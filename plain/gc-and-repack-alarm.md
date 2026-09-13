@@ -12,97 +12,114 @@ Think of it like this. A gardener prunes a fruit tree once a season. The gardene
 
 ## How it works
 
-1. A commit is one saved version of the files, with a note about what changed. A ref is a name that points at one commit. A branch is a ref. A tag is a ref. A branch is a named line of commits, like a bookmark that moves forward as you save.
+The second pass writes the design in Rust, against one shared contract that every idea in this set follows. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker.
+
+1. A commit is one saved version of the files, with a note about what changed. A ref is a name that points at one commit. A branch is a ref. A tag is a ref. A branch is a named line of commits, like a bookmark that moves forward as you save. A push is sending your new commits to the server.
 2. A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. There is one DO for each repo. Think of it like the one librarian who is allowed to update the catalog. DO SQLite is the small database inside each Durable Object. An alarm is a timer inside a Durable Object. A DO has only one alarm at a time.
-3. An object is one stored item in git. An object is a file's content, a folder listing, or a commit. Push means sending your new commits to the server. Each push moves a ref inside the DO. Each ref move bumps a version counter and sets the alarm for a quiet time, ten minutes after the last push.
-4. GC is a background task that deletes files nobody points to anymore. When the alarm fires, the DO runs a GC job in three phases named mark, pack, and sweep. The job saves its state in DO SQLite after each slice of work, so the job survives the CPU limit and DO restarts.
-5. Mark phase. The job starts from every ref and follows the links from each object to the objects it points at. Pushes have already stored those links in an index in DO SQLite, so the mark phase reads nothing from R2. R2 is Cloudflare's large file store. It holds the git objects. Each object found goes into a marked table, in batches.
-6. Pack phase. A packfile is one bundle that holds many objects, squeezed to save space. The job reads each marked object from R2 and rewrites the object as a packfile entry. The job uploads the packfile to R2 in parts of 5 MB.
-7. A SHA, also called a hash, is a fingerprint of an object's content. Two objects with the same content have the same fingerprint. The job keeps a running fingerprint of the packfile in DO SQLite, for the checksum at the end.
-8. Sweep phase. The job first checks the ref version counter. If any ref moved during the job, the job throws away the marked table and starts over. Otherwise the job deletes every unmarked object that is older than the job start, 1,000 objects per call, and drops their index rows.
-9. Every alarm run does a bounded slice of work, saves its position, and sets the alarm again for right now. So a cleanup of any size runs as a chain of short alarms.
-10. Fetch means getting commits from the server. A clone gets everything for the first time. When the packfile is complete, the job records it so that the clone path from idea #7 can serve it.
+3. The one alarm belongs to a shared job dispatcher inside the DO. Every feature adds rows to one job table, and the dispatcher runs one slice of work at a time. Each push moves a ref inside the DO, bumps a counter named refs_version, and queues a mark job for ten minutes later. The queue keeps at most one waiting job of each kind.
+4. An object is one stored item in git. An object is a file's content, a folder listing, or a commit. GC is a background task that deletes files nobody points to anymore. GC runs as a chain of three jobs named mark, build, and sweep. Each job does a bounded slice, saves its position in DO SQLite, and continues on the next alarm firing. A job that dies mid-slice replays the same work, because every step is safe to repeat.
+5. Mark job. Every object already lives inside a packfile in R2. A packfile, or pack, is one bundle that holds many objects, squeezed to save space. R2 is Cloudflare's large file store. It holds the git objects. A table in DO SQLite lists where each object sits inside its packfile. The job starts from every ref and follows each link from one object to the next.
+6. The job reads the stored bytes of commits, tags, and folder listings to find each link. File contents are marked without being read. Each found object sets one bit in the bitmap of the packfile that holds the object. A bitmap covers only the candidate packfiles, which are the packfiles at least one hour old when the mark begins. One object sets at most one bit, so the count of marked entries is exact.
+7. Build job. The job copies each marked entry into one new packfile, byte for byte, with no unsqueeze or squeeze. A delta is a stored object written as "the same as that other object, with these changes". The contract stores no deltas, so any subset of entries is a valid packfile. The job uploads the new packfile to R2 in parts of at least 5 MB. After each part, the job records the part and the position in the same step.
+8. A SHA, also called a hash, is a fingerprint of an object's content. Two objects with the same content have the same fingerprint. The packfile ends with a fingerprint of all its bytes. The job keeps the half-done fingerprint as plain saved state, so a restarted job resumes the same upload with the same bytes.
+9. Sweep job. The input gate is the rule that a Durable Object handles one request at a time while it waits on its own storage. The gate opens when the DO waits on the network instead. The sweep is one step that never waits on the network, so no push can slip inside the step.
+10. The sweep first checks the ref counter. If any ref moved during the chain, the sweep throws away the work and queues a fresh mark. Otherwise the sweep marks every candidate packfile dead, deletes its index rows, and bumps a second counter named gc_epoch, all at once or not at all. A push that began before the sweep and commits after sees the new counter and gets a clear retry message.
+11. A janitor deletes the dead keys in R2 one hour later. A janitor is a background task that deletes files nobody points to anymore. A fetch that resolved its reads before the sweep still finds the bytes. Fetch means getting commits from the server. A clone gets everything for the first time. The new packfile is an ordinary packfile, so the clone path from idea #7 serves it like a packfile from any push.
 
 ```mermaid
 flowchart LR
-    R["Refs table"] --> M["Mark: walk the link index"]
-    M --> P["Pack: build one packfile"]
-    P --> U["R2 packfile, uploaded in parts"]
-    P --> S["Sweep: delete unmarked objects"]
-    S --> O["R2 objects"]
-    A["DO alarm chain"] --> M
+    P["Push moves a ref, bumps the counter"] --> Q["Job queue, mark after ten minutes"]
+    Q --> M["Mark: one bit per live object"]
+    M --> B["Build: copy marked entries to a new pack"]
+    B --> R["R2 packfile, uploaded in parts"]
+    B --> S["Sweep: one step, old packs go dead"]
+    S --> J["Janitor deletes keys after one hour"]
+    A["Dispatcher owns the one alarm"] --> Q
 ```
 
 ## What the reviewer decided
 
-The reviewer decided that this idea is risky.
+The reviewer looks for blockers and caveats. A blocker is a problem that stops the idea from working until it is fixed. A caveat is a limit or a condition. The idea works, but only inside this limit.
+
+The verdict is Lands with caveats.
 
 | Score | Value |
 |---|---|
-| Feasibility | 3 of 5 |
-| Reliability | 2 of 5 |
-| Correctness | 2 of 5 |
+| Feasibility | 4 of 5 |
+| Reliability | 3 of 5 |
+| Correctness | 3 of 5 |
 
-Feasibility asks if Cloudflare can run the idea today. Reliability asks if the idea keeps data safe when things fail. Correctness asks if the idea does what its title says.
+| Score | First pass | Second pass |
+|---|---|---|
+| Feasibility | 3 of 5 | 4 of 5 |
+| Reliability | 2 of 5 | 3 of 5 |
+| Correctness | 2 of 5 | 3 of 5 |
 
-Risky. The idea can be built. But the proof shows one or more problems the reviewer could not fully solve, or it does a weaker version of the goal. Think of it like a runway you can see on the map, but nobody has checked it for holes.
+Lands with caveats. The idea is sound and can be built. The proof has one or more problems that must be fixed first, and the reviewer described each fix. Think of it like a flight with a runway that needs some repairs before you land. The runway is there. The repairs are known.
 
-A blocker is a problem that stops the idea from working until it is fixed. A caveat is a limit or a condition. The idea works, but only inside this limit. For this idea, the reviewer found four blockers and seven caveats.
+For this idea, the verdict moved from Risky to Lands with caveats, and every score moved up. All four first-pass blockers are genuinely closed. The sweep is atomic by construction, the alarm belongs to the shared dispatcher, and the stored form matches the contract exactly. The resumable build is shown in code, with a correct fingerprint, instead of asserted. Feasibility rose because every platform call the code makes exists in the worker library.
 
-GA means a Cloudflare feature that is finished and supported, not a preview. Every feature the proof uses is GA. The shape of the design is right for a cleanup with no server. But the code as written cannot run against the repositories that its sibling ideas build. The sweep can leave a ref that points at deleted bytes, and the job can stop for good in three ways. The reviewer knows each fix, none is done, and the work takes weeks.
+The remaining work is small and local. Three blockers stay open, and all three fixes are mechanical. The rebuilt packfile's rows never get their position numbers. An abort during the mark can never re-queue the mark. The resume signature disagrees with the sibling idea. The reviewer still expects weeks of work.
+
+## What changed in the second pass
+
+- The mismatch with the sibling ideas is fixed. The old storage model is gone. The mark walks the shared index of objects inside packfiles, the links come from the stored bytes, and the build writes an ordinary packfile that the clone path serves by design.
+- The sweep race is fixed. The sweep is one step with no waits and no R2 calls. The counter check, the row deletes, and the epoch bump land together or not at all. The janitor deletes the R2 keys one hour later.
+- The stall that could stop the job for good is partly fixed. There is no latch anymore. The job row keeps the chain alive, dead jobs restart at boot, and errors back off. But an abort during the mark never re-queues the mark, and stale running rows need a restart rule the contract does not have yet.
+- The fight for the single alarm is fixed by the contract modules. This module never sets the alarm. GC is three job rows in the shared queue, and the dispatcher alone sets the alarm.
+- The oversized output buffer is fixed. The part buffer lives only in the pack writer's memory. The saved state is a small position record, one row per uploaded part, and one bitmap per candidate packfile.
+- The doubling of storage is partly fixed. Dead bytes are truly deleted after the grace hour, and duplicate copies collapse to one entry. Live bytes still never shrink, because the contract has no delta search.
+- The cost of one read and one squeeze per object is fixed. Reads are coalesced ranges over the packfiles, file contents are never read, and entries are copied byte for byte.
+- The expiring multi-part upload is fixed. A check on the key tells a finished upload from a dead one. After two dead uploads, the job wipes the build and restarts from the intact marks.
+- The fingerprint that was asserted but not shown is fixed. The code is shown in full and checked against the standard test values.
+- The packfile that could end up short, or missing its trailer, is fixed. One object sets at most one bit, so the header count is exact. The writer appends the 20-byte fingerprint before completing the upload.
+- The cleanup that could starve on a busy repository is still open. A repository pushed faster than a full chain still never sweeps. The reviewer kept this limit by design.
 
 ## Problems that must be fixed first
 
-### Problem 1: The code does not match the parts it builds on
+### Problem 1: The new packfile's rows get no position number
 
-**What goes wrong.** The objects index that idea #6 creates has no columns for type, size, links, or creation time. So the mark phase throws on the first ref. Idea #5 stores objects unsqueezed, and at a different key, so the pack phase finds nothing. With the key fixed, the unsqueeze step fails on a body that was never squeezed. Idea #7 needs slice offsets and the refs the packfile covers, and this proof writes neither, so the packfile is never served.
+**What goes wrong.** The helper that builds an index row for the new packfile takes no position number. If the position defaults to zero, every row of the rebuilt packfile claims position zero. The next mark then sets only bit zero. The build reads every row for that one bit, the counts disagree, and the job throws on every retry.
 
-**Why it matters.** Mark, pack, and serve each fail against a real repository. Nothing in the job runs end to end.
+**Why it matters.** The build job wedges for good on any repository that was ever repacked. The clone path marks bit zero too, so a fast clone streams a packfile whose header promises every object but carries one entry, and git rejects the packfile.
 
-**How to fix it.** Agree on one index schema, one key layout, and one stored form of objects across the three ideas. Record the slice offsets and covered refs when the packfile is complete.
+**How to fix it.** Pass the running position of each entry into the row helper. Every row then records where its entry sits in the packfile.
 
-### Problem 2: A push during the sweep can lose a commit
+### Problem 2: An abort during the mark can never re-queue the mark
 
-**What goes wrong.** The input gate is the rule that a Durable Object handles one request at a time while it waits on its own storage. The gate opens when the DO waits on the network instead. The sweep checks the ref version counter, and then waits on R2 to delete a batch of objects. During that wait, a push arrives that brings back one of the doomed objects. The push sees the index row and sees the bytes in R2, so the push uploads nothing and moves a ref to that object. The sweep then finishes deleting the bytes and the row.
+**What goes wrong.** When a push lands mid-mark, the mark job aborts and tries to queue a fresh mark for after the quiet window. The queue allows one waiting or running job per kind, and the running mark row itself counts. The fresh mark is silently dropped. The old row then ends as done, and no mark remains.
 
-**Why it matters.** A ref now points at a commit whose bytes are gone. A normal git clone gets a packfile with a hole in it, and a file check on the client fails.
+**Why it matters.** No mark runs until the next push arrives. The restart that the design promises on exactly this path never happens. The repository simply stops collecting garbage, the same stall the first pass was failed for.
 
-**How to fix it.** Delete the index rows first, so the push sees no row and uploads the bytes again. Then delete the R2 keys. Or, teach the push to distrust a found object that has no index row.
+**How to fix it.** Reschedule the running row instead of queueing a new one, or let a job re-queue itself past the duplicate check.
 
-### Problem 3: The job can stop for good with nobody to restart it
+### Problem 3: The resume signature disagrees with the sibling idea
 
-**What goes wrong.** Three faults each make the alarm throw on every retry. First, if the DO dies right after the upload completes, the saved state rolls back, and the retry completes an upload that no longer exists. Second, the code spreads a whole object's bytes as call arguments, which throws for any object over about 100 KB. Third, a marked object with no index row throws. After the retries run out, the alarm is dropped, but the saved job state still exists, so nothing ever sets the alarm again.
+**What goes wrong.** This proof resumes an interrupted upload with a saved state that carries the half-done fingerprint. The sibling idea declared resume with a different argument list that carries no fingerprint state. A writer resumed under that form cannot produce a correct trailer.
 
-**Why it matters.** GC is switched off for that repository for good, without any error message. A finished packfile can sit in R2 with no record of it.
+**Why it matters.** Rust code with mismatched signatures does not compile. The whole crate stays broken until one side changes.
 
-**How to fix it.** Save the completion before the handler returns. Copy bytes in chunks instead of spreading them. Add a watchdog that clears a dead job and sets the alarm again.
-
-### Problem 4: The job takes the only alarm
-
-**What goes wrong.** A DO has only one alarm. The job sets the alarm for right now, over and over, to continue its chain. Each set replaces any alarm another feature had set. Ideas #6, #7, #9, and #30 each rely on their own alarm in the same DO.
-
-**Why it matters.** Those four features lose their timers with no warning while the job runs. Their cleanups and rebuilds never happen.
-
-**How to fix it.** Build one shared alarm scheduler in the DO. Every feature registers its timers there, and the scheduler sets the single alarm for the earliest one.
+**How to fix it.** Pick one signature for resume. Change either this idea or the sibling idea to match. Record the choice in the shared contract.
 
 ## Things to know
 
-- The job keeps its output buffer as a list of numbers in JSON, up to 5 MB. That is over the 2 MB limit for one DO SQLite value, and costs about eight times the bytes in memory. The buffer must become binary chunks or a scratch file in R2.
-- A delta is a stored object written as "the same as that other object, with these changes". The packfile has no deltas, and the single objects it covers stay in R2 after the pack, so storage about doubles. The job only reclaims objects that nothing points to.
-- The packfile header takes its object count from the marked table, but the entries come from a join of marked with the index. Any mismatch gives a packfile that a normal git clone rejects with a bad object error.
-- Any push during the mark or pack phase makes the job start over at sweep time. A busy repository can starve, and never finish a cleanup.
-- R2 cancels an unfinished multi-part upload after about 7 days. A stalled job must detect the missing upload and restart the pack phase.
-- The running fingerprint needs a hash whose state can be saved to a database. The proof asserts such a hash in plain JavaScript, but does not show it.
-- Each build costs one billed R2 read and one unsqueeze and squeeze per object still in use. Large repositories need a rule that runs the job only after enough change, not after every quiet window.
+- One error helper takes the wrong error type, so the code does not compile as written. The fix is one word. Two small additions to the shared pack writer are also used but never declared.
+- The job kinds are stored as text, and the proofs spell the kind names differently. Whichever spelling loses, that idea's check for a running GC job never matches.
+- The uploaded parts are not all the same size, while the contract asks for equal-sized parts. Real R2 enforcement is unverified, along with re-uploading a part before completion and the 7-day cleanup of dead uploads.
+- The mark job's check for other GC work ignores dead job rows. On one narrow path a half-written packfile is left orphaned for good.
+- An aborted build never cancels its multi-part upload. The uploaded parts sit in R2 until the automatic cleanup, about 7 days later. That is a storage cost only.
+- The copy helper must keep the entry count, the commit range, and the fingerprint up to date, or the trailer and the index rows disagree. The contract does not say this yet.
+- Some calls are unverified, the same as in the sibling proofs. These are storing raw bytes in a database value, the source of random ids, and enforcement of the subrequest limit inside a DO. A subrequest is one call from a Worker to another service, such as one read from R2.
+- Two limits are kept on purpose. No packfile ever holds deltas, so repack merges and prunes but never shrinks live bytes. A repository pushed faster than a full chain never sweeps.
 
 ## How this idea connects to the others
 
-This idea needs [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md), which is the DO that owns the refs and runs the alarm.
+This idea needs [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md), which is the DO that owns the refs, the ref counter, and the shared job queue.
 
-This idea needs [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md), which puts the refs in the database that the mark phase reads.
+This idea needs [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md), which keeps the index of what each packfile holds.
 
-This idea needs [#5 Content-addressed R2 keys](./content-addressed-r2-keys.md), which sets the key layout the sweep deletes from, and which does not match this proof yet.
+This idea needs [#5 Content-addressed R2 keys](./content-addressed-r2-keys.md), which sets the key layout the new packfile is written under and the dead keys are deleted from.
 
-This idea needs [#6 Two-phase push](./two-phase-push.md), which fills the object index with links and creation times, and which does not match this proof yet.
+This idea needs [#6 Two-phase push](./two-phase-push.md), whose ref moves bump the counter and queue the first mark.
 
-This idea needs [#7 Precomputed pack slices for clone](./precomputed-clone-pack.md), which serves the packfile this job builds, and which does not match this proof yet.
+This idea needs [#7 Precomputed pack slices for clone](./precomputed-clone-pack.md), which serves the packfile this chain builds.

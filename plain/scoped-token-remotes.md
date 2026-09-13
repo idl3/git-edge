@@ -12,73 +12,96 @@ Think of it like this. A hotel key card opens one door, for one day, a limited n
 
 ## How it works
 
-A commit is one saved version of the files, with a note about what changed. A branch is a named line of commits, like a bookmark that moves forward as you save. A ref is a name that points at one commit. A branch is a ref. A tag is a ref. Cloudflare Workers, or Workers, are small programs that run on Cloudflare's network close to the user, with no server to manage. A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. There is one DO for each repo. Think of it like the one librarian who is allowed to update the catalog. DO SQLite is the small database inside each Durable Object. A pkt-line is git's way of framing a message. Each line starts with four characters that give its length. A SHA, or hash, is a fingerprint of an object's content. Two objects with the same content have the same fingerprint. An object is one stored item in git. An object is a file's content, a folder listing, or a commit. A packfile, or pack, is one bundle that holds many objects, squeezed to save space. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it. An alarm is a timer inside a Durable Object. A DO has only one alarm at a time.
+The second pass writes the design in Rust, against one shared contract that every idea in this set follows. The token is one more credential kind in the auth code, plus three small additions to the push path. A commit is one saved version of the files, with a note about what changed. A branch is a named line of commits, like a bookmark that moves forward as you save. A ref is a name that points at one commit. A branch is a ref. A tag is a ref. Cloudflare Workers, or Workers, are small programs that run on Cloudflare's network close to the user, with no server to manage. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker. A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. There is one DO for each repo. Think of it like the one librarian who is allowed to update the catalog. DO SQLite is the small database inside each Durable Object. A pkt-line is git's way of framing a message. Each line starts with four characters that give its length. A packfile, or pack, is one bundle that holds many objects, squeezed to save space. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it. A janitor is a background task that deletes files nobody points to anymore.
 
-1. The server makes a URL that contains a payload and a signature. The payload names the repo, the branch, the expiry time, the maximum pushes and the maximum bytes. The signature is an HMAC over the payload with a secret that only the Worker holds.
-2. A client runs git push with that URL.
-3. The Worker checks the signature and the expiry with WebCrypto. No storage lookup is needed.
-4. The Worker reads the pkt-line command section of the push body before touching the packfile. Each command names an old SHA, a new SHA and a ref.
-5. The Worker rejects any command whose ref is not the scoped one.
-6. If the commands pass, the Worker calls the repo DO. The DO debits a token_usage row in DO SQLite, which counts pushes and bytes and holds a revoked flag.
-7. Only then does the Worker stream the packfile to the pack reader. The DO checks the scope again inside the ref compare-and-swap.
-8. An alarm set to the earliest expiry deletes expired rows.
+1. The server makes a URL that carries a payload and a signature. The payload names the repo, the branch, the expiry time, the maximum pushes, the maximum bytes and a delete flag. The signature is an HMAC over the payload with a secret that only the Worker holds. An HMAC is a signature made with a shared secret, and only the holder of the secret can make or check one.
+2. A client runs git push with that URL. The Worker checks the signature and the expiry with pure Rust code. Every failure is a 403, never a 401, so git never asks for a credential that cannot exist. No Durable Object wakes and no storage lookup is needed.
+3. The URL serves push only. The info/refs request gets the full advertisement of every ref, so a first push sends only what is new. A fetch request is refused. A push token does not read.
+4. On a push, one body reader drives the whole request. The contract's header parser reads the command lines and consumes the "shallow" lines first, so the scope check sees commands only. If no command is in scope, the Worker reads the body to the end before it sends the ng report, because an early answer cancels the stream.
+5. If a command is in scope, the request becomes the two-phase push of the sibling idea. A note with the token's limits rides on the begin and commit calls to the DO.
+6. Inside the commit step, the DO makes the usage row if the row is missing. The DO denies the push if the row is revoked, the pushes are spent, or the pack's bytes would pass the byte limit.
+7. The DO also checks each command against the scoped ref inside the same step. A delete needs the delete flag. When at least one ref moves, the same step adds one push and the pack's bytes to the usage row.
+8. A crash before the commit step leaves the usage row untouched, so the token is not spent. The janitor deletes expired rows inside its normal slice, with no second alarm.
 
 ```mermaid
 sequenceDiagram
   participant Client as Git client
   participant Worker
   participant DO as Repo DO
-  Client->>Worker: git push to URL with token
-  Worker->>Worker: verify HMAC and expiry
-  Worker->>Worker: parse commands and check ref scope
-  Worker->>DO: debit token_usage row
-  DO-->>Worker: allowed or over limit
-  Worker->>DO: stream packfile and update refs with CAS
-  DO-->>Client: ok or ng per ref
+  Client->>Worker: git push to /t/ URL
+  Worker->>Worker: verify HMAC and expiry, 403 on failure
+  Worker->>Worker: parse header and check ref scope
+  Worker->>DO: begin and ingest with token note
+  Worker->>DO: commit with token note
+  DO->>DO: check scope and limits, debit inside CAS span
+  DO-->>Worker: ok or ng per ref
+  Worker-->>Client: report lines
 ```
 
 ## What the reviewer decided
 
-The reviewer's verdict is Lands with caveats.
+The reviewer looks for blockers and caveats. A blocker is a problem that stops the idea from working until it is fixed. A caveat is a limit or a condition. The idea works, but only inside this limit.
+
+The verdict is Lands with caveats.
 
 | Score | Value |
 |---|---|
 | Feasibility | 4 of 5 |
-| Reliability | 3 of 5 |
-| Correctness | 3 of 5 |
+| Reliability | 4 of 5 |
+| Correctness | 4 of 5 |
+
+| Score | First pass | Second pass |
+|---|---|---|
+| Feasibility | 4 of 5 | 4 of 5 |
+| Reliability | 3 of 5 | 4 of 5 |
+| Correctness | 3 of 5 | 4 of 5 |
 
 Lands with caveats. The idea is sound and can be built. The proof has one or more problems that must be fixed first, and the reviewer described each fix. Think of it like a flight with a runway that needs some repairs before you land. The runway is there. The repairs are known.
 
-For this idea, the design is sound and cheap. The signed token in the path, the command check before the packfile, and the single DO counter all work. GA, or generally available, means a Cloudflare feature that is finished and supported, not a preview. Every Cloudflare feature used is GA. The rate limit is exact, not eventually consistent. A blocker is a problem that stops the idea from working until it is fixed. As written, the proof breaks on two real cases that git clients produce, and burns budget when a push crashes. All fixes are hours of work on top of the other ideas, not a redesign. The reviewer expects days of work.
+For this idea, the second pass is a real step forward. Both first-pass blockers are closed by the shape of the design, not by a check at run time. One body reader drives the whole request, and the contract parser handles the shallow lines. The debit now sits inside the commit step, so the worst crash outcome changed from "token spent, nothing moved" to "nothing spent, nothing moved". What remains is a set of mechanical reconciliations, one error arm the token path depends on, and one test line the edge answers earlier with different text. The reviewer now expects weeks of work, not days, because a tokened push needs the sibling's receive-pack code split at the header boundary.
+
+## What changed in the second pass
+
+- The pack handoff stream was broken: fixed. One body reader per request drives the header parse, the drain and the ingest, and the pack hands off through the same reader. There is no second stream to lock.
+- Shallow clients were rejected: fixed by the contract modules. The shared header parser consumes the "shallow" lines before the command lines, so the scope check sees commands only. A new test scenario covers the depth-one CI case.
+- The debit burned budget on any failure: fixed. The debit moved inside the commit step and runs only when at least one ref moved. A crash in the middle of a pack leaves the usage row untouched.
+- Chunked pushes debited zero bytes: fixed. The gate reads the pack size the DO already recorded, so the byte limit counts real stored bytes across pushes.
+- The scoped-only advertisement inflated first pushes: fixed. The token URL now serves the full advertisement of every ref, and scope is enforced on the commands. The token holder can see every ref name, which is accepted as a limit.
+- Early replies cancelled the stream: partly fixed. The out-of-scope path now reads the body to the end before the report. A body larger than 1 MB on a request rejected before routing can still hit the old cancel, which is narrow because an expired token fails earlier.
+- A one-branch token could delete its branch: fixed. The payload has a delete flag that defaults to no, checked at the edge and again inside the DO.
+- Revoked rows lived forever: fixed. A revoked row keeps the token's real expiry, and the janitor deletes expired rows whether revoked or not.
+- The token in the URL had no key rotation: partly fixed. Rotation now has a two-key window with a previous secret. A key id is still not built, and the token still leaks into config files and logs.
+- The Cloudflare body cap: fixed. The cap is documented in the contract and enforced before the code runs.
+- Minting was left out: partly fixed. The revoke call is now real code, but minting and the admin route have no owner. The sibling idea that was named does not build them.
 
 ## Problems that must be fixed first
 
-### Problem 1: The pack handoff stream is broken
+### Problem 1: The shared functions do not match the sibling ideas
 
-**What goes wrong.** After reading the commands, the Worker hands the rest of the body to the pack reader as a stream. The code asks the body for a new reader every time the stream is pulled, and never releases the old reader. The second pull throws the error "ReadableStream is locked".
+**What goes wrong.** This proof calls a receive-pack body function with seven arguments. No sibling defines that function. The receive-pack function itself has three different signatures across the two sibling proofs and this one. The route parser is defined twice with different return types.
 
-**Why it matters.** Any packfile larger than one chunk cannot be read. A normal git push with real content fails.
+**Why it matters.** Rust code with mismatched signatures does not compile. The whole crate stays broken until one definition wins. The fix is mechanical, but it must be reconciled, not assumed.
 
-**How to fix it.** Hold one reader in a closure. Reuse that reader for every pull.
+**How to fix it.** Split the sibling's receive-pack code at the header boundary, so the header parse happens before the scope check. Pick one signature per shared function and record the choice in the shared contract.
 
-### Problem 2: Shallow clients are rejected
+### Problem 2: The spent-token denial reaches git as HTTP 409
 
-**What goes wrong.** A fetch or clone is getting commits from the server. A clone gets everything for the first time. A shallow clone gets only the newest commits. When a shallow clone pushes, git sends "shallow SHA" lines before the command lines. The proof parses those lines as commands with no ref name, and answers "ng undefined". The GitHub Actions checkout step makes a shallow clone by default.
+**What goes wrong.** The contract says any error after the command lines are parsed must become a 200 response with an ng line for every ref. The early limit check inside begin returns a conflict error, and nothing maps that error to the 200 report. The exhausted-token retry is the most common denial on this path.
 
-**Why it matters.** The main audience for scoped tokens is CI. That exact client fails on every push.
+**Why it matters.** A client that pushes twice on a one-push token sees "RPC failed, HTTP 409" and "the remote end hung up unexpectedly", not "ng rate limit". git discards the body of a 409, so the user does not learn that the token was spent.
 
-**How to fix it.** Skip every line that starts with "shallow ".
+**How to fix it.** Add the conflict error to the error arm at the edge, next to the unpack error. Map the conflict to a 200 report with an ng line for every command.
 
 ## Things to know
 
-A caveat is a limit or a condition. The idea works, but only inside this limit.
-
-- The DO debits the push and byte budget before the pack is read, with no refund. A crash in the middle of a pack burns the token, so the debit must move inside the ref CAS transaction.
-- Chunked pushes with no content length reserve 0 bytes, and nothing writes the real count back. The byte limit holds per push only, not across pushes.
-- The server advertises only the scoped ref, so git assumes the server has nothing else. The first push of a new branch then ships the full history, so advertise all refs and rely on the command check.
-- Rejecting early without reading the whole body cancels the HTTP/2 stream. Git then prints "RPC failed, curl 92" instead of "remote rejected", so read the body to the end before replying, as git-receive-pack does.
-- Branch deletion is advertised, so a one-branch push token can also delete that branch. Revoked rows are never swept, there is no key id for rotation, and the token in the URL leaks into config files and logs.
-- Cloudflare caps the request body at 100 to 500 MB, depending on the plan. That cap bounds any single push for the whole project.
+- The signature is checked over the decoded payload bytes, not over the encoded text in the URL. Two different encodings of one payload both verify. A holder can rewrite the encoding, not the content.
+- A payload with no maximum pushes or no maximum bytes fails to parse and gets a 403. There is no way to say "unlimited" except a very large number.
+- The token URL answers info/refs with the full advertisement, so a push-only token can read every ref name and fingerprint in the repo.
+- A request rejected before routing drains at most 1 MB of the body before the error reply. A larger body on a bad token can still cancel the stream. The risk is narrow because an expired token fails earlier.
+- Minting tokens and the admin route still have no owner. The sibling auth idea builds only the two-token password path in the second pass.
+- Several parts are unverified at run time. These are the HMAC, SHA-256 and base64 crates on Wasm, the secret reading, and the stub request bodies.
+- The token still lives in the URL, so config files, shell history and logs all see it. Short expiry and the revoke call are the mitigations.
+- A push token cannot fetch. The clone for the CI case still needs an ordinary credential.
 
 ## How this idea connects to the others
 
@@ -90,4 +113,4 @@ This idea keeps the usage counter in the same DO as [#1 One Durable Object per r
 
 This idea hands the packfile to [#4 Packfile parsing in a Worker with a streaming inflater](./streaming-pack-parser.md).
 
-This idea re-checks the scope inside the commit step of [#6 Two-phase push](./two-phase-push.md).
+This idea rides on the begin and commit calls of [#6 Two-phase push](./two-phase-push.md).

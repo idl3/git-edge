@@ -72,7 +72,7 @@ The table is sorted by verdict, best first. Click **plain** for the beginner exp
 
 ## Second pass
 
-14 ideas were rewritten in Rust against [CONTRACTS.md](../CONTRACTS.md) and reviewed again. The table shows first-pass and second-pass scores side by side. A plus sign means the score went up.
+33 ideas were rewritten in Rust against [CONTRACTS.md](../CONTRACTS.md) and reviewed again: the 14 foundation ideas, then the 19 edge ideas on the amended contract. The table shows first-pass and second-pass scores side by side. A plus sign means the score went up.
 
 | # | Idea | Verdict, first | Verdict, second | Feasibility | Reliability | Correctness | Still open from first pass | New blockers | Read |
 |---|---|---|---|---|---|---|---|---|---|
@@ -90,8 +90,27 @@ The table is sorted by verdict, best first. Click **plain** for the beginner exp
 | 12 | Bundle-URI support | lands with caveats | risky | 4 → 4 | 3 → 3 | 3 → 4 (+1) | 2 | 2 | [plain](../plain/bundle-uri.md) · [proof v2](../proofs-v2/bundle-uri.md) · [review v2](../reviews-v2/bundle-uri.md) |
 | 53 | The /info/refs?service= entrypoint and pkt-line codec | lands | lands with caveats | 5 → 4 (-1) | 5 → 5 | 4 → 4 | 1 | 1 | [plain](../plain/info-refs-endpoint.md) · [proof v2](../proofs-v2/info-refs-endpoint.md) · [review v2](../reviews-v2/info-refs-endpoint.md) |
 | 54 | Auth and multi-tenancy: owner/repo routing to DO ids | lands with caveats | lands with caveats | 5 → 5 | 4 → 4 | 4 → 4 | 3 | 2 | [plain](../plain/auth-and-multitenancy.md) · [proof v2](../proofs-v2/auth-and-multitenancy.md) · [review v2](../reviews-v2/auth-and-multitenancy.md) |
+| 13 | Refs replicated to every region via KV and DO location hints | lands with caveats | lands with caveats | 4 → 4 | 3 → 4 (+1) | 3 → 4 (+1) | 1 | 3 | [plain](../plain/replicated-refs-edge.md) · [proof v2](../proofs-v2/replicated-refs-edge.md) · [review v2](../reviews-v2/replicated-refs-edge.md) |
+| 14 | Push-triggered CI as a DO alarm chain | lands with caveats | lands with caveats | 4 → 4 | 3 → 4 (+1) | 3 → 4 (+1) | 0 | 2 | [plain](../plain/alarm-chain-ci.md) · [proof v2](../proofs-v2/alarm-chain-ci.md) · [review v2](../reviews-v2/alarm-chain-ci.md) |
+| 15 | Live fetch over hibernating WebSockets | lands with caveats | lands with caveats | 4 → 4 | 3 → 4 (+1) | 2 → 4 (+2) | 0 | 2 | [plain](../plain/live-fetch-websocket.md) · [proof v2](../proofs-v2/live-fetch-websocket.md) · [review v2](../reviews-v2/live-fetch-websocket.md) |
+| 16 | Branch-level Durable Objects for monorepos | risky | lands with caveats | 4 → 4 | 3 → 3 | 2 → 3 (+1) | 0 | 3 | [plain](../plain/branch-level-dos.md) · [proof v2](../proofs-v2/branch-level-dos.md) · [review v2](../reviews-v2/branch-level-dos.md) |
+| 17 | Server-side three-way merge in the Worker | risky | lands with caveats | 4 → 4 | 3 → 4 (+1) | 2 → 3 (+1) | 0 | 5 | [plain](../plain/server-side-merge.md) · [proof v2](../proofs-v2/server-side-merge.md) · [review v2](../reviews-v2/server-side-merge.md) |
+| 18 | Server-side rebase and squash as protocol v2 extensions | risky | lands with caveats | 4 → 4 | 2 → 4 (+2) | 2 → 3 (+1) | 1 | 4 | [plain](../plain/server-side-rebase.md) · [proof v2](../proofs-v2/server-side-rebase.md) · [review v2](../reviews-v2/server-side-rebase.md) |
+| 19 | Signed refs by default with append-only DO reflog | lands with caveats | lands with caveats | 4 → 4 | 2 → 4 (+2) | 3 → 3 | 0 | 3 | [plain](../plain/signed-reflog.md) · [proof v2](../proofs-v2/signed-reflog.md) · [review v2](../reviews-v2/signed-reflog.md) |
+| 20 | Time-travel refs | lands with caveats | lands with caveats | 4 → 4 | 4 → 4 | 4 → 3 (-1) | 0 | 3 | [plain](../plain/time-travel-refs.md) · [proof v2](../proofs-v2/time-travel-refs.md) · [review v2](../reviews-v2/time-travel-refs.md) |
+| 21 | Snapshots via R2 object versioning of ref state | lands with caveats | lands with caveats | 4 → 4 | 2 → 3 (+1) | 3 → 4 (+1) | 0 | 3 | [plain](../plain/r2-versioned-snapshots.md) · [proof v2](../proofs-v2/r2-versioned-snapshots.md) · [review v2](../reviews-v2/r2-versioned-snapshots.md) |
+| 22 | Copy-on-write forks | risky | risky | 4 → 4 | 2 → 3 (+1) | 3 → 3 | 0 | 2 | [plain](../plain/cow-forks.md) · [proof v2](../proofs-v2/cow-forks.md) · [review v2](../reviews-v2/cow-forks.md) |
+| 23 | Pre/post-receive hooks as Workers via service bindings | risky | lands with caveats | 4 → 4 | 2 → 4 (+2) | 3 → 4 (+1) | 0 | 1 | [plain](../plain/hooks-as-workers.md) · [proof v2](../proofs-v2/hooks-as-workers.md) · [review v2](../reviews-v2/hooks-as-workers.md) |
+| 24 | Per-blob presigned direct upload for giant pushes | risky | lands with caveats | 4 → 3 (-1) | 2 → 3 (+1) | 3 → 3 | 0 | 4 | [plain](../plain/presigned-direct-upload.md) · [proof v2](../proofs-v2/presigned-direct-upload.md) · [review v2](../reviews-v2/presigned-direct-upload.md) |
+| 25 | Wasm git core (gitoxide/libgit2) for delta resolution and merge | risky | lands with caveats | 4 → 4 | 3 → 4 (+1) | 3 → 3 | 0 | 4 | [plain](../plain/wasm-git-core.md) · [proof v2](../proofs-v2/wasm-git-core.md) · [review v2](../reviews-v2/wasm-git-core.md) |
+| 26 | Search index built on push (D1 FTS / Vectorize) | lands with caveats | lands with caveats | 4 → 4 | 3 → 3 | 3 → 4 (+1) | 0 | 3 | [plain](../plain/search-index-on-push.md) · [proof v2](../proofs-v2/search-index-on-push.md) · [review v2](../reviews-v2/search-index-on-push.md) |
+| 27 | Diff API served with R2 range reads | risky | lands with caveats | 4 → 4 | 3 → 4 (+1) | 2 → 3 (+1) | 0 | 3 | [plain](../plain/diff-api-range-reads.md) · [proof v2](../proofs-v2/diff-api-range-reads.md) · [review v2](../reviews-v2/diff-api-range-reads.md) |
+| 28 | Rate-limited, token-scoped remote URLs | lands with caveats | lands with caveats | 4 → 4 | 3 → 4 (+1) | 3 → 4 (+1) | 0 | 2 | [plain](../plain/scoped-token-remotes.md) · [proof v2](../proofs-v2/scoped-token-remotes.md) · [review v2](../reviews-v2/scoped-token-remotes.md) |
+| 29 | Push from a sibling workspace DO over RPC, no HTTP | lands with caveats | lands with caveats | 4 → 4 | 3 → 4 (+1) | 3 → 4 (+1) | 0 | 3 | [plain](../plain/tui-rpc-push.md) · [proof v2](../proofs-v2/tui-rpc-push.md) · [review v2](../reviews-v2/tui-rpc-push.md) |
+| 55 | GC and repack as a DO alarm | risky | lands with caveats | 3 → 4 (+1) | 2 → 3 (+1) | 2 → 3 (+1) | 1 | 3 | [plain](../plain/gc-and-repack-alarm.md) · [proof v2](../proofs-v2/gc-and-repack-alarm.md) · [review v2](../reviews-v2/gc-and-repack-alarm.md) |
+| 56 | Want/have negotiation with a commit-graph in SQLite | lands with caveats | risky | 4 → 4 | 3 → 3 | 3 → 3 | 0 | 3 | [plain](../plain/want-have-negotiation.md) · [proof v2](../proofs-v2/want-have-negotiation.md) · [review v2](../reviews-v2/want-have-negotiation.md) |
 
-Average across these 14 ideas: feasibility 4.1 → 4.1, reliability 3.4 → 3.7, correctness 3.1 → 3.9.
+Average across all 33 rewritten ideas: feasibility 4.0 → 4.0, reliability 3.0 → 3.7, correctness 2.9 → 3.6.
 
 ## Each idea in one breath
 

@@ -20,16 +20,19 @@ Think of it like this. A band recorded five tracks over an old backing track. No
 
 ## How it works
 
-1. The Worker lists the server's features in the protocol v2 advertisement. The list gains two extra lines, rebase=squash and rebase-status. A normal git client ignores lines it does not know.
-2. A special client sends command=rebase with the target branch, the branch to move, and the expected tip of that branch. The client can also ask for a squash and give a message.
-3. The Worker forwards the command to the repo DO.
-4. The DO finds the merge base and the list of commits to copy. The merge base is the last commit that both branches share. The DO reads the commit graph from DO SQLite. DO SQLite is the small database inside each Durable Object.
-5. For each commit in the list, the DO merges three folder listings: the commit's parent, the commit, and the current new tip. The DO reads each folder listing from R2. An object is one stored item in git. An object is a file's content, a folder listing, or a commit. R2 is Cloudflare's large file store. It holds the git objects.
-6. If a file changed on both sides, the DO reports a conflict with the paths and stops. The proof leaves the line-by-line merge to a later Wasm core. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker.
-7. Otherwise the DO writes a new folder listing and a new commit to R2 under a content-addressed key. A SHA, or hash, is a fingerprint of an object's content. Two objects with the same content have the same fingerprint. Content-addressed means stored under its own fingerprint, so the name tells you what is inside.
-8. When the list is longer than one request can handle, the DO saves its place in a job row and sets an alarm. An alarm is a timer inside a Durable Object. A DO has only one alarm at a time. The alarm continues the job later, and the client polls command=rebase-status until the job ends.
-9. At the end, the DO moves the branch to the new tip with a compare-and-swap that checks the expected tip again. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it.
-10. The client then runs a normal fetch and resets its own branch to the new tip. A fetch is getting commits from the server.
+The second pass writes the design in Rust, against one shared contract that every idea in this set follows. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker. DO SQLite is the small database inside each Durable Object. A packfile, or pack, is one bundle that holds many objects, squeezed to save space. R2 is Cloudflare's large file store. It holds the git objects.
+
+1. The Worker lists the server's features in the protocol v2 advertisement. The list gains two extra lines, rebase and rebase-status. A normal git client ignores lines it does not know.
+2. A special client sends command=rebase with the target commit, the branch to move, and the expected tip of that branch. The client can also ask for a squash and give a message.
+3. The Worker checks that the caller may write, parses the command, and posts the command to the repo DO. The DO checks the branch name and the expected tip, then writes a job row in DO SQLite.
+4. The DO runs the rebase as slices of the shared job runner. An alarm is a timer inside a Durable Object. A DO has only one alarm at a time. The alarm fires the runner, and each slice has a budget of 20 seconds and 400 subrequests. A subrequest is one call from a Worker to another service, such as one read from R2.
+5. The first slice finds the merge base and the list of commits to copy. The merge base is the last commit that both branches share. For a squash, the list holds only the branch tip.
+6. For each commit, the DO merges three folder listings: the merge base, the commit, and the current new tip. The merge works on folder listings only. A file changed on both sides is a conflict, because no merge library builds inside Wasm yet.
+7. Each new commit keeps the author line of the source commit, byte for byte. The committer is the caller's name with the job's start time, so a retried slice writes the same bytes. Signatures are not copied.
+8. The DO writes every new object into one pack in R2 and posts the object rows to DO SQLite in batches. The pack stays marked ingesting, so a fetch cannot see the half-written result.
+9. When a slice spends 80 percent of its budget, the DO saves its place in the job row, and the alarm fires the runner again. The next slice continues the same upload. When no job row is left, the runner stops.
+10. At the end, one step marks the pack live and moves the branch with a compare-and-swap against the expected tip, all in the same span. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it. A lost CAS marks the pack dead and the job stale.
+11. A short rebase answers inside the request with ack and the new tip. A long one answers pending with a job id, and the client polls command=rebase-status. Each poll also wakes the runner. The client then runs a normal fetch and resets its own branch.
 
 ```mermaid
 sequenceDiagram
@@ -38,96 +41,111 @@ sequenceDiagram
     participant D as Repo DO
     participant R as R2
     C->>W: command=rebase
-    W->>D: Forward the command
+    W->>D: Job row, run one slice
     loop For each commit to copy
-        D->>R: Read folder listings
-        D->>R: Write new commit
+        D->>R: Read folder listings, write pack
     end
-    D->>D: Save place and set alarm if needed
-    D->>D: CAS the branch to the new tip
-    D->>W: ok, pending, or conflict
+    D->>D: Save place, alarm fires next slice
+    D->>D: Pack live and CAS the branch
+    D->>W: ack, pending, conflict, or stale
     W->>C: Reply
+    C->>W: command=rebase-status until done
 ```
 
 ## What the reviewer decided
 
-The reviewer's verdict is Risky.
+The reviewer looks for blockers and caveats. A blocker is a problem that stops the idea from working until it is fixed. A caveat is a limit or a condition. The idea works, but only inside this limit.
+
+The verdict is Lands with caveats.
 
 | Score | Value |
 |---|---|
 | Feasibility | 4 of 5 |
-| Reliability | 2 of 5 |
-| Correctness | 2 of 5 |
+| Reliability | 4 of 5 |
+| Correctness | 3 of 5 |
 
-Risky. The idea can be built. But the proof shows one or more problems the reviewer could not fully solve, or it does a weaker version of the goal. Think of it like a runway you can see on the map, but nobody has checked it for holes.
+| Score | First pass | Second pass |
+|---|---|---|
+| Feasibility | 4 of 5 | 4 of 5 |
+| Reliability | 2 of 5 | 4 of 5 |
+| Correctness | 2 of 5 | 3 of 5 |
 
-For this idea, the protocol claim holds. A normal git client of version 2.18 or newer accepts the advertisement and ignores the two extra lines. The reviewer checked that a normal git fetch and a normal git ls-remote do not fail on them. The CAS in the single repo DO stops the refs from becoming two records that disagree. That holds even when a push and a rebase run at the same time.
+Lands with caveats. The idea is sound and can be built. The proof has one or more problems that must be fixed first, and the reviewer described each fix. Think of it like a flight with a runway that needs some repairs before you land. The runway is there. The repairs are known.
 
-The input gate is the rule that a Durable Object handles one request at a time while it waits on its own storage. The gate opens when the DO waits on the network instead. So pushes can run between the steps of a rebase, and only the CAS protects the ref. Every Cloudflare feature the proof uses is GA. GA, or generally available, means a Cloudflare feature that is finished and supported, not a preview.
+For this idea, the second pass is a real step forward, and the verdict moved up from Risky. All four first-pass blockers are closed. The squash path is a real merge branch, the status command exists, the shared job runner closes the stuck-job hole, and the output is a normal pack instead of loose objects. A retried slice now writes identical bytes, so the lost-objects problem is gone by design rather than by a check.
 
-The rebase engine itself is a sketch. The squash path crashes, and the status command has no code behind it. The job queue can starve or strand jobs, and there is no line-by-line file merge. What the proof achieves is a loop that copies commits at the folder level, not a real rebase.
+The protocol claim still holds. A normal git client ignores the two extra feature lines. The final compare-and-swap still stops two records that disagree. Pushes can interleave with a running rebase, and that is now safe because only the last span touches the refs.
 
-The reviewer sees four blockers. A blocker is a problem that stops the idea from working until it is fixed. The reviewer expects weeks of work to reach a version that can rebase a branch whose files changed on both sides.
+What remains is local and mechanical. The job row reads a pack id that nothing stores, which breaks the resume path. The last step never re-checks that the target commit is still stored. Two calls do not match the sibling code, and the author argument and the status reply are not wired. The reviewer still expects weeks of work, because the file-level merge waits on the sibling merge idea, which has no second-pass proof.
 
-The idea also has caveats. A caveat is a limit or a condition. The idea works, but only inside this limit.
+## What changed in the second pass
+
+- The squash path crashes: fixed. A squash is now its own branch of the code. The copy list holds only the branch tip, and the DO runs one merge of the base, the target, and the tip, then writes one commit with the given message.
+- The status command has no handler: partly fixed. The command is now parsed, and the DO has a status route that reads the job row. Each poll also wakes the job runner. The Worker code that frames the reply is not written yet.
+- The alarm can starve or strand jobs: fixed. There is no private alarm anymore. The rebase rides the shared job runner, which drains the whole job table, retries errors with backoff, and is woken by every request and every poll. One piece of the same problem survives at the row level: a job that errors forever sits at the front of the line until the janitor fails it.
+- The R2 keys do not match the sibling idea: fixed. Loose objects are gone. The rebase writes one normal pack in the repo's packs folder, and the fetch path serves the pack like any pushed pack.
+- No line-by-line file merge: still open. No merge library builds inside Wasm, so a file changed on both sides still reports a conflict. The named fix is a small text-merge driver that waits on the sibling merge idea, which has no second-pass proof.
+- Author and date are replaced: partly fixed. Each new commit now keeps the author line of the source commit, byte for byte, and the committer is the caller. But the optional author argument for a squash is stored and never used, and signatures are still dropped.
+- A long replay lands on a stale target: fixed. The target commit is pinned when the job starts, which is a legal rebase result. A client that needs the newest target reads the refs again and retries on stale.
+- Retried or lost steps leave lost files with no janitor: fixed. All output lives in one pack, which a fetch cannot see until the last step and which is marked dead on failure, so the janitor's normal sweep removes the key.
+- The step budget counts commits, not time: fixed. Each slice now stops at 80 percent of a 20-second budget with 400 subrequests, checked between commits.
+- The claim that the DO serializes every push against a rebase: fixed. The input gate opens while the DO waits on R2, so pushes interleave with the replay. Only the last span touches the refs, and that span is atomic.
+- The merge-commit policy is unstated: fixed. The copy list drops merge commits, which is what a normal git rebase does by default.
+- A retried step mints different object ids: fixed. The committer time is the job's start time, so a retried slice writes identical bytes instead of new objects.
+- A v0 or v1 client gets a not-found answer: fixed by the contract modules. The version-checked router from the protocol-v2-only idea now owns the dispatch, and only v2 requests reach the rebase command.
 
 ## Problems that must be fixed first
 
-### Problem 1: The squash path crashes
+### Problem 1: Resume reads a pack id that is never stored
 
-**What goes wrong.** For a squash, the job list holds one entry that describes the squash and its message. The step code treats that entry as a commit SHA. The step code asks R2 for the folder listing of a SHA that does not exist. The code throws an error on the first loop.
+**What goes wrong.** The job table has no column for the pack id, and nothing writes one. But the slice code reads a pack id from the row. Every slice after the first mints a fresh pack id, while the saved place still points at the first upload. The resume call then names a key that does not own that upload.
 
-**Why it matters.** Squash is half of the idea's title. That half cannot run at all.
+**Why it matters.** Every rebase longer than one slice fails or writes a key with no pack row. That is exactly the long-rebase path the job runner exists for.
 
-**How to fix it.** Give the squash its own path. Merge three folder listings once: the merge base, the target tip, and the branch tip. Then write one commit.
+**How to fix it.** Use the job id as the pack id, as the code's own comment says, or add the column to the table.
 
-### Problem 2: The status command has no handler
+### Problem 2: The last step does not re-check the target is still stored
 
-**What goes wrong.** A rebase that needs more than one step replies "pending" with a job id. The client is told to poll command=rebase-status. The Worker advertises that command but has no code that answers it.
+**What goes wrong.** The last step marks the pack live and moves the branch in one span, but never re-checks that the target commit is still stored live. If the ref that named the target moved and the janitor swept its pack during a long replay, the new pack goes live pointing at deleted objects.
 
-**Why it matters.** Every long rebase becomes invisible to the client. The client cannot learn whether the job finished, failed, or found a conflict.
+**Why it matters.** A live pack that names dead objects breaks the storage rule. The damage stays hidden until a later clone checks the objects.
 
-**How to fix it.** Write the handler. Make the handler read the job row and reply with ok and the new tip, pending, or conflict and the paths.
+**How to fix it.** Add one liveness check on the target commit inside the final span.
 
-### Problem 3: The alarm can starve or strand jobs
+### Problem 3: The object rows are missing their position in the pack
 
-**What goes wrong.** The alarm code picks one unfinished job with LIMIT 1. The alarm is set again only from inside the job that ran. When that job finishes, no alarm is set, so a second waiting job never runs. If a step throws an error, the job stays marked as unfinished with no alarm, forever.
+**What goes wrong.** The code builds object rows with a helper that exists in no sibling idea, and the helper never records each object's position in the pack. Every other idea writes the position as a field named idx.
 
-**Why it matters.** A stuck job never moves the branch and never reports. The client polls forever. A later rebase on the same repo could wake the stuck job by chance, but nothing guarantees that.
+**Why it matters.** The storage contract requires the position, and the mark phase of garbage collection reads it. Rows without the position cannot be read or marked correctly.
 
-**How to fix it.** After every step, set the alarm again whenever any unfinished job exists. Catch errors in the step code and mark the job as failed.
+**How to fix it.** Write the rows with the same record shape the sibling ideas use, with a counter for the position.
 
-### Problem 4: The R2 keys do not match the sibling idea
+### Problem 4: The hash function is called with the wrong shape
 
-**What goes wrong.** This proof writes compressed objects to keys of the form repos/id/objects/oid. The sibling idea for content-addressed keys writes uncompressed objects to keys of the form objects/sha. The fetch path reads the sibling's layout.
+**What goes wrong.** The code calls the hash function with two arguments. The pinned library version and every sibling idea call it with three, where the first argument names the hash kind. As written, the code does not compile.
 
-**Why it matters.** The fetch path could fail to read the rebased commits. A rebase that nobody can fetch has no value.
+**Why it matters.** Rust code that does not compile blocks the whole crate until one side changes. The same wrong call exists in one sibling idea, so the contract must record the right form.
 
-**How to fix it.** Use the same key layout and the same encoding as the sibling idea.
+**How to fix it.** Add the hash-kind argument to both calls, and write the canonical signature into the shared contract.
 
 ## Things to know
 
-- There is no line-by-line file merge until a merge core lands, either in Wasm or in plain JavaScript. Until then, most real rebases onto a moved main report a conflict.
-- The original author, date, and signature of each commit are replaced by a fixed server identity. A normal git rebase keeps the author.
-- The DO reads the target tip once when the job starts. A replay that spans several alarm steps lands on a stale target if the target moved.
-- A retried or lost step creates new commit SHAs, because the commit body includes the current time. The old objects stay in R2 as lost files with no janitor, and job rows are never deleted.
-- The input gate opens while the DO waits on R2, so pushes interleave with the replay and only the final CAS protects the ref. Pushes to the same repo slow down while a job runs, so the step budget must count time, not commits.
-- The server speaks only protocol v2, so an older git client gets a not-found error on the first request and cannot clone. That limit comes from the sibling idea, not from this one.
+- A crash between the pack finishing and the last step is a dead end. The resume path tries to continue an upload that is already complete, fails, and the job retries for about three hours until the janitor marks it failed. A check on the key before resuming would recover the job in one slice.
+- A job that errors forever sits at the front of the line and blocks later rebase jobs for up to one hour. Skipping a failing row, or counting attempts per row, would fix this.
+- Several helper functions are named but never shown, including the driver that replays one commit. A memory cap is declared but no check is visible, and a merge re-run can leave extra folder listings in the pack.
+- The optional author argument is stored but never read. The Worker-side reply that frames command=rebase-status is not written.
+- The caller's name goes into the committer header unchecked. A name with a newline or a closing angle bracket writes a broken commit. One validation line closes this.
+- Asking for the status of a job id that does not exist returns a server error instead of a clean answer.
+- Two ideas this one depends on have no second-pass proof yet: the alarm dispatcher and the server-side merge. The resume call on the pack writer is also only a proposed addition to the contract.
+- Several parts are unverified at run time: the JSON path from the Worker to the DO, re-uploading a part of a storage upload on real R2, and the random id source.
+- The rebase writes no push row, so the reflog entry with a made-up push id is the only audit trail.
 
 ## How this idea connects to the others
 
-The branch moves inside the single ref owner from [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md).
-
-Refs and the commit graph live in DO SQLite, and objects live in R2, as in [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md).
-
-The extra feature lines ride on the advertisement from [#3 Speak git protocol v2 only, translate v0 at the edge](./protocol-v2-only.md).
-
-New commits must use the key layout from [#5 Content-addressed R2 keys](./content-addressed-r2-keys.md).
-
-The list of commits to copy comes from the commit graph in [#56 Want/have negotiation with a commit-graph in SQLite](./want-have-negotiation.md).
-
-The folder merge is the same one as in [#17 Server-side three-way merge in the Worker](./server-side-merge.md).
-
-A line-by-line file merge waits on [#25 Wasm git core for delta resolution and merge](./wasm-git-core.md).
-
-Folder listings read many times could come from [#9 Tiny in-DO object cache with alarm-driven eviction](./in-do-object-cache.md).
+- The branch moves inside the single ref owner from [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md).
+- The job row, the pack rows, and the object rows live in DO SQLite and R2, as in [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md).
+- The extra feature lines and the command parsing ride on [#3 Speak git protocol v2 only, translate v0 at the edge](./protocol-v2-only.md).
+- The objects inside the pack are read through [#4 Packfile parsing in a Worker with a streaming inflater](./streaming-pack-parser.md).
+- The pack writer, the object rows, and the JSON path to the DO come from [#6 Two-phase push](./two-phase-push.md).
+- The file-level merge waits on [#17 Server-side three-way merge in the Worker](./server-side-merge.md).
+- The shared job runner and the janitor sweeps come from [#55 GC and repack as a DO alarm](./gc-and-repack-alarm.md).

@@ -6,96 +6,131 @@
 
 ## What this idea is
 
-Git is a tool that keeps every version of a set of files, and lets many people share those versions. A repository, or repo, is one project's full set of files and their history. Cloudflare Workers, or Workers, are small programs that run on Cloudflare's network close to the user, with no server to manage. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker. Some git work is heavy, such as rebuilding a file from a delta or merging two versions of a file. This idea compiles a small part of gitoxide, a git library written in Rust, to Wasm. The TypeScript code does all reading and writing. The Wasm code only turns bytes into other bytes.
+Git is a tool that keeps every version of a set of files, and lets many people share those versions. A repository, or repo, is one project's full set of files and their history. Cloudflare Workers, or Workers, are small programs that run on Cloudflare's network close to the user, with no server to manage. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker.
 
-Think of it like this. A restaurant kitchen brings in one pastry chef for the hard work. The waiters carry every plate in and out. The pastry chef never leaves the station.
+Some git work is heavy, such as merging two versions of a file or finding every difference between two versions. This idea makes the whole Worker one Rust crate compiled to Wasm, so all git work runs in one language and one engine. On top of that crate, the idea adds a merge engine, a diff engine, and two web routes that call them.
+
+Think of it like this. The kitchen stopped hiring a separate pastry chef for the hard dishes. Every cook now works from the same recipe book. The two new dishes on the menu are a plate that shows the difference between two recipes, and a plate that combines two recipes into one.
 
 ## How it works
 
-An object is one stored item in git. An object is a file's content, a folder listing, or a commit. A commit is one saved version of the files, with a note about what changed. A delta is a stored object written as "the same as that other object, with these changes". A packfile, or pack, is one bundle that holds many objects, squeezed to save space. A push is sending your new commits to the server. R2 is Cloudflare's large file store. It holds the git objects. A SHA, or hash, is a fingerprint of an object's content. Two objects with the same content have the same fingerprint. A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. There is one DO for each repo. Think of it like the one librarian who is allowed to update the catalog. An alarm is a timer inside a Durable Object. A DO has only one alarm at a time.
+The second pass writes the design in Rust, against one shared contract that every idea in this set follows. The hybrid of TypeScript and a small Wasm module is gone. The whole Worker is one Rust crate, and that crate is the git core.
 
-1. A Rust crate with gitoxide's delta applier, object parser and file merger is compiled to Wasm and shipped inside the Worker bundle.
-2. Each Worker isolate creates one instance of the Wasm module and keeps that instance.
-3. The module exposes four pure functions: apply_delta, merge_blob, parse_tree and sha1_object.
-4. During a push, some deltas cannot be applied at once, because their base object is not present yet. The parser parks them in a pending area in R2.
-5. An alarm in the repo DO reads each parked delta and its base from R2, copies both into Wasm memory, and calls apply_delta.
-6. The DO computes the SHA of the result and writes the result to R2 under that SHA.
-7. The server-side merge idea calls merge_blob with the base, ours and theirs versions, and writes the merged file to R2.
-8. The Wasm code never calls back out. TypeScript finishes all reads before each call.
+1. The shared crate already resolves every delta of every push. A push is sending your new commits to the server. A commit is one saved version of the files, with a note about what changed. A delta is a stored object written as "the same as that other object, with these changes". An object is one stored item in git. An object is a file's content, a folder listing, or a commit.
+2. This idea adds the merge and diff pieces the crate did not have. The text merge driver is vendored, which means its 926 lines are copied into the project. A diff library named imara-diff and a small tree merge complete the piece.
+3. Two JSON routes appear under the repo's web address. The diff route takes the ids of two objects. The merge route takes a target ref, a commit id, and a message. A ref is a name that points at one commit. A branch is a ref. A tag is a ref.
+4. Each route forwards the call to the repo's Durable Object as JSON. A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. There is one DO for each repo. Think of it like the one librarian who is allowed to update the catalog.
+5. Inside the DO, a plain function computes over objects held in memory. When the function needs an object that is not loaded, the function returns the missing ids. A waiting half then reads those objects from R2 and calls the function again. R2 is Cloudflare's large file store. It holds the git objects.
+6. The diff route loads the two objects and answers with the line ranges that differ for two files, or with the list of changed paths for two commits.
+7. The merge route finds the last commit the two sides share. The merge then walks the three folder trees, merges each changed file with the vendored driver, and builds the new objects.
+8. A merge ends as a normal push inside the DO. The new objects go to R2 as one pack. A packfile, or pack, is one bundle that holds many objects, squeezed to save space. The index rows go to DO SQLite. DO SQLite is the small database inside each Durable Object.
+9. One compare-and-swap moves the ref only if the tip has not moved. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it. A clean merge answers with the new commit's SHA. A SHA, or hash, is a fingerprint of an object's content. Two objects with the same content have the same fingerprint. A conflicted merge answers with the list of conflicted paths, and no ref moves.
 
 ```mermaid
 sequenceDiagram
-  participant DO as Repo DO alarm
-  participant R2
-  participant Wasm as Wasm git core
-  DO->>R2: read parked delta and base object
-  R2-->>DO: bytes
-  DO->>Wasm: apply_delta with both byte arrays
-  Wasm-->>DO: full object bytes
-  DO->>Wasm: sha1_object
-  Wasm-->>DO: SHA
-  DO->>R2: write object under SHA
+    participant Client
+    participant Edge as Edge Worker
+    participant DO as Repo DO
+    participant R2
+    Client->>Edge: GET diff or POST merge
+    Edge->>DO: forward the call as JSON
+    loop until no object is missing
+        DO->>R2: read the missing objects
+        R2-->>DO: bytes into memory
+    end
+    DO->>R2: for a merge, write the new objects as one pack
+    DO->>DO: index rows, compare-and-swap the ref
+    DO-->>Edge: commit SHA or conflict paths
+    Edge-->>Client: JSON answer
 ```
 
 ## What the reviewer decided
 
-The reviewer's verdict is Risky.
+The reviewer looks for blockers and caveats. A blocker is a problem that stops the idea from working until it is fixed. A caveat is a limit or a condition. The idea works, but only inside this limit.
+
+The verdict is Lands with caveats.
 
 | Score | Value |
 |---|---|
 | Feasibility | 4 of 5 |
-| Reliability | 3 of 5 |
+| Reliability | 4 of 5 |
 | Correctness | 3 of 5 |
 
-Risky. The idea can be built. But the proof shows one or more problems the reviewer could not fully solve, or it does a weaker version of the goal. Think of it like a runway you can see on the map, but nobody has checked it for holes.
+| Score | First pass | Second pass |
+|---|---|---|
+| Feasibility | 4 of 5 | 4 of 5 |
+| Reliability | 3 of 5 | 4 of 5 |
+| Correctness | 3 of 5 | 3 of 5 |
 
-For this idea, the split of work is sound. The host does all input and output, and the Wasm side handles pure bytes. GA, or generally available, means a Cloudflare feature that is finished and supported, not a preview. Every Cloudflare feature used is GA. No data can be lost and no two records can disagree, because refs stay in the DO and R2 keys are content-addressed. Content-addressed means stored under its own fingerprint, so the name tells you what is inside. A blocker is a problem that stops the idea from working until it is fixed. But the proof has three blockers, and the reviewer says the verdict becomes "lands with caveats" once all three are fixed. The reviewer expects two to four weeks of work.
+Lands with caveats. The idea is sound and can be built. The proof has one or more problems that must be fixed first, and the reviewer described each fix. Think of it like a flight with a runway that needs some repairs before you land. The runway is there. The repairs are known.
+
+For this idea, the second pass is a real step forward, and the verdict moves up from risky. Making the whole crate the git core deletes the first pass's entire failure surface. The memory leak, the endless alarm, and the parked-delta mismatch are gone by design. The surviving feature is a real push with the right ordering, so reliability rises from 3 to 4. Correctness stays at 3 because the merge route, as written, fails its own main test.
+
+The remaining work is local. One bug hides the shared base commit and breaks the main merge case. One ordering slip can strand a finished pack in R2. Four function calls do not match the pinned libraries. One shared type has two rival definitions in the sibling ideas. The reviewer still expects weeks of work, because the foundation must land first.
+
+## What changed in the second pass
+
+- Offset deltas pointed at nothing: fixed by the contract modules. The raw pack is now saved whole under the push's own pending key. The parser resolves each delta chain by its recorded offset, in order, with a depth cap. Only fully resolved bytes get a fingerprint, so a broken chain cannot mint a plausible one.
+- The drain alarm could loop forever: fixed. There is no drain loop anymore. A missing base fails the push at once with an unpack message and an ng line for every ref.
+- Wasm memory only grew: fixed. There is no separate Wasm module and no memory protocol anymore. Object data lives in ordinary Rust memory, bounded by byte budgets, and is dropped when the request ends.
+- The drain alarm and the janitor alarm overwrote each other: fixed by the contract modules. A janitor is a background task that deletes files nobody points to anymore. The merge registers no job and finishes inside one request, and the jobs dispatcher is the only code that arms the alarm.
+- Wasm ran only on the rare parked-delta path: fixed. Every delta of every push is now resolved inside the crate during the ingest step. The rare path no longer exists.
+- Nobody had checked that the gix-merge crate compiles to Wasm: fixed. The text driver is vendored instead. The full merge crate needs filesystem helpers that do not exist on Wasm.
+- The free plan's 3 MB size cap was tight: fixed. That cap no longer exists. The whole foundation measures 605 KB, or 262 KB compressed.
+- Sixty-four large deltas in one slice could exceed the CPU limit: fixed. The work now runs inside one request under a configured CPU limit and byte budgets, not a row count.
+- A base read by offset could itself be a delta: fixed by the contract modules. The chain resolves to a full object before the fingerprint is computed. The waiting half still loads bytes first, then a plain function computes.
+- The claim of byte-identical merge output was overstated: partly fixed. The proof drops the claim and states the limit plainly. Conflict detection is equivalent to git. Marker text and hunk placement can differ.
+- A crash in the drain threw on every alarm forever: fixed. The parked-delta machinery that held the bug is deleted. A crash mid-merge leaves an open push row that the janitor expires.
 
 ## Problems that must be fixed first
 
-### Problem 1: Offset deltas point at nothing
+### Problem 1: The merge cannot find its own base commit
 
-**What goes wrong.** A delta in a pack names its base in one of two ways. A ref-delta gives the base's SHA. An ofs-delta gives a byte offset inside the same pack. This proof resolves an ofs-delta by reading a byte range at the pack key plus the offset in R2. But the pack parser never stores the raw pack. The parser stores each object as a loose file under its SHA. Also, the entry at that offset can itself be a delta, and git chains deltas up to 50 deep. The proof treats whatever sits at that offset as full content.
+**What goes wrong.** The code that finds the last shared commit can return an id it never loaded. The next step reads that commit from memory, finds nothing, and reports not-found. The merge route answers 404 on the most common case, where each side moved one commit.
 
-**Why it matters.** The result hashes to a garbage SHA. The DO stores a file nobody points to, the connectivity check fails, and a normal git push fails.
+**Why it matters.** The headline route of this idea does not work as written. The proof's own main test hits this bug.
 
-**How to fix it.** Either store the raw pack under a key that the parser records. Or make the parser park each offset as a pending key, and resolve chains in order inside the DO.
+**How to fix it.** Load the base commit through the same read step as every other object, before reading the folder tree of the base. The fix is one line.
 
-### Problem 2: The alarm can loop forever
+### Problem 2: A crash can strand a finished pack
 
-**What goes wrong.** When a base object is missing, the code skips the delta and re-arms the alarm 50 milliseconds later. When a pending key is missing in R2, an assertion throws, and the alarm retries. In both cases the alarm re-arms forever.
+**What goes wrong.** The merge writes the finished pack to R2 before it posts the pack row to the DO. If the request dies in between, R2 holds a complete pack that has no row. The janitor only deletes packs that carry a row marked dead.
 
-**Why it matters.** The push never commits and never reports a failure. The client sits in git push until the connection times out. The DO burns time and blocks the janitor. A janitor, also called a sweep or GC, is a background task that deletes files nobody points to anymore.
+**Why it matters.** A pack of up to 64 MiB stays in R2 forever, and no mechanism reclaims the pack.
 
-**How to fix it.** Fail the push with `ng <ref> missing base <sha>`. Cap the number of retries per push id.
+**How to fix it.** Post the empty pack row before the upload starts. Two-phase push already orders the steps this way.
 
-### Problem 3: Wasm memory only grows
+### Problem 3: Two siblings define the commit call differently
 
-**What goes wrong.** The Wasm instance lives as long as the isolate. The code asks for memory for each request and never frees or resets that memory. The memory grows with every request.
+**What goes wrong.** The request and answer types of the commit step exist in two versions, one in each of two sibling proofs. The versions do not match. This proof's code compiles against only one of them.
 
-**Why it matters.** An isolate is capped at 128 MB. When the cap is reached, every request on that isolate dies.
+**Why it matters.** Rust code with mismatched types does not compile. The crate stays broken until one definition wins.
 
-**How to fix it.** Expose a reset function or a free function in the Wasm module. Call that function after each request.
+**How to fix it.** Pick one definition of the commit request and response. Record the winner in the shared contract.
+
+### Problem 4: Four calls do not match the pinned libraries
+
+**What goes wrong.** Four function calls use names or argument counts that the pinned versions do not have. The diff call does not exist under that name at all. Two parse calls each need one more argument. One call needs a scratch buffer for its output.
+
+**Why it matters.** The file does not compile as written. Every fix is mechanical, but nothing runs before the fixes land.
+
+**How to fix it.** Rename the calls and add the missing arguments to match the pinned versions. Build the crate on day one.
 
 ## Things to know
 
-A caveat is a limit or a condition. The idea works, but only inside this limit.
-
-- The 50 millisecond drain alarm in this proof and the 15 minute janitor alarm in two-phase push overwrite each other. A small push can delay a large push's drain by 15 minutes.
-- Wasm is wired only into the rare parked-delta path in the DO, and the hot inline delta apply in the pack parser stays JavaScript. The promised speed gain mostly does not land unless the parser also calls apply_delta.
-- Nobody has checked that the gix-merge crate compiles to Wasm, because that crate pulls in command, filter and temp file crates. The fallback is to copy the text merge driver into the project.
-- The claim "byte-identical to git merge" is overstated, because the diff algorithm and the conflict marker labels can differ from git in edge cases. Conflict detection is the same.
-- The per-slice budget counts rows, 64 at a time, not bytes. Sixty-four deltas of 40 MB each can exceed the 30 second CPU limit unless a CPU limit is configured.
-- This proof touches no git wire messages. Working with real git depends fully on the push report from two-phase push.
+- Paths of nested files come out wrong, because the code joins path parts without a slash. A file that becomes a folder on both sides gets an error instead of a conflict. Both fixes are mechanical.
+- The merge message has no size cap, and the merge commit skips the size check other new objects get. A large enough message creates a commit over the 16 MiB per-object limit.
+- The cap on loaded objects, the merge output buffer, and the upload part buffer can add up past the 128 MB isolate limit. The worst case is a crash, not a clean limit error.
+- The diff route accepts full fingerprints only, and only a pair of files or a pair of commits. Two files return the differing line ranges. Two commits return a list of changed paths.
+- The merge uses one shared base and has no rename detection. Some merges git resolves cleanly come back as conflicts. A refused merge is always safe.
+- Several parts are not verified at run time. These are the JSON call into the DO, the error decoding from the DO, real R2 multipart uploads, the deployed size, and cold start.
+- A second idea now carries its own copy of the tree merge. The two copies can drift apart.
 
 ## How this idea connects to the others
 
-This idea must agree with [#4 Packfile parsing in a Worker with a streaming inflater](./streaming-pack-parser.md) on where parked deltas and raw packs live.
-
-This idea runs inside the pending step of [#6 Two-phase push](./two-phase-push.md) and shares that idea's alarm.
-
-This idea writes results under their fingerprint, as set out in [#5 Content-addressed R2 keys](./content-addressed-r2-keys.md).
-
-This idea replaces the pure JavaScript merge in [#17 Server-side three-way merge in the Worker](./server-side-merge.md).
-
-This idea relies on the repo's DO owning the refs, as in [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md).
+- The push machinery a merge reuses comes from [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md) and [#6 Two-phase push](./two-phase-push.md).
+- The live-object index and the batched reads come from [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md).
+- The delta resolution every push runs comes from [#4 Packfile parsing in a Worker with a streaming inflater](./streaming-pack-parser.md).
+- The job dispatcher that owns the alarm, and the janitor that reclaims a crashed merge, come from [#55 GC and repack as a DO alarm](./gc-and-repack-alarm.md).
+- The edge routing this idea extends comes from [#53 The /info/refs?service= entrypoint and pkt-line codec](./info-refs-endpoint.md).
+- The repo route and the caller's identity come from [#54 Auth and multi-tenancy: owner/repo routing to DO ids](./auth-and-multitenancy.md).

@@ -18,17 +18,21 @@ Think of it like this. A doorbell is better than walking to the door every minut
 
 ## How it works
 
-1. A helper program on the client opens a WebSocket connection to the Worker. The Worker passes the connection to the repo DO.
-2. The DO accepts the connection and tags the connection with the names of the refs the client wants to watch.
-3. The DO writes the client's last known commit for each ref into a small note attached to the connection. The note can hold at most 2 KiB.
-4. The DO goes to sleep. Cloudflare calls this sleep hibernation. A sleeping DO costs nothing while the connection waits.
-5. The proof plans an alarm that closes connections whose login has expired. An alarm is a timer inside a Durable Object. A DO has only one alarm at a time.
-6. A push arrives. The DO updates the ref in DO SQLite with a compare-and-swap. DO SQLite is the small database inside each Durable Object. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it.
-7. The DO finds every connection tagged with that ref. The DO sends each one a short message with the ref name, the old commit, and the new commit.
-8. The helper answers on the same connection with a protocol v2 fetch request. Protocol v2 is the newer, cleaner set of messages git uses to talk to a server.
-9. The DO reads the needed objects from R2 and streams back a packfile. An object is one stored item in git. An object is a file's content, a folder listing, or a commit. R2 is Cloudflare's large file store. It holds the git objects. A packfile, or pack, is one bundle that holds many objects, squeezed to save space.
-10. The DO frames the packfile as pkt-lines with a sideband. A pkt-line is git's way of framing a message. Each line starts with four characters that give its length. A sideband is a way to send two kinds of data in one stream, like a main channel and a progress channel.
-11. A normal git client cannot use a WebSocket. For a normal git client, the helper only listens for the message and then runs a normal git fetch over smart HTTP. Smart HTTP is the way git talks to a server over normal web requests.
+The second pass writes the design in Rust, against one shared contract that every idea in this set follows. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker.
+
+1. A helper program on the client opens a WebSocket connection to a new route on the Worker. The Worker checks the login and passes the connection to the repo DO. The Worker never answers on the connection itself.
+2. The DO accepts the connection for hibernation and tags the connection with the refs the client wants to watch. A request for all refs, or for more than 10 refs, gets the single tag "*". One connection can hold at most 10 tags.
+3. The DO stores a note on the connection with two values only. One value says when the login expires. The other value says whether a fetch is in flight. The note is about 40 bytes, so the 2 KiB limit can never be reached.
+4. The DO tells the platform to answer ping messages with pong on its own, so keepalives never wake the DO. The DO also queues a sweep job on its alarm. An alarm is a timer inside a Durable Object. A DO has only one alarm at a time. The sweep job closes connections whose login has expired. Then the DO goes to sleep. Cloudflare calls this sleep hibernation. A sleeping DO costs nothing while the connection waits.
+5. A push arrives. The commit code in the DO moves the ref with a compare-and-swap. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it.
+6. Inside the same step, the DO finds every connection tagged with that ref name or with "*". The DO sends each one a short message with the ref name, the old commit, and the new commit. The platform releases the messages only if the ref move is durable.
+7. On every connect, the helper sends a control frame that lists the commit each of its refs points at. The DO compares that list with the refs table in DO SQLite. DO SQLite is the small database inside each Durable Object. The DO sends a message for each ref that differs, including deleted refs.
+8. To fetch over the connection, the helper sends one binary frame that holds a complete protocol v2 fetch request. Protocol v2 is the newer, cleaner set of messages git uses to talk to a server.
+9. The DO runs the same code path as a normal fetch. The DO looks up the wanted objects, works out which objects to send, and writes a packfile. An object is one stored item in git. An object is a file's content, a folder listing, or a commit. R2 is Cloudflare's large file store. It holds the git objects. A packfile, or pack, is one bundle that holds many objects, squeezed to save space.
+10. The reply uses pkt-line framing with a sideband, the same bytes a normal fetch produces. A pkt-line is git's way of framing a message. Each line starts with four characters that give its length. A sideband is a way to send two kinds of data in one stream, like a main channel and a progress channel. After "done", the reply starts with the packfile section, as a real git server does.
+11. The DO splits the reply into binary messages of 64 KiB. If the reply is larger than 8 MiB, the DO sends a control frame instead, and the helper runs a normal git fetch over smart HTTP. Smart HTTP is the way git talks to a server over normal web requests.
+12. Text frames carry only control messages. Binary frames carry only fetch bytes. A ref message during a fetch lands between binary messages, never inside the pack bytes. One fetch can be in flight on a connection. A second request gets an error reply.
+13. A normal git client cannot use a WebSocket. For a normal git client, the helper only listens for the message and then runs a normal git fetch over smart HTTP.
 
 ```mermaid
 sequenceDiagram
@@ -36,15 +40,17 @@ sequenceDiagram
     participant W as Worker
     participant D as Repo DO
     participant R as R2
-    C->>W: Open a WebSocket
+    C->>W: WebSocket upgrade on /live
     W->>D: Pass the connection
-    D->>D: Sleep until a push arrives
+    D->>D: Tag, note, then sleep
     Note over D: A push moves a ref
     D->>C: Message with ref, old commit, new commit
-    C->>D: Fetch request
+    C->>D: Tips frame after each connect
+    D->>C: One message per missed move
+    C->>D: Binary frame with fetch request
     D->>R: Read objects
     R->>D: Objects
-    D->>C: Packfile
+    D->>C: Packfile in binary frames
 ```
 
 ## What the reviewer decided
@@ -57,48 +63,62 @@ The reviewer's verdict is Lands with caveats.
 | Reliability | 3 of 5 |
 | Correctness | 2 of 5 |
 
+| Score | First pass | Second pass |
+|---|---|---|
+| Feasibility | 4 of 5 | 4 of 5 |
+| Reliability | 3 of 5 | 4 of 5 |
+| Correctness | 2 of 5 | 4 of 5 |
+
 Lands with caveats. The idea is sound and can be built. The proof has one or more problems that must be fixed first, and the reviewer described each fix. Think of it like a flight with a runway that needs some repairs before you land. The runway is there. The repairs are known.
 
-For this idea, the verdict holds only for the simple path. In the simple path the DO sends the message, and the client runs a normal git fetch over smart HTTP. Every Cloudflare feature the proof uses is GA. GA, or generally available, means a Cloudflare feature that is finished and supported, not a preview. Refs cannot end up as two records that disagree, because the single DO does the CAS in one database step.
+For this idea, the second pass is a real rewrite, not a patch. All three first-pass blockers and the crash-window finding are closed by the shape of the design. The client now claims its own tips. The fetch bytes come from the same code as the normal fetch route. The note on the connection has a fixed size. The send loop runs inside the commit step, so only the output gate can split a ref move from its message. The output gate is the rule that holds sent messages until the step's writes are durable. Reliability rose from 3 to 4. Correctness rose from 2 to 4.
 
-The path that sends the packfile over the WebSocket has three blockers. A blocker is a problem that stops the idea from working until it is fixed. The reviewer says that path is a demo until the three blockers and flow control are fixed. The reviewer expects the work to take weeks.
+The remaining work is small. Three one-line gaps stop the Rust code from compiling against the sibling ideas. One test step uses a git command that cannot read the reply. The sweep job scans every connection in one step with no budget check. A ref created while the client was away is still never announced. The reviewer still expects weeks of work, because the idea needs the whole fetch path and a helper that is not yet built.
 
 The idea also has caveats. A caveat is a limit or a condition. The idea works, but only inside this limit.
 
+## What changed in the second pass
+
+- Missed ref moves after a reconnect: fixed. The note on the connection stores no tips at all. The client claims its own tips in a control frame on every connect. The DO sends a message for each ref that differs, moved, created, and deleted alike.
+- Wrong reply framing for a fetch with done: fixed by the contract modules. The reply now comes from the same prelude and pack code as the normal fetch route. That code leaves out the acknowledgments section after done.
+- The note on the connection grew without limit: fixed. The note holds two numbers, about 40 bytes, and never grows. The client's haves travel inside each fetch frame.
+- A crash between the ref move and the send loop lost the message: fixed. The send loop runs inside the same step as the ref move, with no wait in between. Only the output gate can separate the two, and the tips frame heals any missed message at reconnect.
+- More than 10 watched refs did not fit in the tags: fixed. A short list becomes one tag per ref. A request for all refs or a longer list becomes the single "*" tag, and the send loop checks both kinds of tag.
+- No flow control on sends: fixed. The DO counts the exact reply size before it writes the pack. Over 8 MiB the reply is a control frame, and the helper fetches over smart HTTP. One reply is in flight per connection.
+- Deploys and restarts drop every connection: partly fixed. The tips frame on reconnect heals the missed moves. A ref created while the client was away is still never announced.
+- The alarm for expired logins and the constructor setup were not written: fixed. A sweep job now closes expired connections every 15 minutes. The schema runs in the boot code inside each request, so no constructor setup exists.
+- A busy repo never sleeps: still open. This is a platform fact. The zero-cost claim holds only for quiet repos.
+- A message could land inside the pack stream, and some protocol bytes went out as text frames: fixed. All protocol bytes go in binary frames. Text frames carry only control messages. A ref message lands between binary messages.
+
 ## Problems that must be fixed first
 
-### Problem 1: Missed ref moves after a reconnect
+### Problem 1: The code does not compile as written
 
-**What goes wrong.** When a client reconnects, the DO fills the note with the server's current commits, not the commits the client reports. If a ref moved while the client was away, the DO now believes the client already has the new commit. The DO sends nothing. The same thing happens when Cloudflare removes the DO from memory between the database write and the send loop. The message is lost, and the client waits with no news.
+**What goes wrong.** Three small gaps separate this file from the sibling ideas. The code calls a sideband constructor that does not exist outside the wire module. The code reads fields of the push command record that are private to the sibling module. The code calls a clock helper that is never imported.
 
-**Why it matters.** The goal of the idea is that the client learns about every ref move at once. One removal from memory breaks that goal. No data is lost, but the client stays on the old commit until some other push happens.
+**Why it matters.** Rust code that does not compile cannot run or be tested. The whole crate stays broken until the fixes land. Each fix is mechanical, but nothing can be checked before they land.
 
-**How to fix it.** Make the helper send its own known commits when the connection opens. Make the DO compare those commits with the current refs. Make the DO send a message for each ref that differs.
+**How to fix it.** Add a sideband constructor to the wire module and register the change in the contract. Mark the command fields visible inside the crate. Add the missing import. Each fix is one line.
 
-### Problem 2: Wrong reply framing for a fetch with done
+### Problem 2: One test step uses the wrong git command
 
-**What goes wrong.** The proof sends an "acknowledgments" section and a "NAK" line before the "packfile" section. When the client's request contains "done", a real git server leaves out the acknowledgments section. Git's fetch code then expects "packfile" as the first section. Git stops with the error "expected 'packfile', received 'acknowledgments'". A helper that feeds these bytes to a normal git fetch command fails on the first frame.
+**What goes wrong.** The new scenario feeds the reply bytes to a git command that reads only a raw packfile. The reply is framed with pkt-lines and a sideband, so that command cannot read the reply.
 
-**Why it matters.** The proof claims the bytes are the same as the smart HTTP reply. The bytes are not the same. The fetch over the WebSocket fails before the first object arrives.
+**Why it matters.** The step is the regression check for the framing fix from the first pass. As written, the check fails for the wrong reason and proves nothing.
 
-**How to fix it.** Leave out the acknowledgments section when the request contains "done". Start the reply with the packfile section, as a real git server does.
-
-### Problem 3: The note on the connection grows without limit
-
-**What goes wrong.** After each fetch, the DO adds every wanted commit to the note attached to the connection. The note never shrinks. Cloudflare limits the note to 2 KiB. After a few dozen fetches the note is too big. The save call throws an error, and the record of what the client has is destroyed.
-
-**Why it matters.** A long-lived connection is the whole point of the idea. A connection that breaks after a few dozen fetches does not deliver that.
-
-**How to fix it.** Keep only the latest commit for each watched ref in the note. Replace the old value instead of adding a new one.
+**How to fix it.** Feed the bytes to git fetch-pack in stateless mode, or split the sideband channels before the packfile check. The rule that the first section is packfile stays the right check.
 
 ## Things to know
 
-- One connection can carry at most 10 tags, so a client cannot watch more than 10 refs. The design needs a scheme that groups refs under one tag.
-- The DO cannot see how much data still waits to be sent. A slow client on a large packfile fills the 128 MB DO memory, so large fetches must go over smart HTTP instead.
-- A code deploy or a DO restart closes every sleeping connection. Clients must reconnect and compare their commits with the server's commits.
-- A push during a fetch on the same connection can place a text message in the middle of the binary packfile stream. The proof also sends some pkt-line strings as text frames, which breaks its own rule that text frames carry only control messages.
-- Two parts are not written: the alarm that closes connections with an expired login, and the real negotiation of which objects to send. The database setup in the constructor must also run inside blockConcurrencyWhile.
-- A repo with constant pushes never sleeps, so the zero-cost claim holds only for quiet repos. A normal git client cannot use the connection at all without a helper program.
+- The catch-up after a reconnect covers only refs the client already knows. A ref created while the client was away is never announced. The client contract needs a periodic ref listing over HTTP, or a server-side diff of the claimed tips.
+- The platform claims the proof depends on are not measured. Unmeasured are the rule that sent messages wait for the ref move to be durable and the upgrade pass-through to the DO. Also unmeasured are the wake on an incoming message and the caps of 10 tags, 2 KiB, and 1 MiB per message.
+- Every Cloudflare feature the proof uses is GA. GA, or generally available, means a Cloudflare feature that is finished and supported, not a preview.
+- The sweep job scans every connection in one step with no budget check. At the platform's connection cap this step is unbounded.
+- The edge route does not charge its DO call against the request budget. Each upgrade makes one uncharged subrequest. A subrequest is one call from a Worker to another service, such as one read from R2.
+- The reply prelude gains a new parameter that belongs to the sibling idea. Both proofs now depend on the same edit landing.
+- A ping text frame to an awake DO gets an error reply, not a pong. The automatic answer works only while the DO sleeps.
+- A repo with constant pushes never sleeps, so the zero-cost claim holds only for quiet repos. Each ref move also sends one message per subscriber inside the commit step.
+- A normal git client still needs the helper. Listening for the message and running git fetch over smart HTTP remains the only mode a normal client can use.
 
 ## How this idea connects to the others
 

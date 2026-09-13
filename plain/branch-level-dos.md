@@ -20,93 +20,123 @@ Think of it like this. A post office with one counter serves everyone in one que
 
 ## How it works
 
-1. A root DO for the repo holds only three things: the default branch, the access rules, and a list of the groups. The list is called the registry.
-2. Each group of refs lives in its own shard DO. A shard is one of the many small parts that together hold all the refs. The shard keeps its refs in DO SQLite. DO SQLite is the small database inside each Durable Object.
-3. On a push, the Worker reads the list of ref commands. Each command names a ref, the old commit, and the new commit.
-4. The Worker unpacks the packfile and writes each object to R2 under a content-addressed key. A packfile, or pack, is one bundle that holds many objects, squeezed to save space. An object is one stored item in git. An object is a file's content, a folder listing, or a commit. R2 is Cloudflare's large file store. It holds the git objects. Content-addressed means stored under its own fingerprint, so the name tells you what is inside.
-5. If the push dies before any ref moves, its objects stay in R2 as lost files until a janitor removes them. A janitor, also called a sweep or GC, is a background task that deletes files nobody points to anymore.
-6. The Worker sorts the commands by group and calls every needed shard at the same time.
-7. Each shard checks that the new tip object exists in R2. Then the shard updates its refs in one database transaction with a compare-and-swap. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it.
-8. Each shard returns one ok or ng line per ref. The Worker joins the lines into one status report for the client.
-9. On a fetch, the client sends a ref prefix with protocol v2. Protocol v2 is the newer, cleaner set of messages git uses to talk to a server. The Worker routes the request to the one shard that owns that prefix.
-10. A fetch with no prefix, or a push advertisement, asks every shard in the registry and merges the lists.
+The second pass writes the design in Rust, against one shared contract that every idea in this set follows. The contract allows only one DO per repo, so the shard design cannot be written as real code. What the second pass builds instead is the reader half of the idea. The heavy part, turning every ref into bytes for a listing, moves off the DO and into a snapshot file in R2. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker. DO SQLite is the small database inside each Durable Object. R2 is Cloudflare's large file store. It holds the git objects.
+
+1. One repo DO still owns every ref, every ref update, and a counter that goes up by one on each commit. A push runs the unchanged foundation path, so a writer never sees a shard.
+2. Each ref update is a compare-and-swap inside the DO. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it.
+3. The expensive part of a monorepo is the listing. git asks for a listing on every clone, every fetch, and at the start of every push.
+4. Under the base design the DO turns every ref into bytes for each listing. A repo with hundreds of thousands of refs blocks all other work while the DO does so.
+5. After a successful push, the DO queues one background job named AdvBuild. The queue keeps at most one waiting job of this kind, so a burst of pushes causes one build.
+6. The job reads the refs table in chunks of 5,000 rows and writes one file that holds the default branch and every ref.
+7. The job stores the file in R2 under a name that contains the counter value. The counter in the name means a listing never reads a half-written file.
+8. Before the job marks the file ready, the job reads the counter again. If a commit landed during the build, the job discards the file and starts over.
+9. When a client asks for a listing, the Worker asks the DO one small question. The question is the current counter value and whether a file for that value is ready.
+10. If the file is ready, the Worker reads the file from R2 and writes the reply itself. A prefix such as refs/heads/ is then only a filter over the file, so a normal clone works.
+11. If no file is ready, the Worker falls back to the old route and asks the DO for all refs. The repo then behaves exactly as the base design, and the check also queues a build.
+12. The job also does janitor work. A janitor, also called a sweep or GC, is a background task that deletes files nobody points to anymore. The job deletes snapshot files older than ten minutes, longer than any request can live. A file over the size limit is never published.
 
 ```mermaid
-flowchart LR
-    W["Worker"] --> RT["Root DO: default branch, access rules, registry"]
-    W --> A["Shard DO: refs/heads/team-a"]
-    W --> B["Shard DO: refs/heads/ci"]
-    W --> M["Shard DO: refs/heads/main"]
-    W --> R["R2: objects under objects/sha"]
+sequenceDiagram
+    participant Client as git client
+    participant Worker
+    participant DO as Repo DO
+    participant R2
+    Client->>Worker: clone, fetch, or push advertisement
+    Worker->>DO: pointer request, one small span
+    DO-->>Worker: counter value and ready flag
+    Worker->>R2: read the snapshot file for that value
+    R2-->>Worker: every ref and the default branch
+    Worker-->>Client: reply, filtered by prefix
+    DO->>R2: background job builds the next snapshot
 ```
 
 ## What the reviewer decided
 
-The reviewer's verdict is Risky.
+The reviewer looks for blockers and caveats. A blocker is a problem that stops the idea from working until it is fixed. A caveat is a limit or a condition. The idea works, but only inside this limit.
+
+The verdict is Lands with caveats. The first-pass verdict was Risky.
 
 | Score | Value |
 |---|---|
 | Feasibility | 4 of 5 |
 | Reliability | 3 of 5 |
-| Correctness | 2 of 5 |
+| Correctness | 3 of 5 |
 
-Risky. The idea can be built. But the proof shows one or more problems the reviewer could not fully solve, or it does a weaker version of the goal. Think of it like a runway you can see on the map, but nobody has checked it for holes.
+| Score | First pass | Second pass |
+|---|---|---|
+| Feasibility | 4 of 5 | 4 of 5 |
+| Reliability | 3 of 5 | 3 of 5 |
+| Correctness | 2 of 5 | 3 of 5 |
 
-For this idea, the reviewer says the core mechanism is sound. One DO per group, a CAS in each shard, and shared objects in R2 use only GA features. GA, or generally available, means a Cloudflare feature that is finished and supported, not a preview. A reader who sends a full prefix does skip the busy group, which is the goal.
+Lands with caveats. The idea is sound and can be built. The proof has one or more problems that must be fixed first, and the reviewer described each fix. Think of it like a flight with a runway that needs some repairs before you land. The runway is there. The repairs are known.
 
-As written, the proof breaks a normal git clone and a normal git fetch. The proof also drops the default branch from listings and keeps one root DO write on every push. The reviewer sees three blockers. A blocker is a problem that stops the idea from working until it is fixed.
+For this idea, the second pass improved. Correctness moved up and the verdict moved from Risky to Lands with caveats. The reason is honest accounting. The proof says plainly that one DO per group cannot exist under the shared contract, and the proof builds the part that can exist instead. Every first-pass blocker is closed. A listing is now exactly one version, which is stronger than the old merge across shards.
 
-The fixes take weeks, and the proof cannot be tested against real git until the routing is redone. The idea also has caveats. A caveat is a limit or a condition. The idea works, but only inside this limit.
+The reviewer notes that what remains is closer to idea #13, which replicates refs to the edge, than to the named idea. What keeps the module out of a clean Lands is wiring, not design. Three blockers remain, and the reviewer calls each fix mechanical.
+
+## What changed in the second pass
+
+- A normal clone and fetch reached an empty shard and saw zero refs: fixed. There are no shards to miss. A ref prefix is now a filter over one snapshot that holds every ref.
+- A crash between a shard update and the registry update could hide a whole new group from listings: fixed. No registry exists. The listing is the refs table captured under one version.
+- One failed shard hid the work of the other shards behind a server error: fixed by the contract modules. One commit step writes one result line per ref, in the order the client sent the commands. There is no fan-out.
+- A janitor could delete the tip object between the existence check and the ref update: fixed by the contract modules. Loose object files no longer exist. The check and the update now happen inside one step that cannot be interrupted.
+- The listing left out the default branch, its target, and peeled tags: fixed. The default branch rides inside the snapshot file, and the shared writer emits all three.
+- The v2 endpoint did not check which command the client sent: fixed by the contract modules. A shared parser now tells a listing request from a fetch request, and fetch still runs in the DO.
+- The push advertisement was never shown and could have promised all-or-nothing pushes: fixed. The Worker builds the advertisement at the edge through the shared writer, which never offers the atomic capability.
+- Every push waited on a root DO and on a listing from every shard: fixed. There is no root DO. Pushes run the unchanged foundation path, and a listing costs one pointer read plus one R2 read.
+- One stale old commit made a whole shard reject its batch: fixed by the contract modules. The commit step does one compare-and-swap per ref, so one stale ref rejects only itself. Atomic across groups is never advertised, so git never asks for atomic.
+- A listing merged from many shards had no single moment in time: fixed. The snapshot is exactly one version, checked again before the snapshot is published. A torn listing can never be served.
+- Stray prefixes that git sends created billable empty DOs on every fetch: fixed. No per-prefix DO can exist. A stray prefix is now only a filter over the snapshot.
+- The ceiling for a hot ref did not change: still open, and now a contract rule. All writes still queue on the one repo DO. What moved off the DO is the listing work, not the write queue.
 
 ## Problems that must be fixed first
 
-### Problem 1: Normal clone and fetch reach an empty shard
+### Problem 1: The Worker cannot find the snapshot file
 
-**What goes wrong.** A normal git clone sends the prefixes refs/heads/ and refs/tags/. The proof turns the prefix refs/heads/ into a group name that no push ever creates. The Worker asks one empty DO and returns zero refs. A normal git clone of a full repo would fail and warn that the repo is empty. A normal git fetch with the default settings would fail in the same way.
+**What goes wrong.** The file name in R2 contains the repo id, a random value that only the DO knows. No read route returns the repo id, so the Worker cannot build the file name and cannot open the bucket. A wrong guess fails quietly into the fallback.
 
-**Why it matters.** Clone and fetch are the two most common git commands. A server that returns no refs to them is not usable.
+**Why it matters.** The fast path is the whole point of the module. As written, the fast path cannot be called, and every listing pays the slow path plus one extra call to the DO.
 
-**How to fix it.** Match each prefix against the registry. Choose every group whose name starts with the prefix, and every group that is a prefix of the request. Route to one shard only when the prefix names a full group.
+**How to fix it.** Add the repo id to the pointer answer. Or name the file after the repo name, as the sibling ideas do.
 
-### Problem 2: A new group is registered too late
+### Problem 2: A queued build can wait for the wrong alarm
 
-**What goes wrong.** The Worker updates the refs in the shard first, and adds the new group to the registry after that. If the Worker crashes between the two steps, the shard holds refs that the registry does not know about. A clone or a full listing then leaves out every ref in that group. The gap stays until the next push to that group.
+**What goes wrong.** When a listing finds no snapshot, the DO queues a build job. The contract says a route that queues a job must reset the DO alarm right after the route finishes. This route does not, and neither do the sibling routes.
 
-**Why it matters.** The listing is wrong in a quiet and lasting way. Nobody gets an error, so nobody knows the refs are missing.
+**Why it matters.** The build then waits for the next alarm that happens to be set, which can be up to 15 minutes away. Every listing in that window takes the slow path.
 
-**How to fix it.** Add the group to the registry first. Update the refs in the shard after that.
+**How to fix it.** Declare the alarm reset on the pointer route and make the code actually run the reset, the same fix two other ideas need.
 
-### Problem 3: One failed shard hides the work of the others
+### Problem 3: A repo too large to build retries forever
 
-**What goes wrong.** The Worker calls all shards with Promise.all. If one shard throws an error, the whole call fails. The Worker then returns a server error with no status report. But the other shards already moved their refs.
+**What goes wrong.** The build must finish inside one job slice. A repo whose refs do not fit in one slice spends its budget, fails, and gets queued again by the next listing. Each try can block the DO for many seconds. A repo over the file size limit also re-runs the whole build on every push before the build hits the limit again.
 
-**Why it matters.** The client sees an error and does not know that some refs moved. Real git reports each ref on its own line, so the client always knows what happened.
+**Why it matters.** The oversized monorepos are exactly the repos this module exists to help. For these repos the design is worse than the base design, because every read triggers work that stops the whole DO.
 
-**How to fix it.** Use Promise.allSettled instead. For each failed shard, return an ng line per ref with the reason. Return the ok lines from the shards that succeeded.
+**How to fix it.** Give the build a cursor so the build continues across slices. Or store a flag that marks the repo as too large, so the repo falls back once and stays there.
 
 ## Things to know
 
-- Every push still waits on the single root DO and on a full listing from every shard. Writers gain nothing per repo, and only readers with a prefix benefit.
-- The ceiling for a hot ref does not change. The branch refs/heads/main is still one DO.
-- The listing leaves out the default branch and its target, and leaves out peeled tags, even when the client asks for them. A clone cannot pick the default branch.
-- One stale old commit makes a shard reject its whole batch, which is stricter than git's per-ref rejection. A push that asks for all-or-nothing across two groups must not be advertised, or needs the two-step commit from idea #48.
-- Stray prefixes that git sends, such as main or refs/main, create billable empty DOs on every fetch.
-- The check that the tip object exists and the ref update are two separate steps, so a janitor can delete the object between them. A listing across shards also has no single moment in time.
+- The idea as named does not ship. What remains is a snapshot publisher in R2, close to idea #13, so the set could end up with two near-identical pipelines.
+- One unlucky kill during the R2 write can stop all builds forever. The job row stays marked running, and the dedup rule then blocks every new build until someone adds a reset.
+- Under a heavy write stream the snapshot is never current. Every listing then pays the old slow path plus one extra call to the DO.
+- The sweep deletes a file by the age of its build, not by the time since a newer file replaced the old one. The margin still holds, because a request uses the file name moments after the DO hands the name out, and a miss falls back.
+- Several parts are unverified at run time. These are the JSON request path to the DO, real R2 put and get behavior, the random id source, and the production subrequest limit. A subrequest is one call from a Worker to another service, such as one read from R2.
+- The multi-key delete that the sweep uses does exist in the worker library. The fallback worry in the proof is stale.
+- Small cleanups remain. The ref row type should come from the shared module, and the schema version number collides with a sibling idea.
 
 ## How this idea connects to the others
 
-This idea splits the single ref owner from [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md) into many owners.
+The single ref authority, the commit step, and the compare-and-swap come from [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md).
 
-Each shard keeps refs in DO SQLite and objects in R2, as in [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md).
+Refs live in DO SQLite and objects live in R2, as in [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md).
 
-Objects are stored under their fingerprint, as in [#5 Content-addressed R2 keys](./content-addressed-r2-keys.md).
+Pushes run the unchanged two-phase path from [#6 Two-phase push](./two-phase-push.md).
 
-The push writes objects first and refs second, as in [#6 Two-phase push](./two-phase-push.md).
+The ref prefix on a listing comes from [#3 Speak git protocol v2 only, translate v0 at the edge](./protocol-v2-only.md).
 
-The Worker unpacks the packfile with [#4 Packfile parsing in a Worker with a streaming inflater](./streaming-pack-parser.md).
+The Worker writes the advertisement and the listing reply through the wire code of [#53 The /info/refs?service= entrypoint and pkt-line codec](./info-refs-endpoint.md).
 
-Prefix routing needs the ref prefix from [#3 Speak git protocol v2 only, translate v0 at the edge](./protocol-v2-only.md).
+The repo id and the access rules come from [#54 Auth and multi-tenancy: owner/repo routing to DO ids](./auth-and-multitenancy.md).
 
-The root DO holds the access rules from [#54 Auth and multi-tenancy: owner/repo routing to DO ids](./auth-and-multitenancy.md).
-
-A push across two groups that must succeed or fail as one needs [#48 Cross-repo atomic pushes](./cross-repo-atomic-push.md).
+The build job runs as one slice of the alarm dispatcher from [#55 GC and repack as a DO alarm](./gc-and-repack-alarm.md).

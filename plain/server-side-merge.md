@@ -18,37 +18,42 @@ Think of it like this. Two editors each mark up a copy of the same chapter. A th
 
 ## How it works
 
-1. The client runs git push with the option "merge=main". Git sends the option as an extra pkt-line after the ref commands. A pkt-line is git's way of framing a message. Each line starts with four characters that give its length.
-2. The Worker runs the normal two-phase push. The objects in the packfile land in R2 under content-addressed keys. An object is one stored item in git. An object is a file's content, a folder listing, or a commit. A packfile, or pack, is one bundle that holds many objects, squeezed to save space. R2 is Cloudflare's large file store. It holds the git objects. Content-addressed means stored under its own fingerprint, so the name tells you what is inside.
-3. The Worker asks the repo DO for the current tip of main.
-4. The Worker asks the DO for the merge base. The merge base is the last commit that both branches share. The DO finds the merge base by walking the commit graph in DO SQLite. DO SQLite is the small database inside each Durable Object.
-5. If main already contains the branch, main does not change. If the branch already contains main, main moves forward to the branch tip with no merge commit.
-6. Otherwise the Worker reads three folder listings from R2: the base, main, and the branch. A file changed on only one side is decided without reading its content.
-7. A file changed on both sides is read from R2 and merged line by line with a three-way text merge.
-8. A real conflict stops the push with the message "ng refs/heads/feature merge conflict" and the list of paths. No ref moves.
-9. If there is no conflict, the Worker writes the new folder listings and a merge commit with two parents to R2.
-10. The Worker sends two ref commands to the DO in one call: move the branch, and move main with a compare-and-swap. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it. If main moved during the merge, the Worker retries the merge up to three times.
+The second pass writes the design in Rust, against one shared contract that every idea in this set follows. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker. DO SQLite is the small database inside each Durable Object.
+
+1. The client runs git push with the option "merge=main". The server advertises the push-options feature, and the client echoes it. Each option then rides as one pkt-line after the ref commands. A pkt-line is git's way of framing a message. Each line starts with four characters that give its length. The Worker reads the option lines only when the client echoed the feature, because without the echo that position holds packfile bytes.
+2. The Worker runs the normal two-phase push. The objects in the pushed pack land in R2. A packfile, or pack, is one bundle that holds many objects, squeezed to save space. An object is one stored item in git. An object is a file's content, a folder listing, or a commit. R2 is Cloudflare's large file store. It holds the git objects.
+3. The Worker checks the option. The merge allows exactly one ref command, no delete, and a target under refs/heads/ that is not the pushed ref. A bad option stops the push with a clear message.
+4. The Worker asks the DO for the ref list and finds the current tip of the target.
+5. The Worker finds the merge base by walking commit objects. The merge base is the last commit that both branches share. The Worker asks the DO which objects are live, in groups of 1,000, and reads their bytes from R2. The push's own objects count too.
+6. Three cases end early. If the target already contains the branch, nothing changes. If the branch already contains the target, the target moves forward with no merge commit. If the target does not exist, the Worker creates it at the branch tip.
+7. Otherwise the Worker compares the folder listings of the base, the target, and the branch. A file changed on one side only takes that side. A file changed on both sides is merged line by line. The merge code is a driver the project carries itself, because the ready-made merge library does not build on Wasm. Anything the rules cannot decide is a conflict.
+8. The merge output goes to R2 as one normal pack. The Worker holds the pack's rows back instead of posting them. A conflict aborts the upload and stops the push before anything moves.
+9. Only after the merge plan proves clean does the Worker commit the pushed ref through the normal commit route.
+10. The Worker calls a new DO route for the merge. In one unbroken step the DO writes the pack rows and marks the pack live. The same step checks that the new tip is a known object and runs a compare-and-swap on the target ref. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it.
+11. If the compare-and-swap loses, the same step marks the merge pack dead, and a janitor deletes its key later. A janitor is a background task that deletes files nobody points to anymore. The Worker reads the new tip and merges again, at most three times.
+12. The report names only the ref the client named. The merge outcome rides a progress note on sideband channel 2. A sideband is a way to send two kinds of data in one stream, like a main channel and a progress channel.
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant W as Worker
-    participant D as Repo DO
-    participant R as R2
-    C->>W: Push with option merge=main
-    W->>R: Write pushed objects
-    W->>D: Ask for tip of main and merge base
-    D->>W: Tip and merge base
-    W->>R: Read three folder listings and changed files
-    W->>R: Write merged files and merge commit
-    W->>D: Move branch and main in one call
-    D->>W: ok or ng per ref
-    W->>C: Status report
+    participant Client as git client
+    participant Worker
+    participant DO as Repo DO
+    participant R2
+    Client->>Worker: push with option merge=main
+    Worker->>R2: ingest pushed pack
+    Worker->>DO: read refs, look up objects
+    Worker->>R2: read trees and blobs, write merge pack
+    Worker->>DO: commit pushed ref
+    Worker->>DO: merge cas, pack rows and CAS in one step
+    DO-->>Worker: ok or failed to update ref
+    Worker-->>Client: report lines and merge note
 ```
 
 ## What the reviewer decided
 
-The reviewer's verdict is Risky.
+The reviewer looks for blockers and caveats. A blocker is a problem that stops the idea from working until it is fixed. A caveat is a limit or a condition. The idea works, but only inside this limit.
+
+The verdict is Lands with caveats.
 
 | Score | Value |
 |---|---|
@@ -56,67 +61,93 @@ The reviewer's verdict is Risky.
 | Reliability | 3 of 5 |
 | Correctness | 2 of 5 |
 
-Risky. The idea can be built. But the proof shows one or more problems the reviewer could not fully solve, or it does a weaker version of the goal. Think of it like a runway you can see on the map, but nobody has checked it for holes.
+| Score | First pass | Second pass |
+|---|---|---|
+| Feasibility | 4 of 5 | 4 of 5 |
+| Reliability | 3 of 5 | 4 of 5 |
+| Correctness | 2 of 5 | 3 of 5 |
 
-For this idea, the reviewer says the push option handling and the merge of folder listings are sound. Both use only GA features. GA, or generally available, means a Cloudflare feature that is finished and supported, not a preview. Both refs move in one DO transaction, so the refs can never become two records that disagree.
+Lands with caveats. The idea is sound and can be built. The proof has one or more problems that must be fixed first, and the reviewer described each fix. Think of it like a flight with a runway that needs some repairs before you land. The runway is there. The repairs are known.
 
-But the proof code cannot complete a single real merge against the other ideas it depends on. The merge objects are never registered with the DO before the commit step, and the janitor cannot see them. A janitor, also called a sweep or GC, is a background task that deletes files nobody points to anymore. The reviewer sees three blockers. A blocker is a problem that stops the idea from working until it is fixed. The fixes take weeks on top of the push pipeline.
+For this idea, the second pass is a real step forward. The verdict moved up from Risky to Lands with caveats. The fatal gap of the first pass is closed. Merge objects were invisible to the commit step, and nothing could collect them. Now the pack rows and the ref move share one unbroken step in the DO. The wire story is right too. The option lines are read only on the client's echo, the report is framed in sideband channel 1, and only client-named refs get result lines.
 
-The idea also has caveats. A caveat is a limit or a condition. The idea works, but only inside this limit.
+The remaining work is concrete. Three ideas now carry three copies of the merge machinery, and one module must own it. One crash window can still leak a finished pack. The base walk skips one step of git's algorithm. Five calls do not compile as written. The reviewer still expects weeks of effort.
+
+## What changed in the second pass
+
+- The DO did not know the merge objects: fixed. A new DO route writes the pack rows and marks the pack live in one unbroken step, before the compare-and-swap. The DO sees the new tip at once, and the next merge can walk it.
+- Abandoned merge objects stayed in R2 forever: partly fixed. A merge pack that loses the compare-and-swap is marked dead in the same step, and the janitor deletes its key later. One window remains. A crash between the upload and the call leaves a finished pack that no row names.
+- The status report was not framed for a normal git client: fixed by the contract modules. The wire module frames the report in sideband channel 1, and the option lines are parsed only when the client echoed the feature. The code that joins these pieces to the push route is declared but not shown.
+- The merge base search could pick an older shared commit: partly fixed. The walk now uses git's own algorithm with a commit-time heap. The code skips one re-queue step, so out-of-order commit times can still return a false "unrelated histories" answer. The failure direction stays safe.
+- Merged files were written before all conflicts were known: fixed. A conflict now aborts the upload and returns an error, and no row for the merge pack ever exists.
+- The x-git-user header could be faked: fixed. The merge commit's author is the login name from the auth layer. No client header is read. The commit is still not signed.
+- The largest file changed on both sides set the memory limit: fixed. A merged object is capped at 16 MiB, the loaded set at 64 MiB, and the base walk at 100,000 commits. Over a cap the push fails with a limit message, not a fake conflict.
+- git warned on the extra status line for main: fixed. The report carries only the ref the client named. The merge outcome rides a progress note on sideband channel 2.
+- Folder entries were sorted as text, not bytes: fixed. Entries are now compared as raw bytes, and folders sort as the name followed by a slash.
+- A delete or an empty pack reached the merge code unguarded: fixed. The option check rejects a delete, a self-merge, and a push with more than one command before any object is touched.
+- An early ok line for the branch could leak when main failed: fixed. The report is built once after the loop. Under the contract each ref moves on its own, so an ok for the branch is a real move.
+- The merge base code read a table layout the sibling idea did not have: fixed. Those tables do not exist under the contract. The walk reads commit objects from R2.
 
 ## Problems that must be fixed first
 
-### Problem 1: The DO does not know the merge objects
+### Problem 1: Three copies of the merge machinery drift apart
 
-**What goes wrong.** The two-phase push keeps a list of the objects in each push, called the manifest. The Worker writes the merged files, the folder listings, and the merge commit to R2 outside that manifest. When the DO commits the refs, the DO checks that the new tip of main is a known object. The check fails, so the DO rejects every real merge with "missing necessary objects".
+**What goes wrong.** The tree merge, the base walk, and the line-by-line driver now exist in three ideas, each with different rules. The same driver is registered at two paths with two different signatures. This proof also fails to name one of the siblings it depends on.
 
-The merge objects are also never added to the DO's tables of objects, commits, and parents. So even with the check removed, the new tip of main cannot be fetched and cannot serve as a merge base later.
+**Why it matters.** The copies already disagree. This idea silently accepts a file-turned-folder change, one sibling rejects it with an error, and a third reports a conflict. Each base walk has a different bug.
 
-**Why it matters.** Only the two easy cases work today: main already contains the branch, or main moves forward with no merge commit. The case the idea exists for never succeeds.
+**How to fix it.** Let one shared module own the driver, the tree merge, and the base walk before the three ideas land.
 
-**How to fix it.** Add a step in which the Worker registers the merge objects and their links with the DO before the commit call. Make that step also fill the tables of objects, commits, and parents.
+### Problem 2: A finished merge pack can leak
 
-### Problem 2: Abandoned merge objects stay in R2 forever
+**What goes wrong.** The Worker starts the merge pack upload before any pack row exists. A crash between the end of the upload and the commit call leaves a completed pack in R2 that no row names.
 
-**What goes wrong.** Some merges are abandoned. A retry lost the CAS three times, a Worker crashed, or a conflict was found after some merged files were already written. In each case the merge objects sit in R2. They are in no manifest, so the janitor the proof relies on cannot find them. They are never deleted.
+**Why it matters.** The janitor deletes only packs whose row is marked dead. The R2 rule that removes incomplete uploads does not cover a finished pack. Nothing ever deletes it.
 
-**Why it matters.** Storage grows with every abandoned merge and never shrinks. The proof claims the janitor sweeps these objects. That claim is false.
+**How to fix it.** Post an empty pack row before the upload starts, the same pattern the push path uses. Or accept the leak and state it plainly.
 
-**How to fix it.** Put the merge objects into a manifest, or into a second manifest of their own, before writing them. Then the janitor can sweep them when the merge is abandoned.
+### Problem 3: The merge base search can miss a real base
 
-### Problem 3: The status report is not framed for a normal git client
+**What goes wrong.** The walk marks each commit as queued and never queues it again. Git's algorithm puts a commit back in the queue each time it gains a flag. Here a commit that gains the second flag late is never revisited.
 
-**What goes wrong.** The server advertises a sideband, so the status report must be wrapped in sideband channel 1. A sideband is a way to send two kinds of data in one stream, like a main channel and a progress channel. The proof does not show that wrapping.
+**Why it matters.** When commit times are out of order, the walk can answer "unrelated histories" for branches that do share a base. The push then fails on a false error. The direction stays safe, but the proof's claim to follow git's algorithm is false.
 
-The Worker must also check that the client echoed the push-options feature before reading an option section. Without that check, the Worker reads the start of the packfile as options. Either fault makes a normal git push with the option "merge=main" fail.
+**How to fix it.** Queue a commit again when it gains a flag. Flags only grow, so the walk still ends. Or drop the claim.
 
-**Why it matters.** The idea only works if a normal git push can complete. As written, a normal git push would fail before the merge starts.
+### Problem 4: The proof code does not compile
 
-**How to fix it.** Wrap every status line in sideband channel 1. Read an option section only when the client echoed the push-options feature.
+**What goes wrong.** Five calls are verified wrong. The hash function is called with two arguments and takes three. Two iterators each miss an argument. One entry id needs an owning copy. One trait import is missing.
+
+**Why it matters.** Rust code that does not compile cannot run. The fixes are mechanical, but nothing in this idea can be tested until they land.
+
+**How to fix it.** Correct the five calls to match the pinned crate versions.
+
+### Problem 5: A file turned into a folder on both sides merges silently
+
+**What goes wrong.** When the base holds a file and both sides replace it with a folder, the code merges the two folders and drops the base file's content. Git reports a conflict in this case.
+
+**Why it matters.** This is the one place the merge accepts in the dangerous direction. Everywhere else the design reports a conflict when the rules cannot decide.
+
+**How to fix it.** Report a conflict for the case, or check the kind of the base entry before merging the folders.
 
 ## Things to know
 
-- The merge base search does not order commits by generation, so in a history with many merges the search can pick an older shared commit. That produces false conflicts, never a silent wrong merge.
-- Folder entries are sorted with the JavaScript string compare, not by bytes. File names outside the basic character range produce a listing that git's checker rejects as not sorted.
-- The Worker loads the whole of each file that both sides changed into 128 MB of memory, so the largest such file sets the limit. Large files must be refused with a clear message, not reported as conflicts.
-- The x-git-user header names the author of the merge commit, and a client can fake that header unless the login layer strips it. The merge commit is not signed.
-- The status report includes a line for main, which the client never named, and git warns on that line but does not stop. The outcome for main must instead ride on the branch's line and on a sideband channel 2 message, which the code leaves out.
-- The merge base code reads a table layout that does not match the sibling idea's table of parents. A push that deletes a branch, or a push with an empty packfile, reaches the merge code with no guard and crashes.
+- After the branch commit succeeds, a merge error still reports ng on a branch that already moved. The only reachable case is a sweep in the small window between the two calls. The report must fall back to the three-attempts note once the results exist.
+- Errors other than unpack errors still reach git as HTTP 413 or 500 after the pack was sent. The fix belongs to the sibling idea's receive code.
+- When a fetch round repeats, the code can write the same object into the merge pack twice. The duplicates are legal and bounded, but they count against the 10,000-object cap, and a conflict path can appear twice in the message.
+- Some error paths abandon the upload without aborting it. The leftover is an incomplete upload that only the unverified R2 cleanup rule can remove.
+- The option accepts exactly one option and one ref command, so a push that names two branches with the merge option is rejected whole. The merge's reflog line also stores a made-up push id that joins to nothing.
+- Under the contract each ref moves on its own. The branch can report ok while the merge is skipped after three lost races, and a merge can land while the branch's own move failed.
+- The Worker reads the whole ref list from the DO on each attempt, up to three times. A late attempt also inherits every object the earlier attempts loaded.
+- Several parts are unverified at run time. These are the request path to the DO, some commit and tree field names, the random id source, and real R2 multipart uploads. The line-by-line merge driver is claimed, not built.
 
 ## How this idea connects to the others
 
-The merge runs after the objects are stored but before the refs move, as in [#6 Two-phase push](./two-phase-push.md).
-
-The Worker unpacks the pushed packfile with [#4 Packfile parsing in a Worker with a streaming inflater](./streaming-pack-parser.md).
-
-The two ref commands go to the single ref owner from [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md).
-
-Refs live in DO SQLite and objects live in R2, as in [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md).
-
-Merge objects are written under their fingerprint, as in [#5 Content-addressed R2 keys](./content-addressed-r2-keys.md).
-
-The merge base comes from the commit graph in [#56 Want/have negotiation with a commit-graph in SQLite](./want-have-negotiation.md).
-
-The push option is advertised by [#53 The /info/refs?service= entrypoint and pkt-line codec](./info-refs-endpoint.md).
-
-The author of the merge commit comes from the login layer in [#54 Auth and multi-tenancy: owner/repo routing to DO ids](./auth-and-multitenancy.md).
+- The pushed pack is ingested and the pushed ref is committed by [#6 Two-phase push](./two-phase-push.md).
+- The ref moves and the new merge route go to the single ref owner from [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md).
+- Refs live in DO SQLite and objects live in R2, as in [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md).
+- The Worker unpacks the pushed packfile with [#4 Packfile parsing in a Worker with a streaming inflater](./streaming-pack-parser.md).
+- Dead merge packs are swept by the janitor from [#55 GC and repack as a DO alarm](./gc-and-repack-alarm.md).
+- The push option is advertised by [#53 The /info/refs?service= entrypoint and pkt-line codec](./info-refs-endpoint.md).
+- The author of the merge commit comes from the login layer in [#54 Auth and multi-tenancy: owner/repo routing to DO ids](./auth-and-multitenancy.md).
+- The line-by-line merge driver and the tree-merge code are shared with [#18 Server-side rebase and squash as protocol v2 extensions](./server-side-rebase.md).

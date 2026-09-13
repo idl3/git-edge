@@ -36,8 +36,9 @@ Read in this order.
 3. [findings/build-order.md](findings/build-order.md). Six waves, from the first message to the exotic ideas.
 4. [findings/scoreboard.md](findings/scoreboard.md). All 56 ideas scored, with a one-line plain summary each.
 5. [findings/rust-and-gitoxide.md](findings/rust-and-gitoxide.md). Why the server will be written in Rust with gitoxide, and what that does and does not fix.
-6. [plain/](plain/). One plain-language explainer per idea, with an analogy, a diagram, and each problem explained.
-7. [site/index.html](site/index.html). The interactive map. Click an idea to see its plain explainer, its proof, and its review.
+6. [findings/second-pass.md](findings/second-pass.md). What changed when 33 ideas were rewritten in Rust against one shared contract, in plain words.
+7. [plain/](plain/). One plain-language explainer per idea, with an analogy, a diagram, and each problem explained.
+8. [site/index.html](site/index.html). The interactive map. Click an idea to see its plain explainer, its proofs, and its reviews.
 
 ## The language decision
 
@@ -51,6 +52,8 @@ The 56 proofs were written in TypeScript. We then asked whether the server can b
 | `plain/` | One explainer per idea in plain language | Everyone. |
 | `proofs/` | One proof per idea, with code | Engineers. |
 | `reviews/` | One review per idea, in the reviewer's own words | Engineers. |
+| `proofs-v2/` | The second pass: 33 foundation and edge proofs rewritten in Rust against the contract | Engineers. |
+| `reviews-v2/` | The second-pass reviews, checking contract compliance | Engineers. |
 | `ideas/` | The list of 56 ideas as they went into the study | Everyone. |
 | `site/` | The interactive map as one web page | Everyone. |
 | `data/` | The structured results every other file was made from | Tools. |
