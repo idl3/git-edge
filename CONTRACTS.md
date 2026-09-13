@@ -529,3 +529,13 @@ The following are not built, not advertised, and must not be assumed by a revise
 - Metrics, tracing beyond `console_log!`, admin API.
 
 A revised proof that needs one of these items writes it as a dependency on a named later idea, and its proof code compiles against the signatures in section 1 exactly as written here.
+
+## Corrections from the Rust spike (measured 2026-09-13, see research/rust-spike.md)
+
+These override anything above or in research/rust-server.md that disagrees.
+
+1. `gix_packetline` 0.22.2: the encoder and writer live under `gix_packetline::blocking_io::{encode, Writer, StreamingPeekableIter}`. `gix_packetline::encode` holds only the `Error` type. Use `use gix_packetline::blocking_io::encode;`.
+2. `gix_pack::data::delta::apply` and `decode_header_size` are `pub(crate)` in 0.74.2. Resolve deltas through `gix_pack::data::File::<&[u8]>::from_data(bytes, path, kind)`, then `entry(offset)` and `decode_entry(entry, &mut out, &mut gix_zlib::Inflate, &resolve_ref_delta, &mut cache::Never)`. `gix-zlib` 0.1.0 is therefore a direct dependency. `BytesToEntriesIter` yields compressed entry bytes only.
+3. `[profile.release] strip = true` breaks `worker-build` (the abort handler needs the `target_features` section that `--strip-all` removes). Use `strip = "debuginfo"`.
+4. Client-controlled parse failures must return HTTP 400 from the handler. A `worker::Error` propagated out of `fetch` surfaces as an uncaught exception and HTTP 500.
+5. Measured: the whole spike Worker with gix-hash, gix-object, gix-packetline, gix-pack, gix-traverse and gix-zlib linked is 605 KB after wasm-opt, 262 KB gzipped on upload. Cold instantiate cost is 20 to 30 ms on local workerd. Real git 2.43 `ls-remote` over protocol v2 and v0 succeeded against it, and a 6-object pack with two OFS deltas was parsed, resolved, hashed and walked on workerd with ids matching `git verify-pack`.

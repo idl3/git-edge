@@ -12,7 +12,7 @@ use std::io::Write;
 
 use bstr::ByteSlice;
 use gix_hash::ObjectId;
-use gix_packetline::{decode, encode, PacketLineRef};
+use gix_packetline::{blocking_io::encode, decode, PacketLineRef};
 use serde::Serialize;
 use worker::*;
 
@@ -173,7 +173,12 @@ impl RepoDO {
         let mut lines: Vec<PacketLineRef<'_>> = Vec::new();
         let mut rest = body;
         while !rest.is_empty() {
-            match decode::streaming(rest).map_err(|e| Error::RustError(format!("pkt-line decode: {e}")))? {
+            // Malformed client input is a 400, never a 500 (and never a panic).
+            let stream = match decode::streaming(rest) {
+                Ok(s) => s,
+                Err(e) => return Response::error(format!("bad pkt-line: {e}"), 400),
+            };
+            match stream {
                 decode::Stream::Complete { line, bytes_consumed } => {
                     lines.push(line);
                     rest = &rest[bytes_consumed..];
@@ -406,7 +411,7 @@ async fn selftest(env: &Env) -> Result<Response> {
         Err(e) => report.errors.push(format!("r2: {e}")),
     }
     // Exercise the packetline Writer (blocking-io) too, just to link it.
-    let mut w = gix_packetline::Writer::new(Vec::<u8>::new());
+    let mut w = gix_packetline::blocking_io::Writer::new(Vec::<u8>::new());
     w.write_all(b"ping").map_err(|e| Error::RustError(e.to_string()))?;
     Response::from_json(&report)
 }

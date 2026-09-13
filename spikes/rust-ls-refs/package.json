@@ -1,1 +1,1 @@
-{ "name": "git-edge-spike", "private": true, "devDependencies": { "wrangler": "^4.129.0" } }
+{"name":"git-edge-spike","private":true,"devDependencies":{"wrangler":"4.129"}}

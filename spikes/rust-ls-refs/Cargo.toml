@@ -27,4 +27,4 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = "debuginfo"   # NOT `true`: --strip-all drops the target_features section and wasm-bindgen then fails with "externref table required for catch wrappers"

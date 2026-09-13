@@ -74,12 +74,24 @@ The nine problems in [cross-cutting-defects.md](./cross-cutting-defects.md) are 
 
 - gitoxide has no server side. The commands for listing refs, sending a pack, and receiving a push must be written by us on top of gitoxide's message codec. Budget for that.
 - Every walk over commits must load first and walk second. A walk that discovers what to load next must be written as a loop of small loads. This is the same shape as the fix for the subrequest limit.
-- The compiled Rust program is likely 1 to 3 MB. Cloudflare allows 64 MiB. The risk is start-up time, which has a 1 second budget for top-level code. Nobody has measured this yet. Keep the top level empty and measure with a cold-start test before committing.
+- The compiled Rust program is 605 KB, measured. Cloudflare allows 64 MiB. Start-up cost was 20 to 30 ms locally against a 1 second budget. The number on Cloudflare's own machines is still to be measured.
 - A build takes minutes, not seconds. The change-and-test loop is slower than in TypeScript.
 - A Rust panic stops the whole Worker unless a flag is set. Every byte from a client must be checked, never assumed.
 - gitoxide checks that its blocks build for Wasm. It does not run its tests on Wasm. We must run our own tests for delta unpacking and pack streaming inside a Worker.
 - gitoxide releases monthly and bumps many crate versions together. Pin exact versions and upgrade on purpose.
 - workers-rs has small gaps. Typed calls between DOs are experimental, so use web-shaped calls. The DO cannot read its own name, so store it.
+
+## We built the first slice, and it works
+
+After the memo, we built the first milestone as a real program and ran it on the Cloudflare runtime locally. The results are in [research/rust-spike.md](../research/rust-spike.md) and the source is in `spikes/rust-ls-refs/`.
+
+- A normal git program ran `git ls-remote` against the Rust Worker and printed all four seeded refs. It worked over the newer message set and over the old one.
+- The Worker read a small packfile with two deltas, unpacked them, and computed every fingerprint. Every value matched what git itself reports for the same packfile.
+- The whole program with all six gitoxide building blocks is 605 KB. That is well under the 64 MiB limit. The memo's guess of 1 to 3 MB was too pessimistic.
+- The first request after start costs 20 to 30 ms more than later requests. The start-up budget is 1 second. The risk the memo raised is closed for local runs. The number on Cloudflare's own machines is still to be measured.
+- Three details in the memo were wrong and are now corrected in the contract. The message encoder lives under a different module path. The delta function is not public, so deltas go through the packfile reader instead. One build flag had to change.
+
+Think of it like this. The memo was the map. The spike was the first walk down the road. The road is there, two signposts were mislabelled, and the walk was shorter than the map suggested.
 
 ## Where to start
 
