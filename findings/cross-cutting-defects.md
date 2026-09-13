@@ -1,94 +1,177 @@
-# Cross-cutting defects
+# The nine problems that kept coming back
 
-The reviewers kept finding the same failure modes across unrelated ideas. These are platform truths about Workers and Durable Objects, not per-idea mistakes. Fix each once in the foundation and most of the per-idea caveats disappear.
+The reviewers checked 56 ideas. The same nine problems appeared again and again, in ideas that had nothing to do with each other. These problems are not mistakes in one idea. They are facts about how Cloudflare Workers and Durable Objects behave. If we fix each one once, in the foundation, most of the per-idea problems disappear.
 
-## pkt-line and sideband framing details git actually checks
+Think of it like this. A gardener plants 56 different seeds. Many of them grow badly. The gardener looks closer and finds the same nine causes: the soil is too wet, the wall casts a shadow, the hose is too short. Fixing the soil once helps every plant, not one plant.
 
-**Hit 37 of 56 proofs.**
+Each section below gives four things. What goes wrong. Why it matters. A picture. The one fix.
 
-Git checks exact bytes: pkt-line lengths include their own four hex digits, sideband frames must be at most 65,515 data bytes, report-status rides in band 1, and a v2 fetch with done omits the acknowledgments section.
+## 1. The message format git checks byte by byte
 
-**Fix once:** One shared pkt-line and sideband codec module, tested against a stock git client before any feature uses it.
+**Hit 37 of 56 ideas.**
 
-Affected: [#1 repo-do-ref-authority](../reviews/repo-do-ref-authority.md), [#2 refs-sqlite-objects-r2](../reviews/refs-sqlite-objects-r2.md), [#3 protocol-v2-only](../reviews/protocol-v2-only.md), [#4 streaming-pack-parser](../reviews/streaming-pack-parser.md), [#6 two-phase-push](../reviews/two-phase-push.md), [#7 precomputed-clone-pack](../reviews/precomputed-clone-pack.md), [#8 pinned-delta-bases](../reviews/pinned-delta-bases.md), [#10 partial-clone-filters](../reviews/partial-clone-filters.md), [#13 replicated-refs-edge](../reviews/replicated-refs-edge.md), [#14 alarm-chain-ci](../reviews/alarm-chain-ci.md), [#15 live-fetch-websocket](../reviews/live-fetch-websocket.md), [#16 branch-level-dos](../reviews/branch-level-dos.md), [#17 server-side-merge](../reviews/server-side-merge.md), [#19 signed-reflog](../reviews/signed-reflog.md), [#20 time-travel-refs](../reviews/time-travel-refs.md), [#23 hooks-as-workers](../reviews/hooks-as-workers.md), [#25 wasm-git-core](../reviews/wasm-git-core.md), [#26 search-index-on-push](../reviews/search-index-on-push.md), [#28 scoped-token-remotes](../reviews/scoped-token-remotes.md), [#30 ephemeral-repos](../reviews/ephemeral-repos.md), [#31 crdt-branches](../reviews/crdt-branches.md), [#32 agent-native-commands](../reviews/agent-native-commands.md), [#34 commit-event-stream](../reviews/commit-event-stream.md), [#35 speculative-packs](../reviews/speculative-packs.md), [#36 federated-gossip](../reviews/federated-gossip.md), [#38 global-dedup](../reviews/global-dedup.md), [#39 merkle-proofs](../reviews/merkle-proofs.md), [#41 branch-preview-workers](../reviews/branch-preview-workers.md), [#44 ref-leases](../reviews/ref-leases.md), [#46 time-boxed-history](../reviews/time-boxed-history.md), [#48 cross-repo-atomic-push](../reviews/cross-repo-atomic-push.md), [#49 github-webhook-compat](../reviews/github-webhook-compat.md), [#50 storage-tiering](../reviews/storage-tiering.md), [#51 agent-blame](../reviews/agent-blame.md), [#52 offline-browser-client](../reviews/offline-browser-client.md), [#53 info-refs-endpoint](../reviews/info-refs-endpoint.md), [#56 want-have-negotiation](../reviews/want-have-negotiation.md)
+**What goes wrong.** git is a tool that keeps every version of a set of files, and lets many people share those versions. When git talks to a server, it uses a strict message format called pkt-line. Each line starts with four characters that give the line's length. Many proofs got a detail of this format wrong. Some wrote the length without counting the four length characters themselves. Some sent a chunk larger than the maximum of 65,515 bytes. Some sent a status reply on the wrong channel. Some sent a reply section that git does not expect.
 
-## Janitor or GC sweeps race live pushes and delete referenced objects
+**Why it matters.** git does not forgive a wrong byte. It stops with an error and the user sees a failed clone or a failed push. The server can be perfect inside and still be useless if the first message is wrong.
 
-**Hit 31 of 56 proofs.**
+Think of it like this. A postal service that only accepts letters in one exact envelope size. The letter can be brilliant. If the envelope is one millimeter too wide, the letter comes back.
 
-A janitor or repack computed an orphan set, awaited R2, and deleted an object that a concurrent push had just made reachable.
+```mermaid
+sequenceDiagram
+    participant C as git client
+    participant S as server
+    C->>S: request
+    S-->>C: "0009packfile" (wrong length prefix)
+    C->>C: error: bad line length
+    Note over C: clone stops here
+```
 
-**Fix once:** Grace period by timestamp, refs_version check atomic with the delete, and never delete in the same alarm slice that computed the candidate set.
+**The one fix.** Write one shared code module that builds and reads pkt-line messages and sideband channels. Test that module against a real git program before any feature uses it. Then every idea uses the same tested module.
 
-Affected: [#1 repo-do-ref-authority](../reviews/repo-do-ref-authority.md), [#2 refs-sqlite-objects-r2](../reviews/refs-sqlite-objects-r2.md), [#4 streaming-pack-parser](../reviews/streaming-pack-parser.md), [#5 content-addressed-r2-keys](../reviews/content-addressed-r2-keys.md), [#6 two-phase-push](../reviews/two-phase-push.md), [#7 precomputed-clone-pack](../reviews/precomputed-clone-pack.md), [#9 in-do-object-cache](../reviews/in-do-object-cache.md), [#10 partial-clone-filters](../reviews/partial-clone-filters.md), [#11 native-lfs](../reviews/native-lfs.md), [#12 bundle-uri](../reviews/bundle-uri.md), [#14 alarm-chain-ci](../reviews/alarm-chain-ci.md), [#17 server-side-merge](../reviews/server-side-merge.md), [#18 server-side-rebase](../reviews/server-side-rebase.md), [#20 time-travel-refs](../reviews/time-travel-refs.md), [#22 cow-forks](../reviews/cow-forks.md), [#23 hooks-as-workers](../reviews/hooks-as-workers.md), [#24 presigned-direct-upload](../reviews/presigned-direct-upload.md), [#25 wasm-git-core](../reviews/wasm-git-core.md), [#27 diff-api-range-reads](../reviews/diff-api-range-reads.md), [#29 tui-rpc-push](../reviews/tui-rpc-push.md), [#30 ephemeral-repos](../reviews/ephemeral-repos.md), [#32 agent-native-commands](../reviews/agent-native-commands.md), [#34 commit-event-stream](../reviews/commit-event-stream.md), [#37 client-key-encryption](../reviews/client-key-encryption.md), [#38 global-dedup](../reviews/global-dedup.md), [#40 zero-clone-vfs](../reviews/zero-clone-vfs.md), [#42 git-as-db-driver](../reviews/git-as-db-driver.md), [#44 ref-leases](../reviews/ref-leases.md), [#48 cross-repo-atomic-push](../reviews/cross-repo-atomic-push.md), [#50 storage-tiering](../reviews/storage-tiering.md), [#55 gc-and-repack-alarm](../reviews/gc-and-repack-alarm.md)
+## 2. The cleanup task deletes files that are still in use
 
-## Real pushes arrive as thin packs; every reader needs delta resolution
+**Hit 31 of 56 ideas.**
 
-**Hit 27 of 56 proofs.**
+**What goes wrong.** Every git server needs a background task that deletes objects nobody points to anymore. An object is one stored item in git, such as a file's content or a commit. We call this task the janitor. The janitor makes a list of unused objects, then waits for the file store to respond, then deletes. While the janitor waits, a new push can arrive and start to use one of those objects. The janitor then deletes an object that a branch now points to.
 
-Real pushes arrive as thin packs with ofs-delta and ref-delta entries. Many proofs assumed loose objects and had no delta resolution path.
+**Why it matters.** The result is a repository with a hole in it. A branch points at a commit, but the commit's data is gone. Every later clone of that branch fails. This is data loss, and it is silent until someone clones.
 
-**Fix once:** The streaming pack parser resolves deltas on ingest, and a pack index in SQLite lets every later reader find any object in a pack by range read.
+Think of it like this. A hotel cleaner makes a list of empty rooms at 9:00, goes to get the cart, and starts cleaning at 9:10. A guest checked into room 12 at 9:05. The cleaner throws out the guest's luggage.
 
-Affected: [#2 refs-sqlite-objects-r2](../reviews/refs-sqlite-objects-r2.md), [#4 streaming-pack-parser](../reviews/streaming-pack-parser.md), [#5 content-addressed-r2-keys](../reviews/content-addressed-r2-keys.md), [#7 precomputed-clone-pack](../reviews/precomputed-clone-pack.md), [#8 pinned-delta-bases](../reviews/pinned-delta-bases.md), [#9 in-do-object-cache](../reviews/in-do-object-cache.md), [#22 cow-forks](../reviews/cow-forks.md), [#25 wasm-git-core](../reviews/wasm-git-core.md), [#26 search-index-on-push](../reviews/search-index-on-push.md), [#27 diff-api-range-reads](../reviews/diff-api-range-reads.md), [#28 scoped-token-remotes](../reviews/scoped-token-remotes.md), [#29 tui-rpc-push](../reviews/tui-rpc-push.md), [#33 semantic-diffs](../reviews/semantic-diffs.md), [#34 commit-event-stream](../reviews/commit-event-stream.md), [#35 speculative-packs](../reviews/speculative-packs.md), [#36 federated-gossip](../reviews/federated-gossip.md), [#37 client-key-encryption](../reviews/client-key-encryption.md), [#38 global-dedup](../reviews/global-dedup.md), [#39 merkle-proofs](../reviews/merkle-proofs.md), [#40 zero-clone-vfs](../reviews/zero-clone-vfs.md), [#41 branch-preview-workers](../reviews/branch-preview-workers.md), [#45 vectorized-commit-graph](../reviews/vectorized-commit-graph.md), [#47 reviews-as-refs](../reviews/reviews-as-refs.md), [#50 storage-tiering](../reviews/storage-tiering.md), [#52 offline-browser-client](../reviews/offline-browser-client.md), [#54 auth-and-multitenancy](../reviews/auth-and-multitenancy.md), [#55 gc-and-repack-alarm](../reviews/gc-and-repack-alarm.md)
+```mermaid
+sequenceDiagram
+    participant J as janitor
+    participant R as R2 file store
+    participant P as new push
+    J->>J: list unused objects: [X]
+    J->>R: wait for R2
+    P->>R: write X, point branch at X
+    J->>R: delete X
+    Note over R: branch points at deleted X
+```
 
-## DO input gates open during R2 awaits, so check-then-act races
+**The one fix.** Give every object a grace period, so the janitor never deletes an object younger than a set time. Check a version number of the refs at the exact moment of the delete, all at once with the delete. Never delete in the same run that made the list.
 
-**Hit 15 of 56 proofs.**
+## 3. Real pushes arrive squeezed, and readers expected them unsqueezed
 
-Durable Objects are single-threaded, but the input gate only holds across storage awaits. Any await on R2 or fetch lets another request interleave, so a ref read before an R2 call and a ref write after it is a classic lost update.
+**Hit 27 of 56 ideas.**
 
-**Fix once:** Do all R2 work first, then run the ref compare-and-swap inside one synchronous transactionSync with no await in it. Reserve blockConcurrencyWhile for GC-style sweeps.
+**What goes wrong.** When you push, git does not send each object one by one. It sends one packfile, which is one bundle that holds many objects, squeezed to save space. Inside the bundle, many objects are stored as a delta. A delta says "the same as that other object, with these changes". Many proofs assumed each object arrives on its own, fully written out. They had no code to unpack a delta.
 
-Affected: [#2 refs-sqlite-objects-r2](../reviews/refs-sqlite-objects-r2.md), [#6 two-phase-push](../reviews/two-phase-push.md), [#11 native-lfs](../reviews/native-lfs.md), [#15 live-fetch-websocket](../reviews/live-fetch-websocket.md), [#18 server-side-rebase](../reviews/server-side-rebase.md), [#19 signed-reflog](../reviews/signed-reflog.md), [#21 r2-versioned-snapshots](../reviews/r2-versioned-snapshots.md), [#22 cow-forks](../reviews/cow-forks.md), [#24 presigned-direct-upload](../reviews/presigned-direct-upload.md), [#31 crdt-branches](../reviews/crdt-branches.md), [#35 speculative-packs](../reviews/speculative-packs.md), [#40 zero-clone-vfs](../reviews/zero-clone-vfs.md), [#42 git-as-db-driver](../reviews/git-as-db-driver.md), [#48 cross-repo-atomic-push](../reviews/cross-repo-atomic-push.md), [#55 gc-and-repack-alarm](../reviews/gc-and-repack-alarm.md)
+**Why it matters.** Every real push from a real git program is a packfile with deltas. A server that cannot read deltas cannot accept a normal push. It also cannot read back objects that arrived that way.
 
-## Proofs disagree on R2 key layout and object encoding
+Think of it like this. A recipe book where most pages say "same as page 40, but use butter instead of oil". If you tear out page 40, half the book is unreadable.
 
-**Hit 15 of 56 proofs.**
+**The one fix.** The pack reader must unpack every delta as the push arrives, and store each object fully written out. It must also keep an index in the database that says which bundle holds each object and at what position. Then every later reader can find any object with one small read.
 
-The proofs disagreed on whether R2 holds zlib loose objects, raw content with metadata, or packs, and on key layout. Ideas that were individually fine could not read each other's bytes.
+## 4. The proofs did not agree on how objects are stored
 
-**Fix once:** Write one object storage spec: key layout, body encoding, metadata fields, and a pack index table shape. Every idea reads through the same object reader.
+**Hit 15 of 56 ideas.**
 
-Affected: [#5 content-addressed-r2-keys](../reviews/content-addressed-r2-keys.md), [#7 precomputed-clone-pack](../reviews/precomputed-clone-pack.md), [#9 in-do-object-cache](../reviews/in-do-object-cache.md), [#10 partial-clone-filters](../reviews/partial-clone-filters.md), [#18 server-side-rebase](../reviews/server-side-rebase.md), [#21 r2-versioned-snapshots](../reviews/r2-versioned-snapshots.md), [#22 cow-forks](../reviews/cow-forks.md), [#26 search-index-on-push](../reviews/search-index-on-push.md), [#31 crdt-branches](../reviews/crdt-branches.md), [#33 semantic-diffs](../reviews/semantic-diffs.md), [#42 git-as-db-driver](../reviews/git-as-db-driver.md), [#43 server-side-bisect](../reviews/server-side-bisect.md), [#47 reviews-as-refs](../reviews/reviews-as-refs.md), [#54 auth-and-multitenancy](../reviews/auth-and-multitenancy.md), [#55 gc-and-repack-alarm](../reviews/gc-and-repack-alarm.md)
+**What goes wrong.** Some proofs stored each object squeezed. Some stored it unsqueezed with a small label next to it. Some used one folder layout, some another. Each proof worked on its own. Two proofs together could not read each other's files.
 
-## A Durable Object has exactly one alarm slot; siblings clobber each other
+**Why it matters.** The system is one system. If the pack reader writes objects one way and the clone builder reads them another way, nothing works end to end.
 
-**Hit 10 of 56 proofs.**
+Think of it like this. A band where the guitarist tunes to one pitch and the singer to another. Each sounds fine alone. Together it is noise.
 
-A Durable Object has exactly one alarm. The janitor, the repack, the CI chain, the KV publisher and the lease expirer all called setAlarm and silently cancelled each other.
+**The one fix.** Write one short document that says exactly how objects are stored: the folder layout, the squeezed or unsqueezed format, the label fields, and the shape of the index table. Every idea reads and writes through one shared object reader that follows that document.
 
-**Fix once:** One alarm dispatcher per DO: a jobs table in SQLite with next_run_at, and a single alarm() that pops the earliest row and re-arms for the next.
+## 5. The Durable Object lets requests collide while it waits on the network
 
-Affected: [#9 in-do-object-cache](../reviews/in-do-object-cache.md), [#20 time-travel-refs](../reviews/time-travel-refs.md), [#23 hooks-as-workers](../reviews/hooks-as-workers.md), [#25 wasm-git-core](../reviews/wasm-git-core.md), [#30 ephemeral-repos](../reviews/ephemeral-repos.md), [#35 speculative-packs](../reviews/speculative-packs.md), [#44 ref-leases](../reviews/ref-leases.md), [#48 cross-repo-atomic-push](../reviews/cross-repo-atomic-push.md), [#49 github-webhook-compat](../reviews/github-webhook-compat.md), [#55 gc-and-repack-alarm](../reviews/gc-and-repack-alarm.md)
+**Hit 15 of 56 ideas.**
 
-## git sends chunked and gzipped request bodies
+**What goes wrong.** A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. That is the promise. The promise has a condition. The DO handles one thing at a time only while it waits on its own storage. When the DO waits on the network instead, for example on R2, another request can run in the middle. Many proofs read a branch pointer, then waited on R2, then wrote the branch pointer. Two pushes could both read the old value and both write, and one push is lost.
 
-**Hit 8 of 56 proofs.**
+**Why it matters.** This is the exact problem the whole design exists to avoid. A lost push means a user's commit vanished with a success message.
 
-git gzips small POST bodies and sends chunked transfer for pushes over 1 MiB, so there is no content-length to hand R2.
+Think of it like this. One librarian updates the catalog. She reads the card for a book, walks to the back room to fetch something, and comes back to write the card. While she was away, a second librarian read the same card and wrote a different value. The first librarian overwrites it without knowing.
 
-**Fix once:** Honor Content-Encoding at the edge and ingest packs through R2 multipart upload with buffered parts of at least 5 MiB.
+```mermaid
+sequenceDiagram
+    participant A as push A
+    participant DO as Durable Object
+    participant R as R2
+    A->>DO: read branch = old
+    DO->>R: wait on R2 (gate opens)
+    Note over DO: push B runs here, reads old, writes B
+    DO->>DO: write branch = A
+    Note over DO: push B is lost
+```
 
-Affected: [#1 repo-do-ref-authority](../reviews/repo-do-ref-authority.md), [#3 protocol-v2-only](../reviews/protocol-v2-only.md), [#5 content-addressed-r2-keys](../reviews/content-addressed-r2-keys.md), [#6 two-phase-push](../reviews/two-phase-push.md), [#7 precomputed-clone-pack](../reviews/precomputed-clone-pack.md), [#28 scoped-token-remotes](../reviews/scoped-token-remotes.md), [#39 merkle-proofs](../reviews/merkle-proofs.md), [#41 branch-preview-workers](../reviews/branch-preview-workers.md)
+**The one fix.** Do all the R2 work first. Then run the read and the write of the branch pointer inside one storage transaction with no network wait inside it. Use the compare-and-swap rule: change the value only if it still has the value you expect.
 
-## 1,000 subrequests per invocation; per-object R2 calls blow the cap
+## 6. A Durable Object has only one alarm, and everyone used it
 
-**Hit 7 of 56 proofs.**
+**Hit 10 of 56 ideas.**
 
-R2 binding calls count as subrequests, capped at 1,000 per invocation. A blobless checkout, a 1,000-file workspace push, or a pack rebuild all issue one R2 call per object.
+**What goes wrong.** An alarm is a timer inside a Durable Object. A DO has only one alarm at a time. The janitor set the alarm. The repack task set the alarm. The test runner set the alarm. The lease timer set the alarm. Each one silently cancelled the one before it.
 
-**Fix once:** Batch objects into packs and read them with coalesced range reads. Spread multi-thousand-object jobs across alarm slices with a durable cursor.
+**Why it matters.** A task that never runs looks fine until you need it. The janitor never runs, so storage grows. The test runner never runs, so results never appear.
 
-Affected: [#7 precomputed-clone-pack](../reviews/precomputed-clone-pack.md), [#10 partial-clone-filters](../reviews/partial-clone-filters.md), [#29 tui-rpc-push](../reviews/tui-rpc-push.md), [#35 speculative-packs](../reviews/speculative-packs.md), [#41 branch-preview-workers](../reviews/branch-preview-workers.md), [#43 server-side-bisect](../reviews/server-side-bisect.md), [#52 offline-browser-client](../reviews/offline-browser-client.md)
+Think of it like this. One kitchen timer, four cooks. Each cook resets it for their own dish. Only the last dish gets a ring. The other three burn.
 
-## ctx.id.name is undefined inside a DO made via idFromName
+**The one fix.** Keep a small table of jobs in the DO database, each with a time to run. Set the single alarm for the earliest job. When the alarm rings, run that job, then set the alarm for the next earliest.
 
-**Hit 5 of 56 proofs.**
+## 7. git sends request bodies in ways the proofs did not expect
 
-Inside a DO created via idFromName, ctx.id.name is undefined. Proofs that built R2 prefixes from it wrote to objects/undefined.
+**Hit 8 of 56 ideas.**
 
-**Fix once:** Persist owner and repo into SQLite on the first request and read them from there.
+**What goes wrong.** git squeezes small requests with gzip. git sends large pushes in chunks with no total size up front. Many proofs read the body as plain bytes with a known size. R2 needs a known size to accept a file in one write.
 
-Affected: [#8 pinned-delta-bases](../reviews/pinned-delta-bases.md), [#21 r2-versioned-snapshots](../reviews/r2-versioned-snapshots.md), [#30 ephemeral-repos](../reviews/ephemeral-repos.md), [#36 federated-gossip](../reviews/federated-gossip.md), [#48 cross-repo-atomic-push](../reviews/cross-repo-atomic-push.md)
+**Why it matters.** A small push arrives squeezed and the server reads garbage. A large push arrives with no size and the R2 write fails.
 
+Think of it like this. A parcel that arrives shrink-wrapped, or arrives as ten boxes with no note about the total. The receiving desk expected one open box with a label.
+
+**The one fix.** Unsqueeze the body at the edge when the request says it is gzip. Write large pushes to R2 with the multipart upload method, which accepts parts of at least 5 MiB and does not need the total size up front.
+
+## 8. One R2 read per object hits the 1,000-call limit
+
+**Hit 7 of 56 ideas.**
+
+**What goes wrong.** A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests. Several proofs read or wrote one object per call. A checkout of a 2,000-file project, or a push of a 2,000-file workspace, stops at call 1,000.
+
+**Why it matters.** The failure is not a slow request. It is a hard stop in the middle, with a half-finished result.
+
+Think of it like this. A library card that allows 1,000 checkouts per visit. A researcher who needs 2,000 books has to come back tomorrow, and the proofs had no "tomorrow".
+
+**The one fix.** Group objects into packfiles and read many objects with one range read. For jobs that need thousands of calls, split the job across several alarm runs and save the position in the database between runs.
+
+## 9. The Durable Object does not know its own name
+
+**Hit 5 of 56 ideas.**
+
+**What goes wrong.** The system creates one Durable Object for each repo by name, such as "owner/repo". Inside the DO, the code asked the DO for its own name and got nothing back. Cloudflare does not fill in that field for DOs created this way. Proofs that built their R2 folder path from the name wrote to a folder called "undefined".
+
+**Why it matters.** Every repo writes to the same wrong folder. Repos overwrite each other. Nothing can be found again.
+
+Think of it like this. A new employee who never asks what their own desk number is, and files everything under "desk unknown".
+
+**The one fix.** On the first request, write the owner and repo name into the DO's database. Read the name from there afterwards.
+
+## What to do with this list
+
+Fix all nine in the foundation, before any edge or wild idea. The order matters:
+
+1. The message format module, tested against real git.
+2. The object storage document and the shared object reader.
+3. The pack reader that unpacks deltas and keeps an index.
+4. The compare-and-swap rule with no network wait inside the transaction.
+5. The single alarm dispatcher.
+6. The janitor with a grace period.
+7. The request body handling for gzip and chunked pushes.
+8. The DO name stored in its own database.
+9. Grouping of reads to stay under 1,000 calls.
+
+## Where to check this in git's own code
+
+git is open source at https://github.com/git/git. These files are where the claims above come from. Read them to check us.
+
+| Claim | File in git's source |
+|---|---|
+| A message line has a four-character length, and the maximum line is 65,520 bytes | `pkt-line.c` and `pkt-line.h` |
+| The rules for the newer message set, including when the reply must skip the acknowledgments section | `Documentation/gitprotocol-v2.txt` and `upload-pack.c` |
+| What the server must send back after a push, and on which channel | `builtin/receive-pack.c` |
+| A git program refuses to push a branch that moved, before any data leaves the machine | `remote.c`, function `set_ref_status_for_push` |
+| A shallow clone sends extra lines before its push commands | `send-pack.c` |
+| Small requests are squeezed with gzip and large pushes are sent in chunks | `remote-curl.c` |
+| How a packfile and its deltas are laid out | `Documentation/gitformat-pack.txt` |

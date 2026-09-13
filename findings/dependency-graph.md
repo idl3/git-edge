@@ -1,6 +1,10 @@
-# Dependency graph
+# What leans on what
 
-Edges point from an idea to the ideas it depends on, as declared by each proof. Rendered by GitHub as Mermaid.
+Each arrow points from an idea to an idea it needs. The foundation group is the trunk. Almost every arrow from the edge and wild groups ends in the same few foundation ideas. That is why the build order starts there.
+
+Think of it like this. A tree. The trunk must stand before any branch can grow, and every branch, however far out, draws from the same trunk.
+
+GitHub draws this picture on its own. It is large. Use your browser search to find an idea by number.
 
 ```mermaid
 graph LR
