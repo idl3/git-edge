@@ -124,15 +124,17 @@ Think of it like this. A parcel that arrives shrink-wrapped, or arrives as ten b
 
 **The one fix.** Unsqueeze the body at the edge when the request says it is gzip. Write large pushes to R2 with the multipart upload method, which accepts parts of at least 5 MiB and does not need the total size up front.
 
-## 8. One R2 read per object hits the 1,000-call limit
+## 8. One R2 read per object hits the subrequest limit
 
 **Hit 7 of 56 ideas.**
 
-**What goes wrong.** A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests. Several proofs read or wrote one object per call. A checkout of a 2,000-file project, or a push of a 2,000-file workspace, stops at call 1,000.
+**What goes wrong.** A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 50 subrequests on the free plan and 10,000 on the paid plan. Several proofs read or wrote one object per call. A checkout of a 20,000-file project, or a push of a 20,000-file workspace, stops at call 10,000. On the free plan the stop comes at call 50.
+
+**A correction.** The reviews used the number 1,000, which was the paid limit when the reviewers wrote. Cloudflare's limits page now says 10,000 on the paid plan. The per-idea explainers still quote the reviewers' 1,000. Read those numbers as "the limit", not as an exact count. The problem does not go away with the larger number. It moves from a 1,000-file project to a 10,000-file project.
 
 **Why it matters.** The failure is not a slow request. It is a hard stop in the middle, with a half-finished result.
 
-Think of it like this. A library card that allows 1,000 checkouts per visit. A researcher who needs 2,000 books has to come back tomorrow, and the proofs had no "tomorrow".
+Think of it like this. A library card that allows a fixed number of checkouts per visit. A researcher who needs more books has to come back tomorrow, and the proofs had no "tomorrow".
 
 **The one fix.** Group objects into packfiles and read many objects with one range read. For jobs that need thousands of calls, split the job across several alarm runs and save the position in the database between runs.
 
@@ -160,7 +162,7 @@ Fix all nine in the foundation, before any edge or wild idea. The order matters:
 6. The janitor with a grace period.
 7. The request body handling for gzip and chunked pushes.
 8. The DO name stored in its own database.
-9. Grouping of reads to stay under 1,000 calls.
+9. Grouping of reads to stay under the subrequest limit.
 
 ## Where to check this in git's own code
 

@@ -58,7 +58,7 @@ A blocker is a problem that stops the idea from working until it is fixed. The r
 
 ### Problem 1: Large trees hit the request limit
 
-**What goes wrong.** A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests. The alarm reads one object from R2 for each file and folder. So a tree with more than about 1,000 objects cannot be deployed at all. The proof counts only CPU time and never counts subrequests.
+**What goes wrong.** A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 50 subrequests on the free plan and 10,000 on the paid plan. The alarm reads one object from R2 for each file and folder. So a tree with more than about 1,000 objects cannot be deployed at all. The proof counts only CPU time and never counts subrequests.
 
 **Why it matters.** Many real projects have more than 1,000 files. For those projects the deploy fails every time.
 

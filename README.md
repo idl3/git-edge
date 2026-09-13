@@ -35,8 +35,13 @@ Read in this order.
 2. [findings/cross-cutting-defects.md](findings/cross-cutting-defects.md). The nine problems that appeared again and again, with pictures, and the one fix for each.
 3. [findings/build-order.md](findings/build-order.md). Six waves, from the first message to the exotic ideas.
 4. [findings/scoreboard.md](findings/scoreboard.md). All 56 ideas scored, with a one-line plain summary each.
-5. [plain/](plain/). One plain-language explainer per idea, with an analogy, a diagram, and each problem explained.
-6. [site/index.html](site/index.html). The interactive map. Click an idea to see its plain explainer, its proof, and its review.
+5. [findings/rust-and-gitoxide.md](findings/rust-and-gitoxide.md). Why the server will be written in Rust with gitoxide, and what that does and does not fix.
+6. [plain/](plain/). One plain-language explainer per idea, with an analogy, a diagram, and each problem explained.
+7. [site/index.html](site/index.html). The interactive map. Click an idea to see its plain explainer, its proof, and its review.
+
+## The language decision
+
+The 56 proofs were written in TypeScript. We then asked whether the server can be written in Rust. The answer is yes, with gitoxide, a set of Rust building blocks that already read and write git's file formats. gitoxide takes over the two hardest problems in the list below, the message format and the squeezed packfiles. The first library we looked at, git2-rs, does not run inside a Worker, and the reasons are in the finding. Read [findings/rust-and-gitoxide.md](findings/rust-and-gitoxide.md) for the plain version and [research/rust-server.md](research/rust-server.md) for the engineer memo with every source link.
 
 ## Map of the folders
 
@@ -49,6 +54,7 @@ Read in this order.
 | `ideas/` | The list of 56 ideas as they went into the study | Everyone. |
 | `site/` | The interactive map as one web page | Everyone. |
 | `data/` | The structured results every other file was made from | Tools. |
+| `research/` | Engineer-level memos with source links, such as the Rust and gitoxide check | Engineers. |
 | `STYLE.md` | The writing rules and glossary for the plain documents | Writers. |
 
 ## The nine problems in one breath
@@ -62,7 +68,7 @@ These are the causes that kept coming back. The full document explains each with
 5. The small program lets requests collide while it waits on the network.
 6. The small program has one timer, and everyone reset it.
 7. git sends request bodies in ways the proofs did not expect.
-8. One file read per object hits the 1,000-call limit.
+8. One file read per object hits the subrequest limit.
 9. The small program does not know its own name.
 
 ## How this study was made

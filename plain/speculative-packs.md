@@ -59,7 +59,7 @@ Every Cloudflare feature used is GA. GA, or generally available, means a Cloudfl
 
 But as written, the proof does not work with any real git client, because of a bug in the sideband framing. A sideband is a way to send two kinds of data in one stream, like a main channel and a progress channel. The stored pack is also looked up by the wrong key.
 
-The pack build in the alarm hits a hard platform limit on subrequests. A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests. Cloudflare Workers are small programs that run on Cloudflare's network close to the user, with no server to manage.
+The pack build in the alarm hits a hard platform limit on subrequests. A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 50 subrequests on the free plan and 10,000 on the paid plan. Cloudflare Workers are small programs that run on Cloudflare's network close to the user, with no server to manage.
 
 The reviewer found three blockers and seven caveats. The reviewer expects weeks of work, and only after three other ideas exist. With the blockers fixed, the idea lands as a modest win for clients that track one branch and fetch full history. One blocker mentions pkt-lines. A pkt-line is git's way of framing a message. Each line starts with four characters that give its length.
 

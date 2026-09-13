@@ -92,6 +92,8 @@ The fourteen ideas:
 
 **Why here.** Writing merge and diff logic from nothing is slow and error-prone. Bringing in a proven library is one large job that unlocks nine ideas.
 
+**A later decision changes this wave.** The server will be written in Rust with gitoxide from the start. See [rust-and-gitoxide.md](./rust-and-gitoxide.md). With Rust everywhere, the first item in this wave, the separate Wasm core, is no longer a separate step. The other eight ideas still need the merge and diff blocks, which gitoxide does not yet build for the Worker in full.
+
 **What must be true at the end.** The server can merge two branches, rebase one branch onto another, and show a diff, all without a client.
 
 The nine ideas:

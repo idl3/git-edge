@@ -76,7 +76,7 @@ The page cannot see that a push worked, and cannot find out what to fetch. The p
 
 ### Problem 3: Large pushes exceed the request cap
 
-**What goes wrong.** A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests. The server DO writes each pushed object to R2 with one call, and checks each object with one more call. A push of more than about 1,000 objects goes over the cap.
+**What goes wrong.** A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 50 subrequests on the free plan and 10,000 on the paid plan. The server DO writes each pushed object to R2 with one call, and checks each object with one more call. A push of more than about 1,000 objects goes over the cap.
 
 **Why it matters.** Any large push fails on the server side, with no way around it.
 

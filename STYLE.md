@@ -101,7 +101,7 @@ Use these definitions word for word the first time a term appears.
 - **input gate**: the rule that a Durable Object handles one request at a time while it waits on its own storage. The gate opens when the DO waits on the network instead.
 - **R2**: Cloudflare's large file store. It holds the git objects.
 - **KV**: Cloudflare's small, fast, world-wide store for simple values.
-- **subrequest**: one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests.
+- **subrequest**: one call from a Worker to another service, such as one read from R2. Each request may make at most 50 subrequests on the free plan and 10,000 on the paid plan.
 - **Wasm, WebAssembly**: a way to run code from other languages, such as Rust, inside a Worker.
 - **GA, generally available**: a Cloudflare feature that is finished and supported, not a preview.
 - **janitor, sweep, GC**: a background task that deletes files nobody points to anymore.

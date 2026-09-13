@@ -23,7 +23,7 @@ Think of it like this. Two cooks work in the same kitchen. One cook hands a fini
 7. The workspace DO writes every object in full. The workspace DO does not build a packfile and does not use deltas. A packfile, or pack, is one bundle that holds many objects, squeezed to save space. A delta is a stored object written as "the same as that other object, with these changes".
 8. The workspace DO builds one folder listing and one commit, and writes both to R2.
 9. The workspace DO calls the repo DO with a direct function call, called RPC. The call carries the branch name, the old commit, the new commit, and the list of SHAs. No git message format is used on this path.
-10. The repo DO checks that each SHA exists in R2. Each check is one subrequest. A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests.
+10. The repo DO checks that each SHA exists in R2. Each check is one subrequest. A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 50 subrequests on the free plan and 10,000 on the paid plan.
 11. The repo DO moves the ref with compare-and-swap. A ref is a name that points at one commit. A branch is a ref. A tag is a ref. Compare-and-swap, or CAS, means change a value only if it still has the value you expect. If someone changed it first, do nothing and report it.
 12. The repo DO writes one line to its log of ref changes and replies with the result.
 

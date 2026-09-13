@@ -85,7 +85,7 @@ The proof code as written cannot complete one clone, because of a pkt-line lengt
 
 ### Problem 3: The pack builder is not designed
 
-**What goes wrong.** The function writePack is left out of the proof, and that function is where the platform risk lives. An alarm run gets 1,000 subrequests, and each R2 call counts. A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests. The multipart upload state must survive across chained alarm runs.
+**What goes wrong.** The function writePack is left out of the proof, and that function is where the platform risk lives. An alarm run gets 1,000 subrequests, and each R2 call counts. A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 50 subrequests on the free plan and 10,000 on the paid plan. The multipart upload state must survive across chained alarm runs.
 
 Deltas must be ordered so each base comes before the delta. A delta is a stored object written as "the same as that other object, with these changes". And idea #2 stores objects as loose files, so there are no existing delta entries to copy.
 

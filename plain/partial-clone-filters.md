@@ -64,7 +64,7 @@ A blocker is a problem that stops the idea from working until it is fixed.
 
 ### Problem 1: One request can need more than 1,000 reads from R2
 
-**What goes wrong.** A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests. Since git 2.24, a checkout does not ask for missing files one by one. It collects every missing file and issues one fetch for all of them. A partial clone of a tree with 5,000 files makes one fetch with 5,000 wants, so the Worker issues 5,000 R2 reads. The runtime stops the Worker at read 1,001.
+**What goes wrong.** A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 50 subrequests on the free plan and 10,000 on the paid plan. Since git 2.24, a checkout does not ask for missing files one by one. It collects every missing file and issues one fetch for all of them. A partial clone of a tree with 5,000 files makes one fetch with 5,000 wants, so the Worker issues 5,000 R2 reads. The runtime stops the Worker at read 1,001.
 
 **Why it matters.** The fetch command that git checkout runs after a partial clone would fail every time for any tree over 1,000 files. This is the main use of the idea, not a rare case.
 

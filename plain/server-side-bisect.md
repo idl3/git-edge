@@ -82,7 +82,7 @@ For this idea, the verdict means the following. Every Cloudflare building block 
 
 **What goes wrong.** The DO hands the test Worker a read token that is limited to one repo. The test Worker ignores that token. Instead, the test Worker reads R2 through a direct platform binding. A test Worker supplied by a customer cannot get that binding without also getting access to every repo on the platform.
 
-**Why it matters.** The design claims isolation between customers, but the proof does not deliver isolation. The honest path is to read objects over web requests through the edge Worker. Each such read is a subrequest. A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests. Only six subrequests can be open at once. A test that walks a wide folder tree hits those caps.
+**Why it matters.** The design claims isolation between customers, but the proof does not deliver isolation. The honest path is to read objects over web requests through the edge Worker. Each such read is a subrequest. A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 50 subrequests on the free plan and 10,000 on the paid plan. Only six subrequests can be open at once. A test that walks a wide folder tree hits those caps.
 
 **How to fix it.** Make the test Worker use the scoped token and read objects through the edge Worker. Design the object reads to stay inside the subrequest limits, or serve many objects in one request.
 

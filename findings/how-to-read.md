@@ -56,6 +56,10 @@ The ideas are in three groups.
 - **Edge.** The 19 ideas that exist only because the server runs on Cloudflare's network with no fixed machine.
 - **Wild.** The 23 ideas that go beyond what a git server normally does.
 
+## One number to read with care
+
+The reviews and the plain explainers say a request may make at most 1,000 calls to other services. That was the paid-plan limit when the reviews were written. Cloudflare's limits page now says 10,000 on the paid plan and 50 on the free plan. The problem those pages describe is the same. Only the size of project that hits it has changed.
+
 ## Words you will see
 
 - **git**: a tool that keeps every version of a set of files, and lets many people share those versions.

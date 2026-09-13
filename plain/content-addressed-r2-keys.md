@@ -27,7 +27,7 @@ Cloudflare Workers are small programs that run on Cloudflare's network close to 
 1. The pack parser hands the Worker one finished object at a time, with its type and its content. Any delta is already applied.
 2. The Worker rebuilds git's own storage form. That form is the type, the size, a zero byte, and the content.
 3. The Worker computes the SHA over those bytes.
-4. The Worker asks R2 whether a file with that name already exists. If yes, the Worker skips the upload. Each such call is a subrequest. A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 1,000 subrequests.
+4. The Worker asks R2 whether a file with that name already exists. If yes, the Worker skips the upload. Each such call is a subrequest. A subrequest is one call from a Worker to another service, such as one read from R2. Each request may make at most 50 subrequests on the free plan and 10,000 on the paid plan.
 5. If no, the Worker writes the bytes to R2 under objects/owner/repo/SHA. The Worker also gives R2 the expected SHA, and R2 refuses any body that does not match.
 6. The repo's Durable Object records the SHA, type, and size in an objects index in DO SQLite. A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. There is one DO for each repo. Think of it like the one librarian who is allowed to update the catalog. DO SQLite is the small database inside each Durable Object.
 7. The refs move only after every SHA in the push is known to exist.
