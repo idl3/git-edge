@@ -12,9 +12,9 @@ A ref is a name that points at one commit. A branch is a ref. A tag is a ref.
 
 The git tool talks to a server over smart HTTP. Smart HTTP is the way git talks to a server over normal web requests. There are two sets of messages for that talk, an old one called v0 and a new one called protocol v2. Protocol v2 is the newer, cleaner set of messages git uses to talk to a server.
 
-Every v2 message is a full, self-contained request. That shape fits Cloudflare Workers well. Cloudflare Workers are small programs that run on Cloudflare's network close to the user, with no server to manage. This idea makes the server speak only v2 inside. Old clients that still speak v0 get a thin translation layer at the edge.
+Every v2 message is a full, self-contained request. That shape fits Cloudflare Workers well. Cloudflare Workers are small programs that run on Cloudflare's network close to the user, with no server to manage. This idea makes the server speak only v2 for reads. An old v0 client can still list the refs. For a real fetch, the server tells the old client to upgrade instead of translating.
 
-Think of it like this. A hotel front desk decides to work in one language only. A guest who speaks an older dialect talks to an interpreter at the door. The interpreter turns each question into the desk's language and turns each answer back.
+Think of it like this. A hotel front desk decides to work in one language only. A guest who speaks an older dialect can still read the room list at the door. To book a room, the guest must speak the desk's language.
 
 ## How it works
 
@@ -22,90 +22,89 @@ A fetch is getting commits from the server. A clone gets everything for the firs
 
 A packfile is one bundle that holds many objects, squeezed to save space. A SHA is a fingerprint of an object's content. Two objects with the same content have the same fingerprint.
 
-1. The git client sends a header that says which protocol version it speaks. The Worker reads that header before doing any other work.
-2. For a v2 client, the Worker answers the first request with a fixed list of supported commands. No Durable Object is touched. A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. There is one DO for each repo. Think of it like the one librarian who is allowed to update the catalog.
-3. Each later request holds one v2 command, such as ls-refs or fetch. The Worker parses the pkt-lines and forwards one command to the repo's DO. A pkt-line is git's way of framing a message. Each line starts with four characters that give its length.
-4. The DO answers ls-refs from its refs table in DO SQLite. DO SQLite is the small database inside each Durable Object.
-5. For fetch, the DO turns the wanted commits into a packfile name and a byte range in R2. R2 is Cloudflare's large file store. It holds the git objects.
-6. The Worker streams that byte range from R2 to the client as sideband frames. Sideband is a way to send two kinds of data in one stream, like a main channel and a progress channel. No pack bytes pass through the DO.
-7. A v0 client goes through a shim. The shim renders the same ref list in the old format and rewrites the old want and have lines into the same internal fetch command.
-8. Push stays unchanged. The git tool has no v2 for push, so push always uses the old format and goes to the push pipeline.
+The second pass is written in Rust and runs as Wasm. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker. All ideas now share one written contract that fixes the module names, the wire rules, and the error rules. This idea owns the wire module and the code at the edge that picks the protocol version.
+
+1. The git client sends a Git-Protocol header that names the version it speaks. The edge reads that header and nothing else to pick the version.
+2. For a v2 client, the edge answers the first request with a fixed list of five lines. The list names the two supported commands, ls-refs and fetch, with the shallow and filter options. No Durable Object is touched. A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. There is one DO for each repo. Think of it like the one librarian who is allowed to update the catalog.
+3. For a v0 or v1 client, the edge asks the DO for the ref list and writes the old format. That keeps git ls-remote working for old clients.
+4. Each later v2 request holds one command. A body reader removes gzip first. The wire module then parses the pkt-lines into one command and refuses any unknown command or argument. A pkt-line is git's way of framing a message. Each line starts with four characters that give its length. The command body is capped at 1 MB.
+5. A v0 or v1 client that posts a fetch request is refused with one ERR line that says protocol v2 is required. There is no v0 translation of fetch.
+6. The edge forwards the raw v2 command to the repo's DO. The DO answers ls-refs from its refs table in DO SQLite. DO SQLite is the small database inside each Durable Object. HEAD comes first, with the branch name it points to.
+7. For fetch, the DO checks every wanted commit, matches the haves, and picks a pack by an unchanging pack id in R2. R2 is Cloudflare's large file store. It holds the git objects.
+8. The wire module writes the answer sections in the order git expects. When the request contains done, the acknowledgments section is left out and the packfile section starts at once.
+9. The pack bytes stream from R2 to the client as sideband frames of 65515 bytes. Sideband is a way to send two kinds of data in one stream, like a main channel and a progress channel. Each frame is copied once. No pack bytes pass through the DO.
+10. Push stays unchanged. The git tool has no v2 for push, so push always uses the old format and goes to the push pipeline.
 
 ```mermaid
 sequenceDiagram
     participant Client as git client
-    participant Worker
+    participant Edge as Edge, Rust wire module
     participant DO as Repo DO
     participant R2
-    Client->>Worker: request with protocol header
-    Worker-->>Client: v2 command list, or v0 ref list via shim
-    Client->>Worker: fetch command with wants
-    Worker->>DO: negotiate wants and haves
-    DO-->>Worker: pack file name and byte range
-    Worker->>R2: read byte range
-    R2-->>Worker: pack bytes
-    Worker-->>Client: pkt-lines and sideband frames
+    Client->>Edge: request with Git-Protocol header
+    Edge-->>Client: v2 command list, or v0 ref list, or ERR for v0 fetch
+    Client->>Edge: v2 fetch command, gzip removed
+    Edge->>DO: raw command
+    DO-->>Edge: acks and pack id
+    Edge->>R2: read pack by id
+    R2-->>Edge: pack bytes
+    Edge-->>Client: sections, then sideband frames, then flush
 ```
 
 ## What the reviewer decided
 
 The reviewer looks for blockers and caveats. A blocker is a problem that stops the idea from working until it is fixed. A caveat is a limit or a condition. The idea works, but only inside this limit.
 
-The verdict is Risky.
+The verdict is Lands with caveats.
 
 | Score | Value |
 |---|---|
 | Feasibility | 4 of 5 |
-| Reliability | 3 of 5 |
-| Correctness | 2 of 5 |
+| Reliability | 4 of 5 |
+| Correctness | 4 of 5 |
 
-Risky. The idea can be built. But the proof shows one or more problems the reviewer could not fully solve, or it does a weaker version of the goal. Think of it like a runway you can see on the map, but nobody has checked it for holes.
+| Score | First pass | Second pass |
+|---|---|---|
+| Feasibility | 4 of 5 | 4 of 5 |
+| Reliability | 3 of 5 | 4 of 5 |
+| Correctness | 2 of 5 | 4 of 5 |
 
-For this idea, the design is the right one for Workers, and every building block is GA. GA, or generally available, means a Cloudflare feature that is finished and supported, not a preview. The read path writes nothing, so it can never lose or split a ref. But the proof code as written cannot complete a single git clone from a modern client. The v0 shim only handles clones, so the claim of one thin shim and one code path is unproven.
+Lands with caveats. The idea is sound and can be built. The proof has one or more problems that must be fixed first, and the reviewer described each fix. Think of it like a flight with a runway that needs some repairs before you land. The runway is there. The repairs are known.
 
-The fixes are edits to the wire format, not changes to the design. The reviewer expects days for v2 clone and fetch. The reviewer expects weeks for a correct v0 shim plus shallow and filter support.
+For this idea, the reviewer checked every library call in the code against the pinned crate sources and found no compile error. The reviewer then walked every byte of a clone, an incremental fetch, and an ls-remote against git 2.43 source. No byte breaks the happy path. The one blocker is an error in the shared contract, not in the design. The reviewer expects days for the wire code and weeks for the full conformance work.
+
+## What changed in the second pass
+
+- The fetch answer no longer starts with a section git does not expect. Fixed by code. The acknowledgments section is written only when the request has no done line, which matches git's own fetch code.
+- The v0 shim could not do a second negotiation round. Fixed by removal. The shared contract dropped the shim, so a v0 fetch request now gets one ERR line that says v2 is required.
+- Compressed request bodies were read as raw bytes. Fixed by a dependency. A body reader removes gzip before the parser runs, but the reader lives in another idea and is not yet tested at runtime.
+- Wanted commits were never checked. Still open in this proof. The parser refuses a fetch with no want line, but the real check lives in the negotiation idea and is claimed, not shown. The ERR line for a bad want must also ride an HTTP 200, see Problem 1.
+- The pkt-line helper copied each frame through a JavaScript array. Fixed. The Rust code slices the input into 65515 byte chunks and writes each one straight into one buffer.
+- The pack name and byte range could point at a rebuilt file. Fixed by the contract. A pack now has an unchanging id, and a rebuild writes a new id instead of replacing the file.
+- The server advertised options it did not honour. Fixed. The advertisement lists only ls-refs, fetch, shallow, and filter, and the parser refuses everything else.
+- There was no symref for HEAD. Fixed. The ls-refs answer writes HEAD first with the branch name it points to, so a clone picks the default branch by name.
+- The ls-refs arguments peel, unborn, and symrefs were not handled. Fixed. The parser accepts all three plus ref-prefix.
 
 ## Problems that must be fixed first
 
-### Problem 1: The fetch answer starts with a section git does not expect
+### Problem 1: Error lines sent with HTTP 400 are never shown to the user
 
-**What goes wrong.** A fresh clone has no local commits, so the client sends done in its first fetch request. The v2 rules say the server must then leave out the acknowledgments section. The proof always sends that section first.
+**What goes wrong.** The contract says a protocol error is an HTTP 400 with one ERR pkt-line in the body. The git HTTP client throws away any body that comes with a status of 300 or higher. The ERR text is never read.
 
-**Why it matters.** A normal git clone would fail. The client stops with the message "expected packfile, received acknowledgments".
+**Why it matters.** A v0 client that posts a fetch sees only "RPC failed, HTTP 400" and no reason. Test scenario 13 asserts the text "protocol v2 required" and cannot pass. The same loss hits the "not our ref" error for a bad want.
 
-**How to fix it.** When the request contains done, send the packfile section right away. Send NAK or ACK and ready only in rounds without done.
-
-### Problem 2: The v0 shim cannot do a second round
-
-**What goes wrong.** An old v0 client sends have lines without done until the server acknowledges some of them. That needs a capability called multi_ack_detailed, which the shim does not offer. The shim replies NAK followed by pack bytes to a have-only round.
-
-**Why it matters.** A normal git fetch from a v0 client with existing history would fail. The client stops with "expected ACK/NAK, got PACK". Only a fresh v0 clone works, so the shim is clone-only.
-
-**How to fix it.** Offer multi_ack_detailed and answer each round with ACK lines marked common or ready. Or refuse v0 incremental fetch on purpose.
-
-### Problem 3: Compressed request bodies are read as raw bytes
-
-**What goes wrong.** The git client compresses the body of a fetch request with gzip once the body grows past a small size. The Worker parses the raw body and ignores the Content-Encoding header.
-
-**Why it matters.** A normal git fetch with many have lines sends a compressed body. The Worker would parse garbage and the fetch would fail.
-
-**How to fix it.** Check the Content-Encoding header. Decompress the body with DecompressionStream in gzip mode before parsing pkt-lines.
-
-### Problem 4: Wanted commits are never checked
-
-**What goes wrong.** The DO never checks that a wanted commit is one the server advertised or can reach. An unknown want returns the whole latest pack.
-
-**Why it matters.** The client gets a large answer instead of a clean error. After a forced push, a stale fetch becomes a full download instead of a clear failure.
-
-**How to fix it.** Compare each want against the advertised refs, or against the commits reachable from them. Answer an unknown want with an ERR line.
+**How to fix it.** Change one line of the contract. Send a protocol error raised after the command was parsed as HTTP 200 with one ERR pkt-line. Keep 400 only for garbage before the handshake. Map that rule in the edge response code.
 
 ## Things to know
 
-- The pkt-line helper copies each 65 KB frame through a JavaScript array. Replace that with direct buffer copies, or a large clone uses up the CPU budget.
-- The pack name and byte range from the DO are not tied to one version of the pack file. If a rebuild replaces the file between the two steps, the client gets a corrupt pack, so use versioned names or an etag match.
-- The server advertises wait-for-done, shallow, and object-info but does not honour them. A clone with a depth limit silently gets the full history.
-- There is no symref for HEAD, so a clone picks the default branch by matching the commit SHA.
-- "v2 only" really means v2 for fetch and v0 for push. Dumb HTTP clients are out of scope.
+- When a body is too large, the code returns early and leaves the request stream unread. The spike showed that pattern restarting the local runtime twice, so cancel the stream on every early return instead of draining it.
+- Want checking and gzip decoding are contract dependencies, not code in this proof. The gzip stream bridge and the streaming response are still unverified at runtime.
+- The server says ready on the first known have. Long divergent histories get a larger pack than needed. That is legal and allowed by the contract, but it is not what git itself does.
+- The proof claims that a blob size filter such as blob:limit=1m fails. That claim is wrong in the harmless direction, because git expands the size to bytes before sending.
+- The glue for the first request is not shown. That glue must set the exact git Content-Type and a no-cache header, or the client refuses the answer. Another idea owns that glue.
+- One writer function listed in the contract is missing from the code. The contract's wording for the fetch sections reads as two delimiters where git accepts only one, so the contract text must be corrected.
+- The peeled target of a tag is never computed by any sync route today. The peeled line in ls-refs depends on a schema addition outside this proof.
+- The proof marked the sideband writer's argument order as unverified. The reviewer read the crate source and closed that doubt. The frame size limit of 65515 bytes is exact.
 
 ## How this idea connects to the others
 
@@ -113,4 +112,5 @@ The fixes are edits to the wire format, not changes to the design. The reviewer 
 - The refs table and the object store come from [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md).
 - The first request and the pkt-line code come from [#53 The /info/refs?service= entrypoint and pkt-line codec](./info-refs-endpoint.md).
 - The want and have matching comes from [#56 Want/have negotiation with a commit-graph in SQLite](./want-have-negotiation.md).
-- The ready-made pack for fresh clones comes from [#7 Precomputed pack slices for clone](./precomputed-clone-pack.md).
+- The push path and its report format come from [#6 Two-phase push](./two-phase-push.md).
+- The blob filters for partial clone come from [#10 Shallow and partial clone as first-class filters](./partial-clone-filters.md).

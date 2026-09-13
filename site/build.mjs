@@ -29,7 +29,7 @@ const slim = rows.map(r => ({
   id: r.id, tier: r.tier, slug: r.slug, title: r.title, desc: r.desc,
   proof: { mechanism: r.proof.mechanism, primitives: r.proof.primitives, dependsOn: r.proof.dependsOn.filter(d => rows.some(x => x.slug === d)), keySnippet: r.proof.keySnippet, knownLimits: r.proof.knownLimits },
   review: { feasibility: r.review.feasibility, reliability: r.review.reliability, correctness: r.review.correctness, verdict: r.review.verdict, blockers: r.review.blockers, caveats: r.review.caveats, effort: r.review.effort, summary: r.review.summary },
-  proofCode: r.proofCode, why: r.why, reviewMd: r.reviewMd, plainMd: r.plainMd,
+  proofCode: r.proofCode, why: r.why, reviewMd: r.reviewMd, plainMd: r.plainMd, review2: r.review2 || null, proofMd2: r.proofMd2 || '', reviewMd2: r.reviewMd2 || '',
 }));
 const safe = s => s.replace(/<\/script/gi, "<\\/script");
 let html = fs.readFileSync("template.html", "utf8");

@@ -63,6 +63,8 @@ section > .eyebrow{margin-bottom:6px}
 .pill.lands-with-caveats{background:var(--cav-soft);color:var(--cav)}
 .pill.risky{background:var(--risk-soft);color:var(--risk)}
 .pill.does-not-land{background:var(--no-soft);color:var(--no)}
+small.p2{font-family:"IBM Plex Mono",monospace;font-size:.62rem;color:var(--accent-ink);background:var(--accent-soft);padding:1px 5px;border-radius:4px;margin-left:6px;vertical-align:middle;font-weight:500}
+.up{color:var(--lands);font-size:.72rem;margin-left:4px;font-family:"IBM Plex Mono",monospace}.down{color:var(--risk);font-size:.72rem;margin-left:4px;font-family:"IBM Plex Mono",monospace}
 .tier{font-family:"IBM Plex Mono",monospace;font-size:.7rem;letter-spacing:.08em;text-transform:uppercase}
 .tier.foundation{color:var(--found)} .tier.edge{color:var(--edge)} .tier.wild{color:var(--wild)}
 
@@ -264,6 +266,8 @@ footer{margin-top:40px;color:var(--ink3);font-size:.8rem;max-width:70ch}
     <button role="tab" aria-selected="false" data-tab="proof">Proof</button>
     <button role="tab" aria-selected="false" data-tab="code">Code</button>
     <button role="tab" aria-selected="false" data-tab="full">Full review</button>
+    <button role="tab" aria-selected="false" data-tab="proof2" hidden>Proof, 2nd pass</button>
+    <button role="tab" aria-selected="false" data-tab="review2" hidden>Review, 2nd pass</button>
   </div>
   <div class="panel" id="d-panel"></div>
 </aside>
@@ -278,6 +282,7 @@ const DATA=JSON.parse(document.getElementById('data').textContent);
 const THEMES=JSON.parse(document.getElementById('themes-data').textContent);
 const WAVES=JSON.parse(document.getElementById('waves-data').textContent);
 const bySlug=Object.fromEntries(DATA.map(r=>[r.slug,r]));
+const cur=r=>r.review2||r.review;
 const VLABEL={'lands':'lands','lands-with-caveats':'lands with caveats','risky':'risky','does-not-land':'does not land'};
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const score=n=>`<span class="score" aria-label="${n} of 5">${[1,2,3,4,5].map(i=>`<i class="${i<=n?'on':''}"></i>`).join('')}</span>`;
@@ -285,7 +290,7 @@ const score=n=>`<span class="score" aria-label="${n} of 5">${[1,2,3,4,5].map(i=>
 // tally
 const tally=document.getElementById('tally');
 for(const v of ['lands','lands-with-caveats','risky','does-not-land']){
-  const n=DATA.filter(r=>r.review.verdict===v).length;
+  const n=DATA.filter(r=>cur(r).verdict===v).length;
   tally.insertAdjacentHTML('beforeend',`<div class="v-${v}"><b>${n}</b><small>${VLABEL[v]}</small></div>`);
 }
 
@@ -294,8 +299,8 @@ const map=document.getElementById('map');
 const TIERS=[['foundation','Foundation','the trunk'],['edge','Edge','serverless superpowers'],['wild','Wild','exotic']];
 const rank={'lands':0,'lands-with-caveats':1,'risky':2,'does-not-land':3};
 for(const [t,label,hint] of TIERS){
-  const items=DATA.filter(r=>r.tier===t).sort((a,b)=>rank[a.review.verdict]-rank[b.review.verdict]||a.id-b.id);
-  map.insertAdjacentHTML('beforeend',`<div class="col ${t}"><h3>${label}<small>${items.length} · ${hint}</small></h3><div class="nodes">${items.map(r=>`<button class="node ${r.review.verdict}" data-slug="${r.slug}" id="n-${r.slug}"><span class="id">${r.id}</span><span class="t">${esc(r.title)}</span><span class="dot"></span></button>`).join('')}</div></div>`);
+  const items=DATA.filter(r=>r.tier===t).sort((a,b)=>rank[cur(a).verdict]-rank[cur(b).verdict]||a.id-b.id);
+  map.insertAdjacentHTML('beforeend',`<div class="col ${t}"><h3>${label}<small>${items.length} · ${hint}</small></h3><div class="nodes">${items.map(r=>`<button class="node ${cur(r).verdict}" data-slug="${r.slug}" id="n-${r.slug}"><span class="id">${r.id}</span><span class="t">${esc(r.title)}${r.review2?' <small class="p2">2nd pass</small>':''}</span><span class="dot"></span></button>`).join('')}</div></div>`);
 }
 let focus=null, verdict='all', q='';
 function applyFilter(){
@@ -303,7 +308,7 @@ function applyFilter(){
   for(const r of DATA){
     const el=document.getElementById('n-'+r.slug);
     const hay=(r.title+' '+r.desc+' '+r.proof.primitives.join(' ')+' '+r.review.blockers.join(' ')+' '+r.review.caveats.join(' ')).toLowerCase();
-    const ok=(verdict==='all'||r.review.verdict===verdict)&&(!ql||hay.includes(ql));
+    const ok=(verdict==='all'||cur(r).verdict===verdict)&&(!ql||hay.includes(ql));
     el.classList.toggle('hidden',!ok);
   }
   drawEdges();
@@ -366,7 +371,7 @@ for(const t of THEMES){
 // waves
 const waves=document.getElementById('waves');
 WAVES.forEach((w,i)=>{
-  waves.insertAdjacentHTML('beforeend',`<div class="wave"><div class="k"><div class="eyebrow">wave ${i}</div><h3>${esc(w.title)}</h3><p>${esc(w.note)}</p></div><div class="items">${w.slugs.map(s=>{const r=bySlug[s];return `<button class="${r.review.verdict}" data-open="${s}"><i></i>${r.id} ${esc(r.title)}</button>`;}).join('')}</div></div>`);
+  waves.insertAdjacentHTML('beforeend',`<div class="wave"><div class="k"><div class="eyebrow">wave ${i}</div><h3>${esc(w.title)}</h3><p>${esc(w.note)}</p></div><div class="items">${w.slugs.map(s=>{const r=bySlug[s];return `<button class="${cur(r).verdict}" data-open="${s}"><i></i>${r.id} ${esc(r.title)}</button>`;}).join('')}</div></div>`);
 });
 
 // roster
@@ -374,11 +379,12 @@ const tbody=document.querySelector('#roster tbody');
 let sortK='id', sortDir=1;
 function renderRoster(){
   const rows=[...DATA].sort((a,b)=>{
-    const va=sortK in a?a[sortK]:sortK==='verdict'?rank[a.review.verdict]:sortK==='effort'?({days:0,weeks:1,months:2})[a.review.effort]:a.review[sortK];
-    const vb=sortK in b?b[sortK]:sortK==='verdict'?rank[b.review.verdict]:sortK==='effort'?({days:0,weeks:1,months:2})[b.review.effort]:b.review[sortK];
+    const va=sortK in a?a[sortK]:sortK==='verdict'?rank[cur(a).verdict]:sortK==='effort'?({days:0,weeks:1,months:2})[cur(a).effort]:cur(a)[sortK];
+    const vb=sortK in b?b[sortK]:sortK==='verdict'?rank[cur(b).verdict]:sortK==='effort'?({days:0,weeks:1,months:2})[cur(b).effort]:cur(b)[sortK];
     return (va>vb?1:va<vb?-1:0)*sortDir||a.id-b.id;
   });
-  tbody.innerHTML=rows.map(r=>`<tr><td class="n">${r.id}</td><td><span class="tier ${r.tier}">${r.tier}</span></td><td class="tt"><button data-open="${r.slug}">${esc(r.title)}</button></td><td><span class="pill ${r.review.verdict}">${VLABEL[r.review.verdict]}</span></td><td>${score(r.review.feasibility)}</td><td>${score(r.review.reliability)}</td><td>${score(r.review.correctness)}</td><td class="e">${r.review.effort}</td></tr>`).join('');
+  const d=(a,b)=>b>a?`<span class="up">+${b-a}</span>`:b<a?`<span class="down">${b-a}</span>`:'';
+  tbody.innerHTML=rows.map(r=>{const c=cur(r),o=r.review;return `<tr><td class="n">${r.id}</td><td><span class="tier ${r.tier}">${r.tier}</span></td><td class="tt"><button data-open="${r.slug}">${esc(r.title)}</button>${r.review2?' <small class="p2">2nd pass</small>':''}</td><td><span class="pill ${c.verdict}">${VLABEL[c.verdict]}</span></td><td>${score(c.feasibility)}${r.review2?d(o.feasibility,c.feasibility):''}</td><td>${score(c.reliability)}${r.review2?d(o.reliability,c.reliability):''}</td><td>${score(c.correctness)}${r.review2?d(o.correctness,c.correctness):''}</td><td class="e">${c.effort}</td></tr>`}).join('');
 }
 document.querySelector('#roster thead').addEventListener('click',e=>{
   const th=e.target.closest('th'); if(!th) return;
@@ -407,6 +413,18 @@ function renderPanel(){
   const r=bySlug[current]; const v=r.review;
   if(tab==='plain'){
     panel.innerHTML=`<div class="md plain">${md(r.plainMd||'No plain explainer yet.')}</div>`;
+  } else if(tab==='proof2'){
+    panel.innerHTML=`<div class="md">${md(r.proofMd2||'')}</div>`;
+  } else if(tab==='review2'){
+    const v=r.review2;
+    panel.innerHTML=`<div class="summary">${esc(v.summary)}</div>
+      <div class="scorecard"><div><b>${v.feasibility}</b><small>feasibility, was ${r.review.feasibility}</small></div><div><b>${v.reliability}</b><small>reliability, was ${r.review.reliability}</small></div><div><b>${v.correctness}</b><small>correctness, was ${r.review.correctness}</small></div></div>
+      <h4>First-pass problems now resolved</h4>${v.resolvedFromV1.length?`<ul>${v.resolvedFromV1.map(b=>`<li>${esc(b)}</li>`).join('')}</ul>`:'<p>None listed.</p>'}
+      <h4>First-pass problems still open</h4>${v.unresolvedFromV1.length?`<ul class="block">${v.unresolvedFromV1.map(b=>`<li>${esc(b)}</li>`).join('')}</ul>`:'<p>None.</p>'}
+      <h4>Blockers in the second pass</h4>${v.blockers.length?`<ul class="block">${v.blockers.map(b=>`<li>${esc(b)}</li>`).join('')}</ul>`:'<p>None found.</p>'}
+      <h4>Contract violations</h4>${v.contractViolations.length?`<ul>${v.contractViolations.map(b=>`<li>${esc(b)}</li>`).join('')}</ul>`:'<p>None.</p>'}
+      <h4>Caveats</h4>${v.caveats.length?`<ul>${v.caveats.map(b=>`<li>${esc(b)}</li>`).join('')}</ul>`:''}
+      <h4>Full second-pass review</h4><div class="md">${md(r.reviewMd2||'')}</div>`;
   } else if(tab==='review'){
     panel.innerHTML=`<div class="summary">${esc(v.summary)}</div>
       <div class="scorecard"><div><b>${v.feasibility}</b><small>feasibility</small></div><div><b>${v.reliability}</b><small>reliability</small></div><div><b>${v.correctness}</b><small>correctness</small></div></div>
@@ -431,7 +449,9 @@ function openDrawer(slug){
   current=slug; const r=bySlug[slug];
   document.getElementById('d-eyebrow').innerHTML=`<span class="tier ${r.tier}">${r.tier}</span> · #${r.id}`;
   document.getElementById('d-title').textContent=r.title;
-  document.getElementById('d-meta').innerHTML=`<span class="pill ${r.review.verdict}">${VLABEL[r.review.verdict]}</span><span class="chip">effort: ${r.review.effort}</span><div class="scores"><span>feas ${score(r.review.feasibility)}</span><span>rel ${score(r.review.reliability)}</span><span>corr ${score(r.review.correctness)}</span></div>`;
+  const c=cur(r);
+  document.getElementById('d-meta').innerHTML=`<span class="pill ${c.verdict}">${VLABEL[c.verdict]}</span>${r.review2&&r.review2.verdict!==r.review.verdict?`<span class="chip">was: ${VLABEL[r.review.verdict]}</span>`:''}<span class="chip">effort: ${c.effort}</span><div class="scores"><span>feas ${score(c.feasibility)}</span><span>rel ${score(c.reliability)}</span><span>corr ${score(c.correctness)}</span></div>${r.review2?`<span class="chip">first pass: ${r.review.feasibility}/${r.review.reliability}/${r.review.correctness} → second: ${c.feasibility}/${c.reliability}/${c.correctness}</span>`:''}`;
+  for(const b of document.querySelectorAll('.tabs [data-tab="proof2"],.tabs [data-tab="review2"]')) b.hidden=!r.review2;
   renderPanel();
   drawer.classList.add('open'); drawer.setAttribute('aria-hidden','false'); scrim.hidden=false;
   try{history.replaceState(null,'','#'+slug);}catch(e){}

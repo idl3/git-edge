@@ -539,3 +539,33 @@ These override anything above or in research/rust-server.md that disagrees.
 3. `[profile.release] strip = true` breaks `worker-build` (the abort handler needs the `target_features` section that `--strip-all` removes). Use `strip = "debuginfo"`.
 4. Client-controlled parse failures must return HTTP 400 from the handler. A `worker::Error` propagated out of `fetch` surfaces as an uncaught exception and HTTP 500.
 5. Measured: the whole spike Worker with gix-hash, gix-object, gix-packetline, gix-pack, gix-traverse and gix-zlib linked is 605 KB after wasm-opt, 262 KB gzipped on upload. Cold instantiate cost is 20 to 30 ms on local workerd. Real git 2.43 `ls-remote` over protocol v2 and v0 succeeded against it, and a 6-object pack with two OFS deltas was parsed, resolved, hashed and walked on workerd with ids matching `git verify-pack`.
+
+## Amendments after the foundation re-review (2026-09-13)
+
+The 14 second-pass foundation reviews found the following gaps in this contract itself. These amendments override the sections they name. Edge proofs must follow the amended form.
+
+**A1. Budget-carrying signatures (overrides 1.2, 1.4, 9).** Every function that makes an R2 or stub call takes `budget: &mut ReqBudget` as its last parameter, and `Bucket` holds no budget. Amended signatures:
+`Bucket::read_range(&self, key: &str, offset: u64, len: u64, budget: &mut ReqBudget) -> Result<Vec<u8>>`;
+`Bucket::read_entries(&self, locs: &[(ObjectId, ObjLoc)], budget: &mut ReqBudget) -> Result<Vec<(ObjectId, Vec<u8>)>>`;
+`PackWriter::create(bucket: &Bucket, key: &str, expected: u32, budget: &mut ReqBudget)`, `PackWriter::flush_if_full(&mut self, budget)`, `PackWriter::finish(self, budget) -> Result<PackMeta>`; `append_entry` and `encode_entry` return `Result`;
+`pack::ingest::run(body, env, stub, repo, push_id, begin, budget)` (7 args);
+`resolve_and_normalize(window, index_sink: &mut IndexSink, budget) -> Result<()>` where `IndexSink::post(&mut self, meta: &PackMeta, rows: Vec<ObjRow>, budget) -> Result<()>` posts every 10,000 rows.
+`Bucket.repo` and `RepoDo.state` are `pub(crate)`.
+
+**A2. Error propagation and the after-header rule (overrides 3, 10).** Inside a Durable Object route, a `Storage` or `Internal` error raised inside a sync span must propagate as `Err` out of `fetch` so the platform discards the uncommitted span. Never convert it to a `Response` inside the DO. The edge converts. Before the receive-pack header is parsed, `Conflict` maps to HTTP 409. After the header is parsed, every error, including `Limit`, `Budget`, `Conflict` and `Storage`, is answered with HTTP 200 and a report-status of `unpack <message>` plus `ng <ref> <reason>` for every command, because git's remote-curl discards any body with status 300 or higher. The `ERR` pkt-line for a v0-only client therefore also travels in a 200 response.
+
+**A3. Alarm arming (overrides 4.1).** `jobs::enqueue` is sync and only writes the row. It never calls `set_alarm`, which is async in worker 0.8.5. Every async route or slice that called `enqueue` must call `jobs::rearm(&self).await` after its sync span returns. `transactionSync` is absent from worker 0.8.5; span atomicity rests on the no-await rule alone, and panic rollback is unverified (scenario 15 stays a day-1 test).
+
+**A4. Slices (overrides 4.2, 4.3).** A slice checks `SliceBudget::spent_80pct()` between units of work and returns `Continue { cursor }` when true. `Reschedule` clears the cursor. Frontier loads inside a slice are chunked so one `read_entries` call charges at most 64 coalesced spans. A `dead` job of kind `Janitor`, `GcMark` or any per-repo maintenance kind is re-enqueued at the next `boot`; `boot` enqueues `Janitor` whenever no `queued` or `running` Janitor row exists, not only on first creation.
+
+**A5. Schema additions (overrides 2.3, 3).** `refs` gains `peeled TEXT` filled at commit from the tag object the edge inflated, and `ls-refs` emits `peeled:` from it. `pushes` gains `swept_at INTEGER`; the Janitor sets `swept_at` and never deletes `pushes` rows. A rejected push writes `pushes.result`. `packs` rows are created `ingesting` on the first `/_do/push/index` post with `ON CONFLICT(id) DO UPDATE ... WHERE state='ingesting' AND push_id=excluded.push_id`, so `finish` metadata is recorded; `commit_lo` with no commits is stored as `i64::MAX`. `MAX_LINKS = 1,000,000` per push is a foundation limit and maps to `Limit`.
+
+**A6. Bound parameters (new).** DO SQLite allows at most 100 bound parameters per statement. Any `IN (...)` list is batched at 90 or replaced by `json_each(?)` over one JSON array parameter.
+
+**A7. Memory cap (overrides 2.4).** The single-object cap is 16 MiB inflated, not 32 MiB. The normalize pass must hold at most two copies of an entry at once: the window slice and the decoded output. `decode_mini` is removed; decode reads directly from the window.
+
+**A8. Dependency direction (overrides 1.1).** Shared request headers, DTOs and the `respond`/`finish` helpers live in `wire::http`, not in `edge`, so `repo_do` never imports `edge`. A small `platform` module owns every `js_sys::Reflect` use (random bytes, `ctx.id.name` cross-check); section 8.3's grep allows `Reflect::get` only in `platform`.
+
+**A9. Registration lists (overrides 1.3, 1.4, 12).** A post-foundation module may add routes, `JobKind` variants, tables and R2 key prefixes if it lists them in one `REGISTRY` block at the top of its file. The foundation lists in 1.3 and 1.4 are the minimum, not the maximum.
+
+**A10. Pass A of ingest (overrides 2.4, 6.4).** Pass A does not use `BytesToEntriesIter`, which is synchronous over `BufRead` and cannot await body bytes mid-entry. Pass A parses entry headers with `gix_pack::data::entry::Header::from_bytes`, inflates with `gix_zlib::Inflate` tracking `total_in`, and hashes the raw pack with the SHA-1 hasher. `BytesToEntriesIter` and `File::decode_entry` are used in pass B over in-memory windows.

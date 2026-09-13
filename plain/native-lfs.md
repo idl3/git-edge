@@ -16,92 +16,114 @@ Some words first. A commit is one saved version of the files, with a note about 
 
 R2 is Cloudflare's large file store. It holds the git objects. A presigned URL is a web address with a built-in signature that allows one action for a limited time. A SHA, or hash, is a fingerprint of an object's content. Two objects with the same content have the same fingerprint. LFS names each big file by its fingerprint, and calls that name the oid.
 
-A Cloudflare Worker is one of the small programs that run on Cloudflare's network close to the user, with no server to manage. A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. There is one DO for each repo. Think of it like the one librarian who is allowed to update the catalog. DO SQLite is the small database inside each Durable Object.
+A Cloudflare Worker is one of the small programs that run on Cloudflare's network close to the user, with no server to manage. Wasm, or WebAssembly, is a way to run code from other languages, such as Rust, inside a Worker. The second pass writes the whole idea in Rust against the shared contract for the foundation. A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. There is one DO for each repo. Think of it like the one librarian who is allowed to update the catalog. DO SQLite is the small database inside each Durable Object.
 
-An alarm is a timer inside a Durable Object. A DO has only one alarm at a time. The input gate is the rule that a Durable Object handles one request at a time while it waits on its own storage. The gate opens when the DO waits on the network instead. A janitor is a background task that deletes files nobody points to anymore.
+An alarm is a timer inside a Durable Object. A DO has only one alarm at a time. The input gate is the rule that a Durable Object handles one request at a time while it waits on its own storage. The gate opens when the DO waits on the network instead. A janitor, or sweep, is a background task that deletes files nobody points to anymore. A subrequest is one call from a Worker to another service, such as one read from R2.
 
-1. The LFS client posts a batch request to the Worker. The batch lists the oids and says download or upload.
-2. The Worker checks the user's identity and forwards the batch to the repo DO.
-3. The DO keeps a table named lfs_objects in DO SQLite, with the oid, the size, and a state.
-4. For a download, the DO answers with a presigned R2 read URL for each oid it knows.
-5. For an upload, the DO inserts a pending row for each oid. The DO answers with a presigned R2 write URL and a verify address.
-6. The signature on the write URL covers a checksum header equal to the oid. R2 rejects any upload whose bytes do not match that fingerprint.
-7. The client writes the bytes straight to R2. Then the client posts the verify request to the DO.
-8. The DO asks R2 for the file's size and checksum, checks them, and sets the row to ok.
-9. An alarm removes pending rows that are older than the URL lifetime.
-10. LFS files live under a separate lfs prefix in the same R2 bucket, because they are not git objects.
+1. The LFS client posts a batch request to the edge Worker. The batch lists the oids and says download or upload.
+2. The edge Worker checks the user's identity. An upload or a verify needs write rights, and a download needs any signed-in user.
+3. The edge Worker maps the two public paths onto two DO routes and adds the public web address of the repo.
+4. The DO checks every oid before any other use. An oid must be exactly 64 lowercase hex characters, or the DO rejects the batch.
+5. The DO keeps a table named lfs_objects in DO SQLite, with the oid, the size, and a state. The state is pending, ok, or dead.
+6. For a download, the DO answers with a presigned R2 read URL for each oid in state ok. Any other oid gets a 404 answer.
+7. For an upload, the DO writes a pending row for each oid. The DO signs the write URL in pure Rust, with no network call.
+8. The signature on the write URL covers a checksum header equal to the oid. R2 must reject any upload whose bytes do not match that fingerprint.
+9. The DO also queues one sweep job in the shared job table. The queue keeps one job per kind, so the sweep can never starve.
+10. The client writes the bytes straight to R2 under the key r/repo/lfs/oid. Then the client posts the verify request.
+11. The DO asks R2 for the file's size and checksum. Then the DO writes the row as ok, but only if the row is still pending.
+12. The sweep runs from the shared alarm. The sweep adopts an intact upload nobody verified, marks a bad one dead, and drops a row with no file.
+13. The sweep deletes an R2 file only for a row that has been dead for at least one hour of grace.
 
 ```mermaid
 sequenceDiagram
     participant C as LFS client
-    participant W as Worker
+    participant W as Edge Worker
     participant D as Repo DO
     participant R as R2
+    participant S as Sweep job
     C->>W: batch request with oids
-    W->>D: forward after auth check
-    D-->>C: presigned URLs
+    W->>D: forward after auth check and path map
+    D-->>C: presigned URLs and verify address
     C->>R: upload or download bytes directly
     C->>D: verify oid and size
-    D->>R: check size and checksum
-    D->>D: set row to ok
+    D->>R: head for size and checksum
+    D->>D: set row to ok if still pending
+    S->>R: adopt, mark dead, or delete after grace
 ```
 
 ## What the reviewer decided
 
-The verdict is "Lands with caveats".
+The reviewer looks for blockers and caveats. A blocker is a problem that stops the idea from working until it is fixed. A caveat is a limit or a condition. The idea works, but only inside this limit.
+
+The verdict is Lands with caveats.
 
 | Score | Value |
 |---|---|
-| Feasibility | 4 out of 5 |
-| Reliability | 3 out of 5 |
-| Correctness | 4 out of 5 |
+| Feasibility | 4 of 5 |
+| Reliability | 4 of 5 |
+| Correctness | 4 of 5 |
 
-The idea is sound and can be built. The proof has one or more problems that must be fixed first, and the reviewer described each fix. Think of it like a flight with a runway that needs some repairs before you land. The runway is there. The repairs are known.
+Lands with caveats. The idea is sound and can be built. The proof has one or more problems that must be fixed first, and the reviewer described each fix. Think of it like a flight with a runway that needs some repairs before you land. The runway is there. The repairs are known.
 
-A caveat is a limit or a condition. The idea works, but only inside this limit. GA, or generally available, means a Cloudflare feature that is finished and supported, not a preview.
+For this idea, the reviewer checked every R2 and DO call against the pinned library source, and every call exists. All three first-pass blockers are closed with code the reviewer can point at. The proof never sets the alarm itself, and the sweep follows the shared mark-then-delete rule. The crash paths walk clean. Three new blockers remain, and none of them is a redesign. The reviewer expects days of work once the foundation exists.
 
-For this idea, the proof is a real LFS batch API, the same shape that large code hosts serve. Every R2 and DO feature used is GA, and the big bytes never touch the Worker. Three small defects and one alarm bug stand between the proof and a normal LFS client. The reviewer expects days of work.
+| Score | First pass | Second pass |
+|---|---|---|
+| Feasibility | 4 of 5 | 4 of 5 |
+| Reliability | 3 of 5 | 4 of 5 |
+| Correctness | 4 of 5 | 4 of 5 |
+
+Reliability went up because the stranded 404 and the starved sweep are closed by construction. Feasibility stayed flat because four crates are new and unbuilt, and the proof wrongly said two of them were already present. Correctness stayed flat because one new client-visible regression and one panic path arrived with the fixes.
+
+## What changed in the second pass
+
+- The verify step could succeed without recording the file. Fixed. The verify step now inserts or updates the row as ok, and the code checks that exactly one row changed. The sweep adopts an intact upload instead of deleting the row.
+- The oid was never checked. Fixed. One function accepts exactly 64 lowercase hex characters and is the only path from an oid to a key, a signature, or a database value. The key is built by plain text formatting under the lfs prefix, with no web address parsing.
+- The web addresses did not match the DO routes. Fixed. The edge Worker now maps the batch path and the verify path onto the two DO routes. The edge adds the public address, so the verify address in the answer is absolute.
+- The first-pass caveat about a mismatched upload body is still open. The proof admits that a real bucket must confirm that R2 rejects such a body. Nobody has run that test yet.
+- The verify fix brought a new problem. A verify of an object that is already ok now fails with a 409 answer. See Problem 1 below.
 
 ## Problems that must be fixed first
 
-A blocker is a problem that stops the idea from working until it is fixed.
+### Problem 1: Verify fails on an object that is already ok
 
-### Problem 1: The verify step can succeed without recording the file
+**What goes wrong.** The verify step writes the row only while the row is still pending. When the row is already ok, the write changes zero rows, and the DO answers with a 409 error. Three normal cases hit that path. Two users push the same file at once, the sweep adopted the upload first, or a client retries a verify whose 200 answer was lost.
 
-**What goes wrong.** The verify step updates the pending row, and does not insert a row when the row is missing. A slow upload can outlive the URL lifetime, and the alarm deletes the pending row in the meantime. The alarm can also run while verify waits on R2, because the input gate is open during a network wait. Verify then updates zero rows and still answers with success.
+**Why it matters.** The git-lfs client treats a 4xx answer as a final error and does not retry. The push fails at the last step, after the bytes are already in R2. Only a manual second push repairs the push.
 
-**Why it matters.** R2 holds the bytes, but DO SQLite says nothing. Every later download answers "404, object does not exist" until someone pushes the same file again. The client was told the push worked, so nobody knows.
+**How to fix it.** On a zero-row write, read the row again in the same sync span. Answer 200 when the state is ok and the size matches.
 
-**How to fix it.** Make verify insert or replace the row with state ok. One line changes.
+### Problem 2: The edge indexes client JSON and can panic
 
-### Problem 2: The oid is never checked
+**What goes wrong.** The edge Worker writes the public address into the request body with an index on a JSON value. When the body is a list, a number, or a string, that index panics. The shared contract forbids index expressions in the edge for exactly that reason.
 
-**What goes wrong.** An oid must be 64 hex characters. The proof never checks that. The URL builder collapses dot-dot path steps. A crafted oid can start with dot-dot path steps and end in the git object area. The DO then signs a write URL into that area of the same bucket. Only the checksum header stands in the way.
+**Why it matters.** Any client with a login can crash the edge Worker with a three-byte body. A panic is a client-controlled failure path, and the lint rules of the contract deny it.
 
-**Why it matters.** A user with upload rights could overwrite or plant git objects. That turns a feature into a security hole.
+**How to fix it.** Read the body into the typed batch struct at the edge. Or check that the value is an object before writing into it.
 
-**How to fix it.** Check that the oid matches 64 hex characters before you build the R2 key or sign anything. Reject any other value.
+### Problem 3: The code does not compile against the shared contract
 
-### Problem 3: The web addresses do not match the DO routes
+**What goes wrong.** The proof reads two private fields of the store's bucket type, and that type has no head, get, or delete_multiple wrappers. The sweep job calls a query helper that is private to the DO module. Three more helpers are used but defined in no proof file.
 
-**What goes wrong.** The verify address the DO hands out ends in "/info/lfs/verify". The batch address ends in "/info/lfs/objects/batch". The DO only matches "/verify" and "/objects/batch". The proof assumes an edge Worker rewrites the path, but does not show that Worker.
+**Why it matters.** The contract requires every proof to compile against the section 1 signatures exactly as written. Until the seams are spelled out, nobody can build the four files.
 
-**Why it matters.** Without the rewrite, every LFS push ends with "verify failed" after the bytes are already in R2. A normal git push with LFS files would fail at the last step.
-
-**How to fix it.** Add the edge route that maps the two public paths onto the DO paths. Show that route in the proof.
+**How to fix it.** Add bucket wrappers for head, get, and delete_multiple that charge the budget. Make the query helper public to jobs, and define the three missing helpers in the DO proof.
 
 ## Things to know
 
-- The R2 changelog says R2 checks a sha256 checksum on a put, but the R2 compatibility table still omits that header. Test on a real bucket that a mismatched body is rejected with a 400 error.
-- Every batch call sets the alarm again and overwrites the pending alarm. A repo with a batch at least once an hour never cleans up its pending rows.
-- Nothing deletes LFS payloads from R2. Files nobody points to collect until a global janitor learns the lfs prefix.
-- Presigned URLs point at the raw R2 host, not a cached custom domain. Every hot download costs one R2 class B operation.
-- The batch handler does not check whether the caller is allowed to read or write. That check is left to the auth idea and must not be forgotten.
-- Only the basic transfer is supported, so files above the 5 GiB single upload limit fail. There is no lock API and no expiry timestamp in the answers.
+- Test on a real bucket on day one that R2 rejects a presigned upload whose body does not match the signed checksum. Also test that R2 stores the checksum. If the stored checksum is absent, every object above 256 MiB is marked dead and deleted after grace. That is a silent size ceiling that destroys data.
+- The proof says two of its crates are already in the spike's dependency tree. The lock file shows none of them. The hmac, hex, sha2, and base64 crates are four new crates, all pure Rust, and none has been built for Wasm.
+- A dead row can be revived by a new upload batch, and the revived row reuses the same R2 key. A sweep delete in flight can then remove a fresh good upload, and the verify answers 409. The shared deletion rule assumes keys are never reused, so add a generation suffix or refuse to revive a dead row until it is swept.
+- The sweep uses a fixed count of 320 head calls and a 20 second wall budget. A slow slice turns into an error and a retry instead of a normal continue. Eight slow slices in a row mark the job dead until the next batch queues it again.
+- The shared error mapping gains a 409 answer and JSON error bodies on the LFS paths. The helper that copies a DO answer to the client must carry that JSON body through, and the proof does not show that.
+- Several limits are admitted in the proof. Nothing deletes an ok payload whose pointer is no longer reachable. Uploads above 5 GiB fail, and there is no lock API and no multipart transfer. Presigned addresses skip the CDN and custom domains, and the same payload in two repos is stored twice. The subrequest budget is not measured in production.
+- The local wrangler R2 simulator has no S3 endpoint. Both test scenarios need wrangler dev in remote mode or a deployed Worker with an R2 API token.
+- The signing code is written by hand from the AWS spec and has never run. The reviewer read the code as correct. A mistake would show up as a 403 signature error on the first upload, not silently.
 
 ## How this idea connects to the others
 
-This idea needs [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md) because the LFS table lives in that DO.
+This idea needs [#1 One Durable Object per repo as the ref authority](./repo-do-ref-authority.md) because the LFS table and the query helpers live in that DO.
+This idea needs [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md) as the base layout for the repo and the bucket type.
+This idea needs [#6 Two-phase push](./two-phase-push.md) for the helper that forwards a JSON request from the edge to the DO.
 This idea needs [#54 Auth and multi-tenancy: owner/repo routing to DO ids](./auth-and-multitenancy.md) to check who is allowed to read or write each repo.
-This idea needs [#5 Content-addressed R2 keys](./content-addressed-r2-keys.md) for the fingerprint-based key layout in the bucket.
-This idea needs [#2 Refs in DO SQLite, objects in R2](./refs-sqlite-objects-r2.md) as the base layout for the repo.
+This idea needs [#55 GC and repack as a DO alarm](./gc-and-repack-alarm.md) for the shared job table, the alarm, and a future check of LFS pointers.
