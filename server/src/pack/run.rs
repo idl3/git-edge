@@ -1,0 +1,174 @@
+//! Phase one of the two-phase push (CONTRACTS.md 2.4-2.5, 3 ordering), in the edge Worker.
+//! Ported from proofs-v2/two-phase-push.md.
+
+use std::collections::HashMap;
+
+use gix_hash::{Kind as H, ObjectId};
+use gix_pack::data::entry::Header;
+use worker::Stub;
+
+use crate::edge::BodyReader;
+use crate::error::Error;
+use crate::store::{keys, Bucket, ObjLoc, ObjRow, PackId, PackMeta, PackWriter, PushId};
+use crate::wire::http::{stub_json, RepoRoute};
+use crate::ReqBudget;
+
+const MAX_LINKS: usize = 1_000_000; // A5
+
+fn unpack(m: impl Into<String>) -> Error {
+    Error::Unpack(m.into())
+}
+
+/// Phase one. Returns (the pack id commit_push step 3 flips to live, tag sha -> target for
+/// `refs.peeled`). pack is None when the push carried no objects (2.4). On Ok: pending/ and packs/ are durable, every ObjRow and the
+/// packs row ('ingesting') are in the DO, every link resolves (2.5). Nothing is visible to
+/// readers until the caller's /_do/push/commit (section 3 ordering 1-2-3).
+pub async fn run(
+    body: &mut BodyReader,
+    bucket: &Bucket,
+    stub: &Stub,
+    repo: &RepoRoute,
+    push: &PushId,
+    budget: &mut ReqBudget,
+) -> Result<(Option<PackId>, HashMap<ObjectId, ObjectId>), Error> {
+    if !body.fill(12).await? {
+        return if body.buffered().is_empty() {
+            Ok((None, HashMap::new())) // delete-only: no PACK
+        } else {
+            Err(unpack("pack header truncated"))
+        };
+    }
+    let head: [u8; 12] = body
+        .buffered()
+        .get(..12)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| unpack("pack header"))?;
+    let (_, count) = gix_pack::data::header::decode(&head).map_err(|e| unpack(e.to_string()))?;
+    if count == 0 {
+        // new ref at an existing commit: header + trailer only
+        if !body.fill(32).await? || body.fill(33).await? {
+            return Err(unpack("bad empty pack"));
+        }
+        let mut h = gix_hash::hasher(H::Sha1);
+        h.update(&head);
+        let want = h.try_finalize().map_err(|_| unpack("sha1 collision"))?;
+        if body.buffered().get(12..32) != Some(want.as_slice()) {
+            return Err(unpack("bad pack checksum"));
+        }
+        return Ok((None, HashMap::new()));
+    }
+    let (entries, _) = super::ingest::stream_to_pending(body, bucket, push, budget).await?;
+    let mut bases: Vec<ObjectId> = entries
+        .iter()
+        .filter_map(|r| match r.kind_or_delta {
+            Header::RefDelta { base_id } => Some(base_id),
+            _ => None,
+        })
+        .collect();
+    bases.sort_unstable();
+    bases.dedup();
+    let mut external: HashMap<ObjectId, ObjLoc> = HashMap::new();
+    for chunk in bases.chunks(1_000) {
+        external.extend(
+            lookup(stub, repo, chunk, None, budget)
+                .await?
+                .into_iter()
+                .filter_map(|(id, l)| Some((id, l?))),
+        );
+    }
+    let pack = PackId::random()?;
+    let mut sink = IndexSink { stub, repo, pack: pack.clone(), push: push.clone(), links: Vec::new(), tags: HashMap::new() };
+    sink.post_meta(&PackMeta::EMPTY, &[], budget).await?; // packs row 'ingesting' before any part is uploaded
+    let key = keys::pack(&bucket.repo, &pack);
+    let mut out = match PackWriter::create(bucket, &key, u32::try_from(entries.len()).unwrap_or(u32::MAX), budget).await {
+        Ok(w) => w,
+        Err(e) => return Err(e),
+    };
+    let pending = keys::pending(&bucket.repo, push);
+    let tail = match super::ingest::resolve_and_normalize(
+        bucket, &pending, &entries, &external, &mut out, &mut sink, budget,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            out.abort().await;
+            return Err(e);
+        }
+    };
+    drop(entries);
+    drop(external);
+    let meta = out.finish(budget).await?; // section 3 (1): pack durable in R2
+    sink.post_meta(&meta, &tail, budget).await?; // section 3 (2): tail rows + real meta
+    let mut links = std::mem::take(&mut sink.links);
+    links.sort_unstable();
+    links.dedup();
+    for chunk in links.chunks(1_000) {
+        // 2.5: links - {this pack} must be live; the DO counts this pack's own rows via `pack`
+        if let Some(id) = lookup(stub, repo, chunk, Some(&pack), budget)
+            .await?
+            .into_iter()
+            .find_map(|(id, l)| l.is_none().then_some(id))
+        {
+            return Err(unpack(format!("missing object {id}")));
+        }
+    }
+    Ok((Some(pack), std::mem::take(&mut sink.tags))) // section 3 (3) is the caller's commit
+}
+
+pub struct IndexSink<'a> {
+    stub: &'a Stub,
+    repo: &'a RepoRoute,
+    pack: PackId,
+    push: PushId,
+    pub links: Vec<ObjectId>,
+    pub tags: HashMap<ObjectId, ObjectId>,
+}
+impl IndexSink<'_> {
+    /// One /_do/push/index call (<= 10,000 rows, 1.3).
+    pub async fn post(&mut self, rows: &[ObjRow], budget: &mut ReqBudget) -> Result<(), Error> {
+        self.post_meta(&PackMeta::EMPTY, rows, budget).await
+    }
+    pub async fn post_meta(
+        &mut self,
+        meta: &PackMeta,
+        rows: &[ObjRow],
+        budget: &mut ReqBudget,
+    ) -> Result<(), Error> {
+        if self.links.len() > MAX_LINKS {
+            return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
+        }
+        const SAFE_MAX: i64 = (1 << 53) - 1;
+        let commit_lo = i64::try_from(meta.commit_lo).unwrap_or(SAFE_MAX).min(SAFE_MAX);
+        let body = serde_json::json!({
+            "pack": { "id": self.pack.0, "push_id": self.push.0, "count": meta.count, "bytes": meta.bytes,
+                      "commit_lo": commit_lo, "commit_hi": meta.commit_hi },
+            "rows": rows,
+        });
+        let _: serde_json::Value =
+            stub_json(self.stub, self.repo, "/_do/push/index", &body, budget).await?;
+        Ok(())
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LookupResponse {
+    locs: Vec<Option<ObjLoc>>,
+}
+
+/// /_do/push/lookup for <= 1,000 ids (1.3, 7.3). `pack` = the caller's own ingesting pack counts (2.5).
+pub async fn lookup(
+    stub: &Stub,
+    repo: &RepoRoute,
+    ids: &[ObjectId],
+    pack: Option<&PackId>,
+    budget: &mut ReqBudget,
+) -> Result<Vec<(ObjectId, Option<ObjLoc>)>, Error> {
+    let hex: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    let res: LookupResponse =
+        stub_json(stub, repo, "/_do/push/lookup", &serde_json::json!({ "ids": hex, "pack": pack }), budget).await?;
+    if res.locs.len() != ids.len() {
+        return Err(Error::Internal("lookup length".into()));
+    }
+    Ok(ids.iter().copied().zip(res.locs).collect())
+}

@@ -1,0 +1,1 @@
+{ "name": "git-edge-server", "private": true, "devDependencies": { "wrangler": "4.129" } }

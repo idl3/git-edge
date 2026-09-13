@@ -1,0 +1,10 @@
+{
+  "name": "git-edge",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-09-01",
+  "build": { "command": "worker-build --release" },
+  "durable_objects": { "bindings": [{ "name": "REPO", "class_name": "RepoDo" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RepoDo"] }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "git-edge" }],
+  "limits": { "cpu_ms": 300000 }
+}

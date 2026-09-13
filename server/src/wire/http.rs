@@ -1,0 +1,131 @@
+//! Shared request/response helpers (CONTRACTS.md A8): the place DTOs, route headers and the
+//! stub-call glue live so `repo_do` never imports `edge`. `worker` types are allowed here.
+
+use worker::{Headers, Method, Request, RequestInit, Response, Stub};
+
+use crate::error::Error;
+use crate::ReqBudget;
+
+/// x-ge-owner / x-ge-repo, set by the edge on every stub request (section 8.1).
+pub struct RepoHeaders {
+    pub owner: Option<String>,
+    pub repo: Option<String>,
+}
+impl RepoHeaders {
+    pub const NONE: RepoHeaders = RepoHeaders { owner: None, repo: None };
+    pub fn from_request(req: &Request) -> Self {
+        Self {
+            owner: req.headers().get("x-ge-owner").ok().flatten(),
+            repo: req.headers().get("x-ge-repo").ok().flatten(),
+        }
+    }
+}
+
+/// One parser for `/:owner/:repo[.git]/<rest>`; the only place the DO name is formed.
+pub struct RepoRoute {
+    pub owner: String,
+    pub repo: String,
+}
+impl RepoRoute {
+    fn seg_ok(s: &str) -> bool {
+        (1..=64).contains(&s.len())
+            && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    }
+    pub fn parse(path: &str) -> Result<(Self, String), Error> {
+        let mut it = path.strip_prefix('/').ok_or(Error::NotFound)?.splitn(3, '/');
+        let (owner, repo, rest) = (
+            it.next().unwrap_or(""),
+            it.next().unwrap_or(""),
+            it.next().unwrap_or(""),
+        );
+        let repo = repo.strip_suffix(".git").unwrap_or(repo);
+        if !Self::seg_ok(owner) || !Self::seg_ok(repo) {
+            return Err(Error::NotFound);
+        }
+        Ok((Self { owner: owner.into(), repo: repo.into() }, rest.into()))
+    }
+    pub fn name(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+    pub fn stub(&self, env: &worker::Env) -> Result<Stub, Error> {
+        Ok(env.durable_object("REPO")?.id_from_name(&self.name())?.get_stub()?)
+    }
+    /// The only two headers a DO ever sees (section 8.1). No client header crosses.
+    pub fn apply_headers(&self, req: &mut Request) -> Result<(), Error> {
+        req.headers_mut()?.set("x-ge-owner", &self.owner)?;
+        req.headers_mut()?.set("x-ge-repo", &self.repo)?;
+        Ok(())
+    }
+    /// A fresh internal Request: POST + the two identity headers + a byte body.
+    pub fn internal_request(&self, path: &str, body: Vec<u8>) -> Result<Request, Error> {
+        let headers = Headers::new();
+        headers.set("x-ge-owner", &self.owner)?;
+        headers.set("x-ge-repo", &self.repo)?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post);
+        init.with_headers(headers);
+        init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
+        Ok(Request::new_with_init(&format!("https://do{path}"), &init)?)
+    }
+}
+
+/// JSON body parse for DO routes; bad JSON from the edge is Internal (edge produced it).
+pub fn parse<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, Error> {
+    serde_json::from_slice(b).map_err(|e| Error::Internal(format!("do body: {e}")))
+}
+
+/// JSON response for DO routes.
+pub fn json(v: serde_json::Value) -> Result<Response, Error> {
+    Response::from_json(&v).map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// Turn a DO-side Error into a JSON response the edge can reconstruct. Storage and Internal
+/// never reach this: they propagate out of `fetch` so the platform rolls back the span (A2).
+pub fn do_error_response(e: &Error) -> Result<Response, Error> {
+    let kind = match e {
+        Error::Protocol(_) => "protocol",
+        Error::Auth => "auth",
+        Error::Forbidden => "forbidden",
+        Error::NotFound => "notfound",
+        Error::Conflict(_) => "conflict",
+        Error::Unpack(_) => "unpack",
+        Error::Budget => "budget",
+        Error::Limit(_) => "limit",
+        Error::Storage(_) | Error::Internal(_) => "internal",
+    };
+    let body = serde_json::json!({ "error": kind, "message": e.message() });
+    let resp = Response::from_json(&body).map_err(|e| Error::Internal(e.to_string()))?;
+    Ok(resp.with_status(e.status()))
+}
+
+/// One stub round-trip, charged first (7.1), identity headers set (8.1).
+/// A non-200 body carries the DO's JSON error (section 10, A2).
+pub async fn stub_json<T: serde::de::DeserializeOwned>(
+    stub: &Stub,
+    repo: &RepoRoute,
+    path: &str,
+    body: &impl serde::Serialize,
+    budget: &mut ReqBudget,
+) -> Result<T, Error> {
+    budget.charge(1)?;
+    let text = serde_json::to_string(body).map_err(|e| Error::Internal(e.to_string()))?;
+    let req = repo.internal_request(path, text.into_bytes())?;
+    let mut resp = stub.fetch_with_request(req).await?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp).await);
+    }
+    resp.json::<T>().await.map_err(|e| Error::Internal(format!("do response: {e}")))
+}
+
+/// Forward a raw pkt-line body to a DO route (ls-refs, fetch). The response streams back as-is.
+pub async fn stub_raw(
+    stub: &Stub,
+    repo: &RepoRoute,
+    path: &str,
+    body: Vec<u8>,
+    budget: &mut ReqBudget,
+) -> Result<Response, Error> {
+    budget.charge(1)?;
+    let req = repo.internal_request(path, body)?;
+    stub.fetch_with_request(req).await.map_err(|e| Error::Storage(e.to_string()))
+}

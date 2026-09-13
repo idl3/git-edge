@@ -569,3 +569,70 @@ The 14 second-pass foundation reviews found the following gaps in this contract 
 **A9. Registration lists (overrides 1.3, 1.4, 12).** A post-foundation module may add routes, `JobKind` variants, tables and R2 key prefixes if it lists them in one `REGISTRY` block at the top of its file. The foundation lists in 1.3 and 1.4 are the minimum, not the maximum.
 
 **A10. Pass A of ingest (overrides 2.4, 6.4).** Pass A does not use `BytesToEntriesIter`, which is synchronous over `BufRead` and cannot await body bytes mid-entry. Pass A parses entry headers with `gix_pack::data::entry::Header::from_bytes`, inflates with `gix_zlib::Inflate` tracking `total_in`, and hashes the raw pack with the SHA-1 hasher. `BytesToEntriesIter` and `File::decode_entry` are used in pass B over in-memory windows.
+
+## Amendments from the implementation pass (2026-09-14, server/ compiles and serves git)
+
+The crate in `server/` now compiles for `wasm32-unknown-unknown`, runs on local workerd,
+and passes `tests/conformance/run.sh` (push, incremental push with client deltas, branch
+create/delete, tag, delete-only push, clone, incremental fetch, `git fsck --strict`,
+malformed-pack report-status). These amendments record what the proofs' prose missed that
+only a real compile and a real git client found.
+
+**A11. Report-status inner flush (overrides 1.1 rule 4).** The report-status pkt-stream must
+end with a flush packet *inside* the sideband framing (`write_report_status` emits
+`body.flush()` before wrapping). Without it, git's demuxed inner reader hits pipe EOF and
+dies with `the remote end hung up unexpectedly` — after having already applied the ref
+updates. A push can therefore commit and still read as a client failure; this is exactly the
+class of bug the proofs' "review by reading" could not see and the conformance suite catches.
+
+**A12. `report-status-v2` is not advertised (overrides 1.1 capability list).** v2 adds an
+`option`-line section after ref results; we emit none, so we advertise `report-status` only.
+Every observed client (git 2.54) falls back to v1. A proof that wants v2 must implement the
+option-line grammar, not just the capability string.
+
+**A13. `Index::lookup` keys by sha (clarifies 2.3).** The `objects JOIN packs` reader query
+must `SELECT o.sha` and build its result map keyed on sha, not pack id. The proof text said
+"returns Option<ObjLoc> per id"; the compiled version made this concrete — a map keyed on
+`pack_id` silently finds nothing and every ref update fails with `missing necessary objects`.
+
+**A14. workers-rs 0.8.5 API facts (extends "Corrections from the Rust spike").**
+- `Response::with_status(u16)` consumes `self`; build status responses as
+  `Response::ok(body)?.with_status(code)`.
+- Responses returned by `stub.fetch_with_request` carry immutable headers. To set
+  `Content-Type` on a forwarded DO response, read `resp.bytes()` and rebuild the `Response`.
+- The request body is `req.stream() -> ByteStream` (a `Stream<Item = Result<Vec<u8>>>`).
+  `req.inner().body()` returns the raw `web_sys::ReadableStream`; it is the right source only
+  for the `DecompressionStream` gzip path, which pipes it through and re-wraps with
+  `wasm_streams::ReadableStream::from_raw`.
+- `wasm-streams` must equal the version `worker` links (0.6 here). Two versions in the tree
+  each export `IntoUnderlyingByteSource` and wasm-bindgen refuses the build.
+- `#[durable_object]` requires fields shaped `state: State, env: Env` plus ordinary fields;
+  the macro generates `new(state, env)` and its ABI derives from the struct itself.
+- DO SQL bind values cross the JS boundary as f64: `i64::MAX` does not round-trip
+  (`commit_lo` sentinels and any other marker integers must stay under `2^53 - 1`).
+- `gix_object` iterator constructors take the hash kind:
+  `CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1)` (same for `TreeRefIter`, `TagRef`).
+- `gix_zlib::stream::deflate::Write` has no `finish()`: `write_all`, then
+  `std::io::Write::flush`, then `into_inner()`.
+- `gix_object::Data` carries `object_hash: gix_hash::Kind`; `Find::try_find` takes
+  `id: &gix_hash::oid` and returns `Result<Option<Data>, gix_object::find::Error>`.
+- `gix_pack::data::entry::Header::from_bytes(bytes, offset, gix_hash::Kind::Sha1)`; `Entry::
+  from_bytes(bytes, offset, gix_hash::Kind::Sha1)`; `header::decode(&head)` returns
+  `(Version, count)`.
+- SQLite `UPDATE/DELETE ... LIMIT` is not compiled in: select keys, then mutate by key.
+- `worker::UploadedPart` is not `Clone`; `MultipartUpload::complete(parts)` consumes;
+  `abort(&self)` does not.
+
+**A15. Verified behaviour, and what is still unverified (overrides nothing; records fact).**
+Verified on local workerd with git 2.54: v2 `ls-refs` on empty and populated repos; v0/v1
+receive-pack advertisement; initial push; incremental push of a thin pack containing
+client-side deltas resolved against stored objects; 6 MiB binary blob round-trip through
+R2 multipart; branch create/delete; tag push; delete-only push (no PACK body);
+`git clone` (v2 fetch + streamed pack over sideband-64k, exact count and trailer);
+incremental `git fetch` (have/want send-set); CAS `ng` on stale `old`; the A2 arm
+(HTTP 200, `unpack <err>`, `ng <ref>`) on a malformed pack; gzip `Content-Encoding` via
+`DecompressionStream`. Not yet exercised: GC end-to-end on live storage (the alarm chain is
+wired; the mark/consolidate/sweep slices are written and compile but have not reclaimed a
+real pack), `wrangler dev`'s local R2 differs from production R2 in MPU orphan semantics,
+and subrequest ceilings below paid-plan values are unenforced by the simulator (ReqBudget is
+the guard).
