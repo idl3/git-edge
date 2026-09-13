@@ -12,7 +12,7 @@ This repository does not contain the server. It contains the study that comes be
 - Can a crash or two users at once lose data?
 - Does it do what the idea says, or something weaker?
 
-Nothing here has run on a real Cloudflare account yet. Read the proofs as an argument. Read the reviews as the argument against.
+The proofs have not run on a real Cloudflare account. Read them as an argument, and the reviews as the argument against. A small test program has run on the real runtime locally, and its answers are in [research/platform-facts.md](research/platform-facts.md).
 
 ## The result in one table
 
@@ -54,7 +54,9 @@ The 56 proofs were written in TypeScript. We then asked whether the server can b
 | `ideas/` | The list of 56 ideas as they went into the study | Everyone. |
 | `site/` | The interactive map as one web page | Everyone. |
 | `data/` | The structured results every other file was made from | Tools. |
-| `research/` | Engineer-level memos with source links, such as the Rust and gitoxide check | Engineers. |
+| `research/` | Engineer-level memos with source links: the Rust check, and the platform facts we measured | Engineers. |
+| `spikes/` | Small real programs run on the Cloudflare runtime to test a fact | Engineers. |
+| `CONTRACTS.md` | The one set of rules every revised proof follows: storage layout, the ref transaction, the job timer, the janitor | Engineers. |
 | `STYLE.md` | The writing rules and glossary for the plain documents | Writers. |
 
 ## The nine problems in one breath

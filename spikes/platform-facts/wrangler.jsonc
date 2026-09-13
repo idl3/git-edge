@@ -1,0 +1,9 @@
+{
+  "name": "git-edge-platform-facts",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": { "bindings": [{ "name": "FACTS", "class_name": "FactsDO" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["FactsDO"] }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "git-edge-spike" }]
+}

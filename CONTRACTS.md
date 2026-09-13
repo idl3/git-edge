@@ -1,0 +1,531 @@
+# git-edge foundation contracts
+
+Status: binding. Every revised proof is written against this file. Where this file and a proof disagree, this file wins. Where this file says "unverified", the item must be tested on day 1 and the result written back here.
+
+Sources: `research/rust-server.md` (crate versions, API coverage), `research/platform-facts.md` (measured on workerd 4.129: `rowsWritten` counts index rows, `ctx.id.name` is populated, R2 awaits open the input gate with 7 of 8 updates lost, a second `setAlarm` cancels the first, multipart and range reads work on the local simulator only), `hand/cross-cutting-defects.md` (defects 1-9), the eight foundation reviews. Crate versions are pinned exactly as the memo lists them: `worker` 0.8.5, `gix-pack` 0.74.2, `gix-object` 0.64.1, `gix-hash` 0.26.2, `gix-packetline` 0.22.2, `gix-traverse` 0.61.0, `gix-features` 0.49.1, `gix-validate` 0.11.4.
+
+Conventions in this file. `async fn` means the function may await (R2, DO stub, request body, alarm API). `fn` means the function must not await and must not touch any host API that returns a promise. "Sync span" means a run of DO code between two awaits; the platform delivers no other event to the DO inside a sync span. All object ids are SHA-1 (`gix_hash::Kind::Sha1`); `object-format=sha256` is rejected at capability parsing.
+
+---
+
+## 1. Crate and module layout
+
+One crate, `git-edge`, `crate-type = ["cdylib"]`, target `wasm32-unknown-unknown`, manifest as in the memo section 4 with `panic = "unwind"` (see section 10). No code runs at global scope; every module initialises lazily inside a handler.
+
+```
+src/
+  lib.rs        #[event(fetch)] entry: delegates to edge::route
+  wire/         pkt-line, sideband, v2 command parser, receive header parser, report-status writer
+  store/        R2 key layout, pack entry codec, SQLite index schema + queries, MemFind
+  repo_do/      #[durable_object] RepoDo: refs, meta, pushes, jobs tables; internal HTTP routes
+  jobs/         alarm dispatcher + job kinds: janitor, gc_mark, gc_consolidate, gc_sweep
+  pack/         ingest (stream, resolve, normalize) and generate (send-set, pack writer)
+  auth/         credential check for the edge
+  edge/         stateless Worker router; body decoding; calls RepoDo through Stub::fetch_with_request
+  error.rs      the single Error enum (section 10)
+```
+
+Dependency direction: `edge -> {auth, wire, pack, store}`; `repo_do -> {wire, store, jobs, pack::generate}`; `jobs -> {store, pack}`; `pack -> {store, wire}`; `store -> gix-*`; `wire -> gix-packetline, gix-hash`. `wire` and `store::codec` never import `worker`. Nothing imports `repo_do` except `lib.rs` and `edge`.
+
+### 1.1 `wire` (no awaits anywhere in this module)
+
+```rust
+pub const MAX_PKT_DATA: usize = 65516;   // 65520 - 4 length bytes (gix_packetline::MAX_DATA_LEN)
+pub const MAX_BAND_DATA: usize = 65515;  // 65520 - 4 - 1 band byte; git's LARGE_PACKET_DATA_MAX - 1
+
+pub enum Pkt<'a> { Data(&'a [u8]), Flush, Delim, ResponseEnd }
+
+pub struct PktReader { buf: Vec<u8>, pos: usize }
+impl PktReader {
+    pub fn push(&mut self, bytes: &[u8]);                       // append raw body bytes
+    pub fn next(&mut self) -> Result<Option<Pkt<'_>>, Error>;   // Ok(None) = need more bytes
+    pub fn remainder(&mut self) -> Vec<u8>;                     // unread bytes after the last returned pkt
+}
+pub struct PktWriter { pub out: Vec<u8> }
+impl PktWriter {
+    pub fn data(&mut self, b: &[u8]) -> Result<(), Error>;      // Err(Error::Internal) if b.len() > MAX_PKT_DATA
+    pub fn text(&mut self, s: &str) -> Result<(), Error>;       // data(s) with a trailing '\n' added if absent
+    pub fn flush(&mut self); pub fn delim(&mut self); pub fn response_end(&mut self);
+}
+pub struct Sideband<'w> { w: &'w mut PktWriter }
+impl<'w> Sideband<'w> {
+    pub fn data(&mut self, b: &[u8]);          // splits into frames of <= MAX_BAND_DATA on band 1
+    pub fn progress(&mut self, s: &str);       // band 2, one frame, truncated to MAX_BAND_DATA
+    pub fn error(&mut self, s: &str);          // band 3, one frame
+}
+
+pub struct RefCommand { pub old: ObjectId, pub new: ObjectId, pub name: BString }
+pub struct ReceiveCaps { pub report_status: bool, pub report_status_v2: bool, pub side_band_64k: bool,
+                         pub delete_refs: bool, pub quiet: bool, pub ofs_delta: bool, pub agent: Option<BString> }
+pub struct ReceiveHeader { pub commands: Vec<RefCommand>, pub caps: ReceiveCaps, pub shallow: Vec<ObjectId> }
+/// Parses `shallow <oid>` lines, then `<old> <new> <name>[\0caps]` lines, up to and including the flush.
+/// Ok(None) when the reader needs more bytes. After Ok(Some), `reader.remainder()` is the PACK (possibly empty).
+pub fn parse_receive_header(r: &mut PktReader) -> Result<Option<ReceiveHeader>, Error>;
+
+pub enum Filter { BlobNone, BlobLimit(u64) }
+pub struct LsRefsArgs { pub symrefs: bool, pub peel: bool, pub unborn: bool, pub prefixes: Vec<BString> }
+pub struct FetchArgs { pub wants: Vec<ObjectId>, pub haves: Vec<ObjectId>, pub done: bool, pub thin_pack: bool,
+                       pub no_progress: bool, pub include_tag: bool, pub ofs_delta: bool,
+                       pub deepen: Option<u32>, pub shallow: Vec<ObjectId>, pub filter: Option<Filter> }
+pub enum V2Command { LsRefs(LsRefsArgs), Fetch(FetchArgs) }
+/// Parses `command=...`, capability lines, delim, arguments, flush. Unknown command or argument -> Error::Protocol.
+pub fn parse_v2_command(body: &[u8]) -> Result<V2Command, Error>;
+
+pub struct RefRow { pub name: BString, pub target: ObjectId, pub peeled: Option<ObjectId> }
+pub fn write_capability_advertisement_v2(w: &mut PktWriter);                       // upload-pack, Git-Protocol: version=2
+pub fn write_advertisement_v0(w: &mut PktWriter, service: Service, head: Option<&BStr>, refs: &[RefRow]);
+pub fn write_ls_refs(w: &mut PktWriter, args: &LsRefsArgs, head: Option<&BStr>, refs: &[RefRow]);
+pub enum RefResult { Ok(BString), Ng(BString, &'static str) }
+pub fn write_report_status(w: &mut PktWriter, unpack: Result<(), &str>, results: &[RefResult], caps: &ReceiveCaps);
+```
+
+Exact wire rules, all enforced inside `wire` and tested against real `git` (section 11):
+
+1. Length prefix counts its own four bytes. `0000` flush, `0001` delim, `0002` response-end. A read of `0003` or a length that overruns the buffer is `Error::Protocol`.
+2. Sideband frames carry at most 65515 data bytes. Progress and error frames are single frames.
+3. v2 `fetch` response: `acknowledgments` section is **omitted entirely** when the client sent `done`. Otherwise it is `acknowledgments\n`, then `NAK\n` or one `ACK <oid>\n` per known have, then `ready\n` if a pack follows. If no pack follows, the response ends with flush after the section. If a pack follows: delim, optional `shallow-info` section, delim, `packfile\n`, sideband frames, flush. `response-end` is never written over smart HTTP.
+4. `report-status` and `report-status-v2` bodies are written in band 1 when `caps.side_band_64k` is true, else as raw pkt-lines. Both end with a flush. Under sideband the final flush is written after the last band-1 frame, outside the band.
+5. v0 receive-pack advertisement: `# service=git-receive-pack\n`, flush, then `<oid> <ref>\0<caps>\n` for the first ref, `<oid> <ref>\n` for the rest, flush. Empty repo: `<40 zeros> capabilities^{}\0<caps>\n`. Advertised receive caps, exactly: `report-status report-status-v2 delete-refs side-band-64k quiet ofs-delta object-format=sha1 agent=git-edge/0.1`. Not advertised: `atomic`, `push-options`.
+6. v2 capability advertisement, exactly: `version 2`, `agent=git-edge/0.1`, `ls-refs=unborn`, `fetch=shallow filter`, `object-format=sha1`, flush. Not advertised: `wait-for-done`, `ref-in-want`, `sideband-all`, `packfile-uris`, `server-option`.
+7. Upload-pack is v2 only. A `GET info/refs?service=git-upload-pack` without `Git-Protocol: version=2` gets the v0 advertisement with capabilities `object-format=sha1 agent=git-edge/0.1` only. A v0 `POST git-upload-pack` gets HTTP 400 with body `ERR protocol v2 required (git >= 2.26)\n` as one pkt-line.
+8. `Git-Protocol: version=1` is answered as v0 with a leading `version 1\n` pkt (upload-pack) or ignored (receive-pack).
+
+### 1.2 `store`
+
+```rust
+pub struct RepoId(pub String);   // 32 lowercase hex chars, section 8
+pub struct PackId(pub String);   // 32 lowercase hex chars, generated by the edge at push begin
+pub struct ObjLoc { pub pack: PackId, pub idx: u32, pub offset: u64, pub len: u32, pub kind: Kind, pub size: u64 }
+
+pub mod keys {   // pure functions
+    pub fn pack(repo: &RepoId, pack: &PackId) -> String;            // r/<repo>/packs/<pack>.pack
+    pub fn pending(repo: &RepoId, push: &PushId) -> String;         // r/<repo>/pending/<push>.pack
+}
+pub mod codec {  // sync, no worker imports
+    /// Encodes one full (non-delta) pack entry: varint type/size header + zlib(data). Returns entry bytes.
+    pub fn encode_entry(kind: Kind, data: &[u8], out: &mut Vec<u8>);
+    /// Decodes one entry that starts at bytes[0]. Errors if the entry is a delta.
+    pub fn decode_entry(bytes: &[u8]) -> Result<(Kind, Vec<u8>), Error>;
+    pub fn entry_header(bytes: &[u8]) -> Result<(Kind, u64 /*size*/, usize /*header len*/), Error>;
+}
+pub struct MemFind { objs: HashMap<ObjectId, (Kind, Vec<u8>)>, pub bytes: usize }
+impl gix_object::Find for MemFind { /* try_find returns Ok(None) on miss, never errors */ }
+impl gix_object::Exists for MemFind {}
+impl MemFind { pub fn insert(&mut self, id: ObjectId, kind: Kind, data: Vec<u8>); pub fn clear(&mut self); }
+
+pub struct Bucket { inner: worker::Bucket, repo: RepoId }
+impl Bucket {
+    pub async fn read_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>, Error>; // one subrequest
+    pub async fn read_entries(&self, locs: &[ObjLoc]) -> Result<Vec<(ObjectId, Vec<u8>)>, Error>; // coalesced, 7.2
+    pub async fn delete(&self, keys: &[String]) -> Result<(), Error>;                            // <= 1000 per call
+}
+pub struct PackWriter { mpu: MultipartUpload, key: String, part: Vec<u8>, parts: Vec<UploadedPart>,
+                        offset: u64, count: u32, hasher: gix_hash::Hasher, commit_lo: u64, commit_hi: u64 }
+impl PackWriter {
+    pub async fn create(bucket: &Bucket, key: String) -> Result<Self, Error>;
+    pub fn append_entry(&mut self, kind: Kind, data: &[u8]) -> (u64 /*offset*/, u32 /*len*/); // sync; buffers
+    pub async fn flush_if_full(&mut self) -> Result<(), Error>;   // uploads one 8 MiB part when part.len() >= 8 MiB
+    pub async fn finish(mut self) -> Result<PackMeta, Error>;     // patches header count, appends trailer, completes
+    pub async fn abort(self);
+}
+pub struct Index<'s>(pub &'s worker::SqlStorage);  // sync SQLite queries, used only inside RepoDo and jobs
+impl<'s> Index<'s> {
+    pub fn lookup(&self, ids: &[ObjectId]) -> Result<Vec<Option<ObjLoc>>, Error>;   // live packs only
+    pub fn insert_pack(&self, meta: &PackMeta, state: PackState) -> Result<(), Error>;
+    pub fn insert_objects(&self, pack: &PackId, rows: &[ObjRow]) -> Result<(), Error>;  // <= 10,000 rows per call
+    pub fn set_pack_state(&self, pack: &PackId, state: PackState) -> Result<(), Error>;
+}
+```
+
+### 1.3 `repo_do`
+
+```rust
+#[durable_object]
+pub struct RepoDo { state: State, env: Env, booted: RefCell<bool> }
+impl DurableObject for RepoDo {
+    fn new(state: State, env: Env) -> Self;
+    async fn fetch(&self, req: Request) -> worker::Result<Response>;   // dispatches on path, section 1.3.1
+    async fn alarm(&self) -> worker::Result<Response>;                 // jobs::dispatch(self)
+}
+impl RepoDo {
+    fn boot(&self, hdr: &RepoHeaders) -> Result<Meta, Error>;          // sync: migrate schema, write/verify meta (section 8)
+    fn list_refs(&self) -> Result<(Option<BString>, Vec<RefRow>), Error>;               // sync
+    fn commit_push(&self, req: &CommitRequest) -> Result<CommitResponse, Error>;         // sync span, section 3
+    async fn fetch_v2(&self, meta: &Meta, args: FetchArgs) -> Result<Response, Error>;  // section 9
+}
+```
+
+Internal routes (all `POST` except the first, all require the headers of section 8):
+
+| Path | Body in | Body out | Awaits inside |
+|---|---|---|---|
+| `GET /_do/refs` | - | JSON `{head, refs:[{name,target,peeled}]}` | none |
+| `/_do/push/begin` | JSON `{push_id}` | JSON `{repo_id, refs_version, gc_epoch}` | none |
+| `/_do/push/lookup` | JSON `{ids:[...]}` (<= 1000) | JSON `{locs:[ObjLoc|null]}` | none |
+| `/_do/push/index` | JSON `{pack: PackMeta, rows:[ObjRow]}` (<= 10,000 rows) | `{}` | none |
+| `/_do/push/commit` | JSON `CommitRequest` | JSON `CommitResponse` | none |
+| `/_do/fetch` | raw v2 fetch body | v2 fetch response stream | R2 reads |
+| `/_do/ls-refs` | raw v2 ls-refs body | pkt-line bytes | none |
+
+Rows are JSON with hex ids. A route with "none" in the last column runs as one sync span from first byte parsed to response built.
+
+### 1.4 `jobs`, `pack`, `auth`, `edge`
+
+```rust
+// jobs
+pub struct Job { pub id: i64, pub kind: JobKind, pub run_at: i64, pub attempts: u32, pub cursor: Option<String>, pub payload: String }
+pub enum JobKind { Janitor, GcMark, GcConsolidate, GcSweep }
+pub enum SliceOutcome { Done, Continue { cursor: String }, Reschedule { run_at: i64 } }
+pub struct SliceBudget { pub started_ms: f64, pub subrequests_used: u32 }   // section 7
+pub async fn dispatch(d: &RepoDo) -> Result<(), Error>;                        // called by alarm()
+pub fn enqueue(sql: &SqlStorage, kind: JobKind, run_at: i64, payload: &str) -> Result<(), Error>;  // sync, dedups by kind
+pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<SliceOutcome, Error>;
+
+// pack::ingest  (runs in the edge Worker)
+pub struct EntryRec { pub offset: u64, pub header_len: u8, pub kind_or_delta: gix_pack::data::entry::Header, pub compressed_len: u32 }
+pub async fn stream_to_pending(body: &mut BodyReader, bucket: &Bucket, push: &PushId, budget: &mut ReqBudget)
+    -> Result<(Vec<EntryRec>, u32 /*count*/), Error>;     // verifies trailer SHA-1; Error::Protocol("bad pack checksum")
+pub async fn resolve_and_normalize(bucket: &Bucket, pending_key: &str, entries: &[EntryRec],
+    external_bases: &HashMap<ObjectId, ObjLoc>, out: &mut PackWriter, budget: &mut ReqBudget)
+    -> Result<Vec<ObjRow>, Error>;                        // section 2.4
+pub fn extract_links(kind: Kind, data: &[u8]) -> Result<Vec<ObjectId>, Error>;   // sync; commit/tree/tag references
+
+// pack::generate  (runs in RepoDo)
+pub async fn send_set(d: &RepoDo, bucket: &Bucket, wants: &[ObjectId], haves: &[ObjectId],
+    filter: Option<&Filter>, deepen: Option<u32>, budget: &mut ReqBudget) -> Result<SendSet, Error>;  // section 9
+pub async fn write_pack(bucket: &Bucket, set: &SendSet, out: &mut Sideband<'_>, budget: &mut ReqBudget) -> Result<(), Error>;
+
+// auth
+pub struct Principal { pub name: String, pub can_write: bool }
+pub fn authenticate(req: &Request, env: &Env) -> Result<Principal, Error>;   // sync; Basic auth, section 12
+
+// edge
+pub async fn route(req: Request, env: Env) -> worker::Result<Response>;
+pub struct BodyReader { /* section 6 */ }
+```
+
+---
+
+## 2. Object storage spec (defects 3 and 4)
+
+### 2.1 Decision
+
+Every object at rest lives inside a **normalized pack**: a byte-exact git pack v2 whose entries are all full objects (no `ofs-delta`, no `ref-delta`), each entry `varint(kind,size) + zlib(data)`, with the usual 12-byte header and 20-byte SHA-1 trailer. There are no loose objects. Ingest resolves every delta, including thin-pack bases, and writes full objects. Deltas are never stored and never resolved at read time.
+
+Why full objects: a reader resolves any SHA with one SQLite lookup plus **one R2 range read** of `[offset, offset+len)`, and the bytes it gets are already a valid pack entry that `pack::generate` copies verbatim into an outgoing pack. No inflate, no base, no chain on the read path. Why not "store the thin pack and resolve at read": a chain of depth d needs d reads across packs, the sync `Find` constraint means all of them must be prefetched before any compute, and the janitor could not delete a pack without knowing which chains cross into it. Why not one R2 object per git object: two subrequests per object caps a push at about 5,000 objects (review, content-addressed-r2-keys); a pack is one multipart upload whatever the object count.
+
+### 2.2 R2 key layout
+
+```
+r/<repo_id>/packs/<pack_id>.pack        normalized pack, immutable once the packs row is live
+r/<repo_id>/pending/<push_id>.pack      raw pack bytes exactly as received (thin, deltas, gzip removed), scratch
+```
+
+`repo_id` comes from the DO `meta` table (section 8), never from `ctx.id.name`, never from the URL. Nothing else is ever written to R2 by the foundation. R2 `customMetadata` on a pack: `{ "repo": repo_id, "pack": pack_id, "count": "<n>", "created_at": "<unix ms>" }`. Metadata is informational for operators; no code path reads it.
+
+### 2.3 SQLite tables in RepoDo
+
+```sql
+CREATE TABLE packs (
+  id          TEXT PRIMARY KEY,           -- pack_id
+  state       TEXT NOT NULL,              -- 'ingesting' | 'live' | 'dead'
+  count       INTEGER NOT NULL,
+  bytes       INTEGER NOT NULL,           -- total pack length including header and trailer
+  commit_lo   INTEGER NOT NULL,           -- lowest offset of any commit entry (u64 max if none)
+  commit_hi   INTEGER NOT NULL,           -- end offset of the last commit entry (0 if none)
+  push_id     TEXT,                       -- null for packs written by gc_consolidate
+  created_at  INTEGER NOT NULL,           -- unix ms
+  dead_at     INTEGER                     -- set by gc_sweep; janitor deletes the R2 key later
+) WITHOUT ROWID;
+
+CREATE TABLE objects (
+  sha     TEXT NOT NULL,                  -- 40 hex
+  pack_id TEXT NOT NULL REFERENCES packs(id),
+  idx     INTEGER NOT NULL,               -- ordinal of the entry inside the pack, 0-based
+  offset  INTEGER NOT NULL,
+  len     INTEGER NOT NULL,               -- entry length: header + zlib body
+  kind    INTEGER NOT NULL,               -- 1 commit, 2 tree, 3 blob, 4 tag (git numbering)
+  size    INTEGER NOT NULL,               -- inflated size
+  PRIMARY KEY (sha, pack_id)
+) WITHOUT ROWID;
+CREATE INDEX objects_pack ON objects(pack_id, idx);
+```
+
+`created_at` is per pack, not per object; the grace period of section 5 is measured on packs. The reader query, and the only way any code resolves a sha:
+
+```sql
+SELECT o.pack_id, o.idx, o.offset, o.len, o.kind, o.size
+FROM objects o JOIN packs p ON p.id = o.pack_id
+WHERE o.sha = ? AND p.state = 'live' LIMIT 1;
+```
+
+A sha that appears in two live packs is legal (two pushes raced with overlapping content). Either row is correct because both hold the same bytes. `gc_consolidate` removes the duplicate.
+
+### 2.4 Ingest (two passes, in the edge Worker)
+
+Pass A, `stream_to_pending`: the body after the receive header (section 6) is streamed into `pending/<push_id>.pack` through `PackWriter`-style multipart with 8 MiB parts, unmodified. In the same pass the bytes are fed to `gix_pack::data::input::BytesToEntriesIter::new_from_header(reader, Mode::Verify, EntryDataMode::Ignore, Sha1)` over a `BufRead` adapter that yields the buffered window (section 6). Each entry produces an `EntryRec` (offset, header, compressed length). `Mode::Verify` checks the trailer. Memory: `EntryRec` is 24 bytes; the vector is capped at 2,000,000 entries (48 MB), beyond which ingest fails with `unpack error too many objects`.
+
+Between passes: all `ref-delta` base ids that are not entries of this pack are looked up in batches of 1,000 through `/_do/push/lookup`. A base that is not live is `unpack error missing base <oid>`. Bases are fetched with `Bucket::read_entries` (coalesced, section 7.2) into a `HashMap<ObjectId, Vec<u8>>` of resolved bytes, capped at 32 MiB; beyond the cap bases are fetched on demand one range read each.
+
+Pass B, `resolve_and_normalize`: the pending pack is read back in 8 MiB windows in offset order (one range read per window). For each entry in order: full object -> inflate; `ofs-delta` -> base is an earlier entry, taken from the resolved LRU (16 MiB) or re-read from `pending/` by its recorded offset (one range read); `ref-delta` -> base from the LRU, the external base map, or the pending pack. Delta application is `gix_pack::data::delta::apply`. The result is hashed with `gix_object::compute_hash`, links are extracted with `extract_links`, the object is appended to the normalized pack with `PackWriter::append_entry`, and an `ObjRow` is recorded. Commit entries update `commit_lo/commit_hi`. Every 10,000 rows are posted to `/_do/push/index`; the `packs` row is inserted with state `ingesting` on the first post. After `PackWriter::finish` returns, the pack is durable in R2 and fully indexed, and only then does the edge call `/_do/push/commit`.
+
+Memory budget for pass B (must fit with the 128 MB isolate): window 8 MiB, resolved LRU 16 MiB, external base map 32 MiB, one base 32 MiB max, one delta result 32 MiB max, multipart part buffer 8 MiB, entry vector 48 MiB worst case. The single-object cap is therefore **32 MiB inflated**; a larger object is `unpack error object too large (32 MiB max)`. This is a foundation limit; LFS is out of scope (section 12). Delta-only packs from git normally place bases before deltas, so the LRU hits in the common case and pass B costs one range read per 8 MiB of pack.
+
+Delete-only pushes carry no PACK; a push of new refs at existing commits carries a 0-object pack (12-byte header + trailer). Both produce no `packs` row and skip both passes.
+
+### 2.5 Connectivity rule
+
+Invariant: every object in a live pack references only objects that are in a live pack (or in the same pack). Ingest enforces it by induction: the set `extract_links(all entries) - {entries of this pack}` is looked up in batches of 1,000; any miss is `unpack error missing object <oid>`. New tips are checked to be in this pack or live. No deep walk is needed, because live objects are closed by the invariant. Pack objects that are unreachable from any command (junk in the pack) are accepted, as git does.
+
+---
+
+## 3. Ref transaction contract (defect 5)
+
+```sql
+CREATE TABLE refs (
+  name       TEXT PRIMARY KEY,   -- full name, validated by gix_validate::reference::name_partial
+  target     TEXT NOT NULL,      -- 40 hex; symbolic refs are not stored here
+  updated_at INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE reflog (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, old TEXT NOT NULL, new TEXT NOT NULL,
+  push_id TEXT NOT NULL, principal TEXT NOT NULL, at INTEGER NOT NULL
+);
+CREATE TABLE pushes (
+  id TEXT PRIMARY KEY, state TEXT NOT NULL,        -- 'open' | 'committed' | 'rejected' | 'expired'
+  pack_id TEXT, principal TEXT NOT NULL, began_at INTEGER NOT NULL, ended_at INTEGER,
+  gc_epoch INTEGER NOT NULL, result TEXT           -- JSON of per-ref results
+) WITHOUT ROWID;
+```
+
+`HEAD` is the row `('head', 'refs/heads/main')` in `meta`; it is a symbolic name only and never stores an oid.
+
+Ordering, strictly: (1) pack durable in R2 (`finish` returned); (2) all `objects` rows and the `packs` row inserted; (3) `/_do/push/commit`. The commit handler is **one sync span**: parse the JSON body fully before touching storage, then:
+
+```
+1. SELECT state, gc_epoch FROM pushes WHERE id=?           -> must be 'open'; else Error::Conflict
+2. SELECT value FROM meta WHERE key='gc_epoch'             -> must equal pushes.gc_epoch; else reject all refs with
+                                                              "ng <ref> gc ran during push, retry" and state='rejected'
+3. UPDATE packs SET state='live' WHERE id=? AND state='ingesting'    (skipped when the push had no pack)
+4. for each RefCommand, in client order, each independent:
+     create:  INSERT INTO refs(name,target,updated_at) VALUES(?,?,?) ON CONFLICT DO NOTHING;  SELECT changes()
+     update:  UPDATE refs SET target=?, updated_at=? WHERE name=? AND target=?;               SELECT changes()
+     delete:  DELETE FROM refs WHERE name=? AND target=?;                                     SELECT changes()
+   ok  <=> changes() == 1, read by the statement issued immediately after, in the same span.
+   ng reason: "failed to update ref" (git's own string).
+   on ok: INSERT INTO reflog(...)
+5. if any ok: UPDATE meta SET value=value+1 WHERE key='refs_version'
+6. UPDATE pushes SET state='committed', ended_at=?, result=? WHERE id=?
+7. if any ok: jobs::enqueue(GcMark, now + 10 min)   (dedups: at most one pending GcMark)
+```
+
+`SqlCursor::rows_written` is never read, by anyone, for any decision. Measured (`research/platform-facts.md` #1): `INSERT` into a `PRIMARY KEY` table reports `rowsWritten = 2` because the autoindex row is counted; on a `WITHOUT ROWID` table it reports 1; `SELECT changes()` reports 1 / 0 / 1 correctly in every case, including inside `transactionSync`. `changes()` is the CAS outcome. `RETURNING` is not used, so the contract does not depend on the SQLite version workerd ships. CI greps the crate for `rows_written` and fails on a hit outside tests.
+
+Atomicity of the span: all statements above execute with no await between them. Measured (#4): eight concurrent DO calls that read, awaited R2, then wrote lost seven updates; the same eight with a synchronous SQL CAS after the await had exactly one winner. The platform commits the writes of one sync span atomically and rolls them back if the handler throws before its next await (memo, section 1; gc review "per-invocation write rollback on throw"). Whether `worker` 0.8.5 binds `transactionSync` is **unverified**; if it does, the span is additionally wrapped in it. If it does not, the span still holds because no other DO event can run inside it.
+
+Multi-ref semantics: **per-ref, independent, in client order**, which is git's default. `atomic` is not advertised (section 1.1 rule 5), so a client never expects all-or-nothing. A ref name that fails `gix_validate` or targets a non-live object gets `ng` for that ref only. Ref deletion of `HEAD`'s target is refused with `ng refs/heads/main deletion of the current branch prohibited`.
+
+The connectivity result and the `objects` presence check are decided before the span (section 2.5) and re-guarded by `gc_epoch` in step 2. That is what makes a sweep between lookup and commit harmless: the push is rejected, not accepted with a hole.
+
+---
+
+## 4. Job dispatcher contract (defect 6)
+
+```sql
+CREATE TABLE jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, run_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0, cursor TEXT, payload TEXT NOT NULL DEFAULT '{}',
+  state TEXT NOT NULL DEFAULT 'queued',        -- 'queued' | 'running' | 'dead'
+  last_error TEXT
+);
+```
+
+Rules:
+
+1. **Only `jobs::rearm` calls `set_alarm`.** Measured (`research/platform-facts.md` #5): a second `setAlarm` cancels the first; only the later one fires. `enqueue` inserts the row and then calls `rearm(sql, storage)` which sets the alarm to `MIN(run_at) WHERE state='queued'`, or deletes the alarm when no row qualifies. Any module that wants background work calls `enqueue`. No other `set_alarm` call exists in the crate (enforced by a grep in CI).
+2. `alarm()` -> `dispatch`: `SELECT ... WHERE state='queued' AND run_at <= now ORDER BY run_at, id LIMIT 1`. Mark it `running`. Run **one slice** with a fresh `SliceBudget`. Apply the outcome in a sync span: `Done` -> delete row (Janitor re-enqueues itself with `run_at = now + 15 min`); `Continue{cursor}` -> `run_at = now, cursor = ?`, state `queued`; `Reschedule{run_at}` -> as given. Then `rearm`. One slice per alarm firing; a `Continue` gets the very next firing.
+3. Slice budget: 20,000 ms wall clock measured with `js_sys::Date::now()` (a conservative stand-in for CPU time, which Wasm cannot read), and 400 subrequests. A slice checks the budget between units of work and returns `Continue` when either is 80% spent.
+4. Retry: on `Err`, `attempts += 1`, `last_error` set, `run_at = now + min(30 s * 2^attempts, 1 h)`, state `queued`, cursor kept. After 8 attempts the row becomes `dead` and stays for inspection; a dead job never blocks the queue because the selection filters on `queued`. `dispatch` never lets an error escape to the platform; the platform's own alarm retry is therefore never exercised.
+5. Job kinds are `Janitor` (recurring, self-enqueued at boot if absent), `GcMark`, `GcConsolidate`, `GcSweep` (chained, section 5). `enqueue` dedups by kind: at most one `queued` or `running` row per kind. Every future background feature registers a new `JobKind` variant and a `run_slice` arm; none may set the alarm.
+
+---
+
+## 5. Janitor and GC contract (defect 2)
+
+Constants: `GRACE = 1 h`, `PUSH_TIMEOUT = 1 h`, `GC_QUIET = 10 min`.
+
+**Janitor** (every 15 min, one slice each):
+1. `UPDATE pushes SET state='expired', ended_at=now WHERE state='open' AND began_at < now - PUSH_TIMEOUT` (sync).
+2. For each pack with `state='ingesting'` whose push is `expired` or `rejected`: in one sync span set `state='dead', dead_at=now` and delete its `objects` rows.
+3. Delete R2 keys: `pending/<push>.pack` for every push not `open` and older than GRACE; `packs/<id>.pack` for every pack `dead` with `dead_at < now - GRACE`, then delete the `packs` row. At most 400 keys per slice, 1,000 per `Bucket::delete` call.
+The list of keys in step 3 is built from SQLite rows in the same slice, but each deleted key has been `dead`/not-`open` for at least GRACE, which is longer than any request can live. "Never delete in the same slice that listed" therefore means: **R2 deletion only ever targets rows that a previous slice, at least GRACE earlier, marked dead.** Marking and deleting never happen in one slice.
+
+**GC** (`GcMark` -> `GcConsolidate` -> `GcSweep`), enqueued 10 min after a ref change:
+1. `GcMark`: records `gc.refs_version` and `gc.started_at` in `meta` on its first slice. Walks from all `refs` targets using the round loop of section 9, but marks whole entries: a bitmap per live pack (`marked` table: `pack_id, bitmap BLOB`), one bit per `idx`. Cursor = frontier of unvisited ids, stored in the job row (capped at 50,000 ids; larger frontiers are spilled to a `gc_frontier` table). Only packs with `created_at < gc.started_at - GRACE` are candidates; younger packs are exempt from this GC entirely.
+2. `GcConsolidate`: if candidate packs number >= 2 or any candidate has unmarked entries: write one new pack `packs/<new>.pack` containing exactly the marked entries of all candidate packs, copied verbatim via `read_entries` (section 7.2), `PackWriter` with `resume_multipart_upload` between slices (cursor = upload id, parts so far, position). The new pack is inserted `live` with its `objects` rows in the slice that completes it; from that moment every marked object has two live rows.
+3. `GcSweep`, **one sync span**: `SELECT value FROM meta WHERE key='refs_version'`; if it differs from `gc.refs_version`, abort the GC (drop `marked`, delete the new pack's rows and mark that pack `dead`, enqueue a fresh `GcMark`) and return. Otherwise: `UPDATE packs SET state='dead', dead_at=now WHERE id IN (candidates)`; `DELETE FROM objects WHERE pack_id IN (candidates)`; `UPDATE meta SET value=value+1 WHERE key='gc_epoch'`; drop `marked`. The R2 keys are removed by the Janitor after GRACE.
+
+Why the two review races are now impossible:
+- *Sweep deletes an object a concurrent push is about to reference* (two-phase-push, gc reviews): a push looks objects up (`/_do/push/lookup`, sync) and later commits (sync). Both are sync spans in the same DO as `GcSweep`; they cannot interleave with it. If the sweep span runs between them, `gc_epoch` has changed and the commit is rejected in step 2 of section 3. If it runs after the commit, `refs_version` has changed and the sweep aborts. If before the lookup, the lookup misses and the push fails with `missing object`. No ordering yields a live ref pointing at a dead pack.
+- *Janitor deletes bytes of a pack whose ref is live* (repo-do-ref-authority review): R2 deletion needs a `dead` row older than GRACE. A pack becomes `dead` only in `GcSweep` (guarded above) or for a push that is `expired`/`rejected` (never committed, so no ref points into it; `pending/` keys are never referenced by any ref).
+- *A refs_version check that is not atomic with the delete* (gc review): the check and the SQLite deletes are the same sync span; the R2 delete is not load-bearing, because readers resolve through SQLite only.
+
+---
+
+## 6. Request body contract (defect 7)
+
+`BodyReader` is built by `edge` for every POST:
+
+```rust
+pub struct BodyReader { stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, Error>>>>, buf: Vec<u8>, eof: bool, total: u64 }
+impl BodyReader {
+    pub fn new(req: &Request) -> Result<Self, Error>;          // sync; wraps the stream, applies gzip
+    pub async fn fill(&mut self, min: usize) -> Result<bool, Error>;   // read until buf.len() >= min or EOF; false on EOF
+    pub fn buffered(&self) -> &[u8]; pub fn consume(&mut self, n: usize);
+}
+```
+
+1. If `Content-Encoding: gzip`, `new` pipes `req.inner().body()` through `web_sys::DecompressionStream::new("gzip")` (`ReadableStream::pipe_through`) and reads the result. Converting the resulting `web_sys::ReadableStream` into a Rust `Stream` uses the `wasm-streams` crate (`ReadableStream::from_raw(..).into_stream()`); whether `worker` re-exports it is **unverified**, so it is listed as a direct dependency. No other encoding is accepted (415).
+2. `Content-Length` is never trusted or required; git sends chunked bodies above `http.postBuffer` (1 MiB). The zone body cap (100 MB Free/Pro) applies before our code and is documented, not handled.
+3. Command section split: `edge` fills the reader in 64 KiB steps and calls `wire::parse_receive_header` (or `parse_v2_command` on the whole body for upload-pack, whose bodies are small) until it returns `Some`. `PktReader::remainder()` plus the rest of the stream is the PACK. The command section is capped at 1 MiB (`Error::Protocol` beyond).
+4. The pack is written to R2 with `create_multipart_upload`, parts of exactly 8 MiB except the last, at most 10,000 parts (80 GB, never reached). Measured only on the local simulator (`research/platform-facts.md` #6): 5 MiB + 1 MiB parts completed and a range read returned the right bytes; the simulator does not enforce the 5 MiB minimum or the equal-size rule, so the first deploy re-runs that spike against real R2 before any push test. The same 8 MiB buffer is the `BufRead` window for `BytesToEntriesIter`; an entry longer than the window is handled by the iterator's own incremental read because `EntryDataMode::Ignore` skips bodies without buffering them.
+5. Memory per receive-pack request: body window 8 MiB + multipart part 8 MiB + entry vector <= 48 MiB in pass A; pass B as in section 2.4. Upload-pack: request body <= 1 MiB; response is streamed through `Response::from_stream` with at most one 8 MiB read window plus one 64 KiB sideband frame in flight.
+
+---
+
+## 7. Subrequest and CPU budgeting (defect 8)
+
+| Limit | Free | Paid | Source |
+|---|---|---|---|
+| Subrequests per invocation (R2 calls count) | 50 | 10,000 | Workers limits page (memo) |
+| CPU per invocation | 10 ms | 30 s default, 300 s with `limits.cpu_ms = 300000` | same |
+| Memory per isolate | 128 MB | 128 MB | same |
+| Request body | 100 MB | 100/200/500 MB by zone plan | reviews |
+| R2 multipart | parts >= 5 MiB, equal size, <= 10,000 | same | R2 docs |
+
+The foundation targets the Paid plan; `wrangler.jsonc` sets `limits.cpu_ms = 300000`. On Free the edge refuses pushes with more than 20 range reads projected (`503 plan limit`). The subrequest limit is **not enforced by local workerd** (`research/platform-facts.md` #7: 1,200 R2 heads succeeded locally), so the conformance harness cannot catch a budget bug; `ReqBudget` is the only guard until the deployed-Worker measurement is done, and the harness asserts on the `ReqBudget` counters reported in a `x-ge-subrequests` response header instead.
+
+```rust
+pub struct ReqBudget { pub max_subrequests: u32, pub used: u32, pub started_ms: f64, pub max_ms: f64 }
+impl ReqBudget { pub fn charge(&mut self, n: u32) -> Result<(), Error>; }   // Error::Budget when exceeded
+```
+
+Rules:
+1. Every `Bucket` and stub call goes through `budget.charge(1)` first. A request starts with `max_subrequests = 9,000` (headroom for the shim), `max_ms = 240,000`.
+2. **Coalesced range reads.** `Bucket::read_entries` sorts locations by `(pack, offset)`, merges neighbours whose gap is < 256 KiB, splits merged spans at 8 MiB, and issues one range read per span. Callers never issue per-object reads.
+3. **Batched lookups.** `/_do/push/lookup` takes up to 1,000 ids; `/_do/push/index` takes up to 10,000 rows. A push of N objects costs about `N/10,000 + N/1,000 + pack_bytes/8 MiB + 2` subrequests, so 1,000,000 objects fit in the paid budget.
+4. **Commit region reads.** For negotiation, commits of a pack are loaded with one range read of `[commit_lo, commit_hi)` per pack, cached per request.
+5. Anything that cannot finish inside one request's budget is not done in a request: it becomes a job slice (section 4), which saves its cursor and continues on the next alarm.
+
+---
+
+## 8. Repo identity (defect 9)
+
+```sql
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+-- rows: repo_id, owner, repo, head, refs_version, gc_epoch, created_at, schema_version
+```
+
+1. The edge derives the DO stub with `env.durable_object("REPO").id_from_name(&format!("{owner}/{repo}"))` and sets headers `x-ge-owner: <owner>` and `x-ge-repo: <repo>` on every stub request. Owner and repo are validated at the edge: `[A-Za-z0-9._-]{1,64}` each, a trailing `.git` stripped from the repo.
+2. `RepoDo::boot` runs at the start of every `fetch` and `alarm` (it is cheap after the first time): if `meta.repo_id` is absent, it inserts `repo_id` = 32 lowercase hex chars from 16 random bytes (`web_sys::Crypto::get_random_values_with_u8_array` on the global `crypto`; exact binding path unverified), `owner`, `repo`, `head = refs/heads/main`, `refs_version = 0`, `gc_epoch = 0`, and enqueues the Janitor. If present, the headers must equal the stored owner/repo, else `Error::Internal("identity mismatch")` (500). `alarm` has no headers and skips the comparison.
+3. Measured (`research/platform-facts.md` #2): on workerd 4.129 `ctx.id.name` **is** populated inside a DO created with `idFromName`, contrary to the five reviews that assumed it is undefined. Production has not been checked. The contract therefore: the stored `meta` rows are the source of truth for owner/repo and repo_id; `ctx.id.name` (reached through `js_sys::Reflect::get` on the inner id, workers-rs issue #760) may be read in exactly one place, `RepoDo::boot`, and only to cross-check the headers, logging a warning on mismatch or absence. No R2 key, SQL row, or response is ever derived from `ctx.id.name`. CI greps `repo_do` for `Reflect::get` and allows the single occurrence in `boot`.
+4. R2 keys use `repo_id`, so a future rename changes two `meta` rows and nothing in R2.
+
+---
+
+## 9. Async-then-sync rule
+
+Rule: **an `async fn` loads bytes into `MemFind`; a `fn` computes over `MemFind`; the loop between them is bounded and explicit.** gitoxide code (`gix_traverse`, `gix_pack::data::output`, `gix_object` parsing) is only ever called from a `fn` that receives `&MemFind` (or a `&[u8]` window). A traversal that discovers what to load next is written as rounds:
+
+```rust
+loop {
+    let missing: Vec<ObjectId> = plan_next(&mem, &state);   // sync: parse loaded objects, list unloaded ids
+    if missing.is_empty() { break; }
+    let locs = index_lookup(&missing)?;                      // sync (in DO) or one stub call (in edge)
+    let bytes = bucket.read_entries(&locs, budget).await?;   // async, coalesced
+    for (id, entry) in bytes { let (k, d) = codec::decode_entry(&entry)?; mem.insert(id, k, d); }
+}
+let answer = compute(&mem);                                  // sync gitoxide
+```
+
+Worked example, v2 `fetch` negotiation in `RepoDo::fetch_v2`:
+
+1. Parse `FetchArgs` (sync). Look up every want and have with `Index::lookup` (sync). Unknown want -> ERR `upload-pack: not our ref <oid>`. Unknown haves are dropped. `acks` = known haves.
+2. Decide readiness (sync): `ready = args.done || args.haves.is_empty() || !acks.is_empty()`. If not ready, write the acknowledgments section with `NAK`, flush, return. This is git's stateless-RPC behaviour: the client sends more haves or `done`.
+3. Prefetch commits by rounds. `frontier` = wants that are commits (annotated tags are peeled by loading the tag object first, one round). Each round: `missing` = frontier ids not in `mem`; group their locations by pack; for each pack read `[commit_lo, commit_hi)` once per request (cached) and insert every commit found; ids still missing after that are read with `read_entries`. Then, sync, for each newly loaded commit `gix_object::CommitRefIter::from_bytes(data).parent_ids()`: a parent that is in `acks` or already loaded is not added; every other parent joins the next frontier. Rounds end when the frontier is empty. Bound: after 200,000 loaded commits or 64 MiB in `mem`, ERR `fetch too large for this server; clone instead` (section 12 names the wave-1 fix).
+4. Sync walk: `gix_traverse::commit::topo::Builder::from_iters(&mem, wants, Some(acks))` (exact constructor name to be verified against 0.61.0; the Topo walk with hidden ends is what is required), collecting interesting commit ids. Commits reachable only through non-ack ancestors of an ack are sent as a superset; the protocol permits supersets.
+5. Trees and blobs by rounds: frontier = root trees of interesting commits; each round loads missing trees with `read_entries` (blobs are never loaded; their `ObjLoc` is enough), and, sync, `gix_object::TreeRefIter` lists entries; a tree entry id already in `seen` is skipped. `Filter::BlobNone` skips blob entries; `BlobLimit(n)` skips blobs with `size > n` (size comes from the lookup, no read). `deepen n` cuts the commit frontier at depth n and records `shallow` lines. Result `SendSet` = one bitmap per pack.
+6. Write: acknowledgments (if not `done`) with ACKs and `ready`, delim, `shallow-info` if any, delim, `packfile`. `write_pack` streams each pack's marked entries in offset order with 8 MiB windows, copying entries verbatim through `Sideband::data`, header count patched up front from the bitmap popcount, trailer from `gix_hash::Hasher`. The whole response is `Response::from_stream`; an error mid-stream writes one band-3 frame and ends the stream.
+
+The same loop shape, with "commit region" replaced by "all live packs in offset order", is `GcMark`; its cursor is the frontier.
+
+---
+
+## 10. Error and panic policy
+
+```rust
+pub enum Error {
+    Protocol(String),   // malformed client bytes: bad pkt-line, unknown command, bad oid, bad ref name
+    Auth,               // 401 with WWW-Authenticate: Basic realm="git-edge"
+    Forbidden,          // 403 principal cannot write
+    NotFound,           // 404 unknown repo route
+    Conflict(String),   // push state wrong (not open, expired)
+    Unpack(String),     // ingest failure reported as `unpack <msg>` in report-status
+    Budget,             // subrequest or time budget exhausted
+    Limit(String),      // foundation limit hit (object > 32 MiB, fetch too large)
+    Storage(String),    // R2 or SQLite failure
+    Internal(String),   // invariant broken (identity mismatch, encode overflow)
+}
+```
+
+Mapping. Before any response byte is written: `Protocol` -> 400, `Auth` -> 401, `Forbidden` -> 403, `NotFound` -> 404, `Budget`/`Limit` -> 413, `Storage`/`Internal` -> 500; the body is one pkt-line `ERR <message>\n` for git-protocol POSTs and plain text for `info/refs`. After response bytes have started (fetch stream): one band-3 `ERR` frame, then end the stream. For receive-pack after the header was parsed: HTTP 200 with `unpack <message>` and `ng <ref> unpack failed` for every command, so the client prints a reason rather than "hung up unexpectedly".
+
+Client bytes: no `unwrap`, `expect`, `[]` indexing, `as` narrowing casts, or arithmetic that can overflow on values derived from the request or from R2/SQLite content. Enforced by `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::arithmetic_side_effects)]` in `wire`, `store::codec`, `pack`, and `edge`. Every gitoxide `Result` is propagated with `?` into `Error::Protocol` or `Error::Unpack`.
+
+Panic decision: build with `worker-build --release -- --panic-unwind` and `panic = "unwind"` in `[profile.release]`. A panic then becomes a JS `PanicError` that the shim turns into a 500 and that leaves the DO's uncommitted sync-span writes rolled back; with `abort` the isolate dies mid-span and the platform behaviour is less well documented. Whether the rollback holds for a `PanicError` raised inside `fetch` is **unverified**; a day-1 test panics inside `commit_push` after step 4 and checks that no ref moved.
+
+---
+
+## 11. Conformance test plan
+
+Harness: `tests/conformance/run.sh` starts `wrangler dev` (workerd with local R2 and DO emulation) on port 8787, creates a temporary `GIT_DIR`, and runs the scenarios with the system `git`, asserting on exit codes, `git rev-parse`, `git fsck --strict`, and `git ls-remote`. `GIT_TRACE_PACKET=1 GIT_TRACE_CURL=1` output is captured on failure. CI matrix: git 2.43, 2.45, 2.47 (built from tags into the runner image), Paid-plan limits in `wrangler.jsonc`. A `git2`-based second harness (memo, section 2) is added later and is not a gate.
+
+| # | Scenario | Commands | Assertion |
+|---|---|---|---|
+| 1 | Clone empty repo | `git clone $U/o/r` | exit 0, "warning: You appear to have cloned an empty repository", no refs |
+| 2 | Push new branch | `git push origin main` (3 commits) | `ok refs/heads/main`; `ls-remote` shows the sha |
+| 3 | Clone with tags | annotated + lightweight tag pushed, `git clone`, `git tag -l`, `fsck` | both tags present, `fsck` clean, peeled line in `ls-refs` |
+| 4 | Push delete | `git push origin :topic` | no PACK sent, `ok`, `ls-remote` lacks the ref; delete of `main` gives `ng` |
+| 5 | Non-fast-forward rejected | second clone amends and pushes | client prints `! [rejected]`; with `--force` the CAS still fails if the advertised old oid is stale, matching git |
+| 6 | Concurrent pushes to same branch | two clones push different commits at once (`&`, `wait`) | exactly one `ok`, the other `ng ... failed to update ref`; `fsck` on a fresh clone clean |
+| 7 | Push > 1 MiB, chunked | commit a 3 MiB random blob, `push` | request had no Content-Length, `pending/` multipart used, clone reproduces the blob byte-exact |
+| 8 | Small gzip push | `-c http.postBuffer=1` is not enough; use `GIT_CURL_VERBOSE` to confirm `Content-Encoding: gzip` on a small push | push ok |
+| 9 | Thin pack | modify one line of a 100 KiB file, push | client log shows `ref-delta` in `GIT_TRACE_PACKET`; ingest resolved it (server log), clone reproduces both versions |
+| 10 | Blobless clone + checkout | `git clone --filter=blob:none`, `git checkout HEAD~1`, `git fsck` | lazy fetch of blobs by oid succeeds (`want <blob>` accepted) |
+| 11 | Shallow clone + push | `git clone --depth 1`, commit, `push` | fetch sent `deepen 1`, `shallow-info` returned, push with `shallow` lines accepted |
+| 12 | Fetch after push (incremental) | clone A pushes 50 commits, clone B `git fetch` | acknowledgments section shows `ACK`, pack contains only new objects (count check), `fsck` clean |
+| 13 | v0 upload-pack client | `git -c protocol.version=0 clone` | fails with the `ERR protocol v2 required` line, not a hang |
+| 14 | Janitor and GC | force-push away 100 commits, advance the fake clock past 10 min + GRACE, fire the alarm via the local scheduler | dead pack row appears, R2 key removed after GRACE, clone `fsck` clean, `gc_epoch` bumped |
+| 15 | Panic rollback (day 1) | test hook panics after CAS step 4 | no ref moved, 500 returned |
+
+Each revised proof names the scenarios it must pass, and adds at most two scenarios of its own to this table. A proof whose feature cannot be exercised by a stock `git` binary states what harness step replaces it.
+
+---
+
+## 12. Out of scope for the foundation
+
+The following are not built, not advertised, and must not be assumed by a revised proof of the 33 non-foundation ideas:
+
+- Delta compression at rest or on the wire (all packs are full-object; `thin-pack` is accepted from clients, never sent).
+- `atomic` push, `push-options`, `report-status-v2` option lines, `wait-for-done`, `ref-in-want`, `sideband-all`, `packfile-uris`, `bundle-uri`, `object-info`, `server-option`.
+- Protocol v0/v1 upload-pack negotiation (`multi_ack_detailed`, `no-done`).
+- `deepen-since`, `deepen-not`, `deepen-relative`, `tree:<n>` and `sparse:` filters, `include-tag` beyond peeled tags of wanted commits.
+- Objects larger than 32 MiB inflated, LFS, presigned uploads, repository imports.
+- Commit-graph tables in SQLite (`commits`, `introduced`), precomputed clone packs, pinned bases, in-DO object cache, replicated refs, cross-repo dedup, forks.
+- Repo rename, deletion, quotas, per-branch DOs, WebSockets, queues, hooks, CI chains, webhooks.
+- Multi-tenancy and per-user permissions. `auth` in the foundation compares HTTP Basic credentials against two secrets, `GE_READ_TOKEN` and `GE_WRITE_TOKEN`; `can_write` is true only for the write token. Anonymous access is refused.
+- SHA-256 repositories.
+- Free-plan operation beyond the 20-range-read refusal in section 7.
+- Metrics, tracing beyond `console_log!`, admin API.
+
+A revised proof that needs one of these items writes it as a dependency on a named later idea, and its proof code compiles against the signatures in section 1 exactly as written here.

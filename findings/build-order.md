@@ -142,7 +142,7 @@ The fifteen ideas:
 
 **What works instead.** Keep the live shared document in the Durable Object, and have the Durable Object write a normal commit to a normal branch when asked. git programs then see an ordinary branch.
 
-## Two checks to do before any code
+## Two checks that were open, now answered
 
-1. Check whether the database's count of changed rows counts index rows too. Several ideas use that count to decide whether a branch moved.
-2. Check whether the Worker runtime can unsqueeze one object at a time from a packfile and report how many bytes it used. The standard browser tool cannot stop at object boundaries.
+1. Does the database's count of changed rows count index rows too? Yes. An insert into a table with a primary key reports two rows written. Every idea must use the `changes()` function instead. Measured on the real runtime.
+2. Can the Worker runtime unsqueeze one object at a time from a packfile and report how many bytes it used? Yes, with the built-in zlib module. Measured on the real runtime. Details in [research/platform-facts.md](../research/platform-facts.md).

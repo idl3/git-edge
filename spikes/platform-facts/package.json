@@ -1,0 +1,7 @@
+{
+  "name": "git-edge-platform-facts",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "wrangler dev --port 8799", "deploy": "wrangler deploy" },
+  "devDependencies": { "@cloudflare/workers-types": "^4.20250901.0", "wrangler": "^4.0.0" }
+}

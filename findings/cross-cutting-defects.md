@@ -78,7 +78,7 @@ Think of it like this. A band where the guitarist tunes to one pitch and the sin
 
 ## 5. The Durable Object lets requests collide while it waits on the network
 
-**Hit 15 of 56 ideas.**
+**Hit 15 of 56 ideas. Measured on the real runtime: eight concurrent requests that awaited R2 between a read and a write lost seven of eight updates. The same requests awaiting DO storage lost none.**
 
 **What goes wrong.** A Durable Object, or DO, is a single small program with its own storage that handles one thing at a time. That is the promise. The promise has a condition. The DO handles one thing at a time only while it waits on its own storage. When the DO waits on the network instead, for example on R2, another request can run in the middle. Many proofs read a branch pointer, then waited on R2, then wrote the branch pointer. Two pushes could both read the old value and both write, and one push is lost.
 
@@ -102,7 +102,7 @@ sequenceDiagram
 
 ## 6. A Durable Object has only one alarm, and everyone used it
 
-**Hit 10 of 56 ideas.**
+**Hit 10 of 56 ideas. Measured on the real runtime: two alarms set in a row, only the second fired.**
 
 **What goes wrong.** An alarm is a timer inside a Durable Object. A DO has only one alarm at a time. The janitor set the alarm. The repack task set the alarm. The test runner set the alarm. The lease timer set the alarm. Each one silently cancelled the one before it.
 
@@ -140,7 +140,7 @@ Think of it like this. A library card that allows a fixed number of checkouts pe
 
 ## 9. The Durable Object does not know its own name
 
-**Hit 5 of 56 ideas.**
+**Hit 5 of 56 ideas. Correction after measurement: on the current runtime the name is populated. See below.**
 
 **What goes wrong.** The system creates one Durable Object for each repo by name, such as "owner/repo". Inside the DO, the code asked the DO for its own name and got nothing back. Cloudflare does not fill in that field for DOs created this way. Proofs that built their R2 folder path from the name wrote to a folder called "undefined".
 
@@ -148,7 +148,13 @@ Think of it like this. A library card that allows a fixed number of checkouts pe
 
 Think of it like this. A new employee who never asks what their own desk number is, and files everything under "desk unknown".
 
+**A correction.** We ran this on the real runtime. Inside a Durable Object created by name, the name was present. The five reviews that said it is missing were wrong for the current runtime. We keep the fix below anyway, because it costs one row and protects against a runtime change.
+
 **The one fix.** On the first request, write the owner and repo name into the DO's database. Read the name from there afterwards.
+
+## What we measured
+
+We ran a small test program on the real Cloudflare runtime, locally. The results are in [research/platform-facts.md](../research/platform-facts.md). In short: problems 5 and 6 are confirmed by measurement. Problem 9 is corrected. The database's count of changed rows does count index rows, so the fix in problem 5 must use the `changes()` function instead. And the runtime can unsqueeze one object at a time and report how many bytes it used, which problem 3 needs.
 
 ## What to do with this list
 
