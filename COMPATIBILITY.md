@@ -93,6 +93,10 @@ object-format=sha1`
 | SHA-256 repos | ❌ clean `object-format sha256 unsupported` error |
 | `git fsck --strict` on clones | ✅ clean across all tests |
 
+`HEAD` defaults to `refs/heads/main` at repo creation; on the first push that
+lands a branch while `HEAD` is dangling (e.g. a `master`-first repo), the
+server adopts an existing branch — clones check out like a GitHub import.
+
 ## Storage & maintenance model
 
 | Property | Upstream `git http-backend` | git-edge |
@@ -190,6 +194,8 @@ truncation, or corrupted ref state.
 | Push 20 MiB blob → GC consolidate → clone (local) | streamed verbatim copy, fsck clean |
 | Push ~95 MiB pack (prod) | 35 s — near the ~100 MB platform body cap |
 | Push ~130 MiB pack (prod) | HTTP 413 at the zone before app code — split the push |
+| Import atlas-core `master` (5,376 commits, ~150k objects, 153 MiB pack) | 4 staged pushes, ~63 s; clone 11.6 s, fsck clean |
+| Import grain-core `main` (6,570 commits, ~403k objects, 434 MiB pack) | 8 staged pushes, ~26 s; clone 20.3 s, fsck clean |
 
 ## Interoperability test matrix (git 2.54, live)
 

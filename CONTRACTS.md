@@ -752,3 +752,26 @@ produced these corrections, all verified against git 2.54:
   emits one Analytics Engine datapoint (index=repo, blob=op,
   doubles=status/ms/subrequests). For streamed responses the duration is
   time-to-first-byte.
+
+## Amendments from the audit-fix and real-repo benchmark passes (460f355, c8e6422)
+
+- **A14. GC durable-byte checkpoint (overrides A10).** `drain_parts` no
+  longer exists. `PackWriter::checkpoint` drains exactly `PART`-sized parts —
+  a variable-size non-final part can never `complete()` under R2's
+  equal-size rule (the audit-round-6 wedge). `PackWriter`'s hasher covers
+  uploaded bytes only, so `WriterCkpt.pos`/`sha` describe the durable
+  prefix exactly. The persisted `gc.pos` rewinds `(ci, idx, count)` to the
+  object containing the last durable byte and may point mid-entry via
+  `frag`; resume replays deterministically from that cursor, and a corrupt
+  `gc.pos` fails loudly rather than stranding state.
+- **A15. Chunked read batches (extends 7.2).** `read_entries` still refuses
+  a batch whose coalesced spans exceed 48 MiB. Fetch loaders (`load`,
+  `load_commits`) and both `gc.rs` call sites use
+  `Bucket::read_entries_chunked`, which splits the locs set on `Limit` and
+  reads the halves — a 10,000-tree expansion chunk or a multi-pack commit
+  prefetch can no longer fail a clone with HTTP 413.
+- **A16. HEAD adoption (extends section 3).** After a commit lands any
+  command, if `meta.head` does not resolve to a `refs` row, it adopts the
+  alphabetically-first existing `refs/heads/*`. `refs/heads/main` remains
+  only the boot-time default; a `master`-first repo now clones with a
+  working checkout.
