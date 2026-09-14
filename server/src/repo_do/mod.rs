@@ -85,6 +85,7 @@ impl DurableObject for RepoDo {
         let out: Result<Option<Response>, Error> = self.boot(&hdr).and_then(|meta| {
             match (&method, path.as_str()) {
                 (Method::Get, "/_do/refs") => self.list_refs().and_then(refs_json),
+                (Method::Get, "/_do/state") => self.debug_state(),
                 (Method::Post, "/_do/push/begin") => self.push_begin(&meta, &parse::<BeginDto>(&body)?),
                 (Method::Post, "/_do/push/lookup") => self.push_lookup(&parse(&body)?),
                 (Method::Post, "/_do/push/index") => self.push_index(&parse(&body)?),
@@ -177,6 +178,23 @@ impl RepoDo {
     pub fn repo_id(&self) -> Result<RepoId, Error> {
         Ok(RepoId(self.meta("repo_id")?))
     }
+    /// GC quiet period in ms — GE_GC_QUIET_MS overrides the 10-minute contract default so
+    /// the chain can be exercised in tests and dev without waiting.
+    pub fn gc_quiet_ms(&self) -> i64 {
+        self.env_ms("GE_GC_QUIET_MS", 600_000)
+    }
+    /// GC grace period in ms — GE_GC_GRACE_MS overrides the contract's 1-hour window.
+    /// Below it, packs stay out of `marked` entirely so a push can never lose bytes mid-flight.
+    pub fn gc_grace_ms(&self) -> i64 {
+        self.env_ms("GE_GC_GRACE_MS", 3_600_000)
+    }
+    fn env_ms(&self, name: &str, default: i64) -> i64 {
+        self.env
+            .var(name)
+            .ok()
+            .and_then(|v| v.to_string().parse::<i64>().ok())
+            .unwrap_or(default)
+    }
 
     /// Section 8.2. Sync span: migrate schema, write/verify meta, enqueue Janitor.
     pub fn boot(&self, hdr: &RepoHeaders) -> Result<Meta, Error> {
@@ -251,6 +269,30 @@ impl RepoDo {
             worker::console_log!("warn: ctx.id.name {seen:?} vs meta {}/{}", meta.owner, meta.repo);
         }
         Ok(meta)
+    }
+
+    /// GET /_do/state — internal observability: row counts per table and jobs by state.
+    /// Not part of the git protocol surface; used by tests and ops to watch the job chain.
+    fn debug_state(&self) -> Result<Response, Error> {
+        #[derive(serde::Deserialize)]
+        struct N {
+            n: i64,
+        }
+        let count = |q: &str| -> Result<i64, Error> {
+            Ok(self.q(q, vec![])?.one::<N>()?.n)
+        };
+        json(serde_json::json!({
+            "refs": count("SELECT COUNT(*) AS n FROM refs")?,
+            "objects": count("SELECT COUNT(*) AS n FROM objects")?,
+            "packs_live": count("SELECT COUNT(*) AS n FROM packs WHERE state='live'")?,
+            "packs_ingesting": count("SELECT COUNT(*) AS n FROM packs WHERE state='ingesting'")?,
+            "packs_dead": count("SELECT COUNT(*) AS n FROM packs WHERE state='dead'")?,
+            "jobs_queued": count("SELECT COUNT(*) AS n FROM jobs WHERE state='queued'")?,
+            "jobs_running": count("SELECT COUNT(*) AS n FROM jobs WHERE state='running'")?,
+            "jobs_dead": count("SELECT COUNT(*) AS n FROM jobs WHERE state='dead'")?,
+            "pushes": count("SELECT COUNT(*) AS n FROM pushes")?,
+            "marked": count("SELECT COUNT(*) AS n FROM marked")?,
+        }))
     }
 
     /// GET /_do/refs (1.3, awaits: none).
@@ -424,7 +466,7 @@ impl RepoDo {
         }
         if any_ok {
             self.q("UPDATE meta SET value=value+1 WHERE key='refs_version'", vec![])?; // step 5
-            jobs::enqueue(&sql, JobKind::GcMark, now + 10 * 60 * 1000, "{}")?; // step 7 (dedups)
+            jobs::enqueue(&sql, JobKind::GcMark, now + self.gc_quiet_ms(), "{}")?; // step 7 (dedups)
         }
         self.finish_push(req, "committed", now, results) // step 6
     }

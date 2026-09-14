@@ -17,8 +17,6 @@ use crate::store::{
     codec, keys, Bucket, Index, ObjLoc, ObjRow, PackId, PackMeta, PackWriter, WriterCkpt,
 };
 
-const GRACE_MS: i64 = 3_600_000;
-const GC_QUIET_MS: i64 = 600_000;
 const ROUND: i64 = 512; // frontier ids per round
 const ROWS: usize = 9_000; // insert_objects cap is 10_000 (1.2)
 const LOAD: u64 = 32 << 20; // A4 read cap per chunk
@@ -43,11 +41,13 @@ struct P {
 struct B {
     #[allow(dead_code)]
     pack_id: String,
+    #[serde(with = "serde_bytes")]
     bitmap: Vec<u8>,
     count: i64,
 }
 #[derive(serde::Deserialize)]
 struct BM {
+    #[serde(with = "serde_bytes")]
     bitmap: Vec<u8>,
 }
 #[derive(serde::Deserialize)]
@@ -166,7 +166,7 @@ pub async fn gc_mark(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Result
         )?
         .to_array::<N>()?;
         if !busy.is_empty() {
-            return Ok(SliceOutcome::Reschedule { run_at: now_ms() + GC_QUIET_MS });
+            return Ok(SliceOutcome::Reschedule { run_at: now_ms() + d.gc_quiet_ms() });
         }
         let now = now_ms();
         for t in ["marked", "gc_frontier", "gc_seen", "gc_parts"] {
@@ -179,7 +179,7 @@ pub async fn gc_mark(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Result
             &sql,
             "INSERT INTO marked(pack_id,bitmap) SELECT id, zeroblob((count+7)/8) FROM packs \
              WHERE state='live' AND created_at < ?",
-            vec![now.saturating_sub(GRACE_MS).into()],
+            vec![now.saturating_sub(d.gc_grace_ms()).into()],
         )?;
         exec(
             &sql,
@@ -306,7 +306,7 @@ fn abort(d: &RepoDo, sql: &SqlStorage) -> Result<SliceOutcome, Error> {
         exec(sql, &format!("DELETE FROM {t}"), vec![])?;
     }
     exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
-    enqueue(sql, JobKind::GcMark, now_ms() + GC_QUIET_MS, "{}")?;
+    enqueue(sql, JobKind::GcMark, now_ms() + d.gc_quiet_ms(), "{}")?;
     Ok(SliceOutcome::Done)
 }
 
@@ -552,6 +552,13 @@ fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
         let n = bm_popcount(&c.bitmap);
         total = total.saturating_add(n);
         unmarked |= i64::from(n) < c.count;
+    }
+    if total == 0 && !cands.is_empty() {
+        // nothing reachable in any candidate: no repack to write — sweep deletes them outright
+        exec(sql, "DELETE FROM gc_parts", vec![])?;
+        exec(sql, "DELETE FROM meta WHERE key IN ('gc.pos','gc.new_pack','gc.fails')", vec![])?;
+        enqueue(sql, JobKind::GcSweep, now_ms(), "{}")?;
+        return Ok(None);
     }
     if !(cands.len() >= 2 || unmarked) {
         if let Some(p) = d.meta_opt("gc.new_pack")? {
