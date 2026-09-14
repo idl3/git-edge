@@ -215,3 +215,77 @@ Findings fixed, verified, and merged as `788f192`:
 abandoned-MPU semantics and plan-limit enforcement require a real Cloudflare
 account; `packfile-uris`/`sideband-all`/`no-done`/sha256/non-blob filters/v0-v1
 negotiation remain deliberately unadvertised with clean protocol errors.
+
+## Round 6 — real Cloudflare deploy (git-edge.grain.workers.dev)
+
+Deployed 2026-09-15. Measured on the real platform:
+
+| Check | Result |
+|---|---|
+| Full conformance suite vs production | `== PASS` |
+| Push 12k commits / clone back | 11.3 s / 4.3 s, `fsck --strict` clean |
+| Push ~95 MiB pack (1 MiB objects) | 35.5 s, committed |
+| Push ~130 MiB pack | **HTTP 413 — the ~100 MB zone body cap is real** |
+| Push with one 120 MiB object | 413 — our `object too large` limit surfaces mid-upload as a client-side hangup (should return report-status `ng` instead) |
+| Subrequest model | Paid plan = 10,000/invocation; our 9,000 budget fits. Free = 1,000 internal-service calls + 10 ms CPU — Paid-only as designed |
+| R2 multipart on real R2 | works — pushes/clone verified |
+| DO alarms on real infra | jobs schedule correctly (janitor 15-min cadence); firing is platform-guaranteed |
+
+**New real-deploy findings:**
+- Push bodies are capped at ~100 MB by the zone before our code runs. Workaround:
+  push in stages (`git push <sha>:main` then `git push main` — incremental packs
+  only carry new objects) or use LFS (not yet implemented).
+- Mid-upload rejection (`object too large`) reports as "remote hung up" on the
+  client. A valid `ng` report-status response would surface the real reason.
+
+## Round 7 — pass-through ingest, per-repo tokens, metrics, error UX
+
+Follow-up feature round, verified on local workerd and re-verified on
+production (`git-edge.grain.workers.dev`):
+
+- **Pass-through ingest for large full objects**: blobs over 16 MiB no longer
+  inflate in isolate memory. Pass A relaxes the object cap for `Header::Blob`
+  entries only; pass B copies the entry's `varint header + zlib body` verbatim
+  from the pending pack to the normalized pack in ≤ 8 MiB `read_range`
+  fragments (`PackWriter::raw_extend`/`raw_entry_done`), while a resumable zlib
+  stream re-inflates purely to compute the object id. Full blobs are now
+  bounded by the 2 GiB pending-pack ceiling. Delta *results* and non-blob full
+  objects keep the 16 MiB cap — they still materialize for link extraction /
+  delta application. A delta naming a streamed blob as base fails cleanly at
+  `Window::entry`'s wire bound or `decode_mini`'s alloc cap.
+- **Fetch fragmentation**: `coalesce` could emit a `Read` larger than the
+  8 MiB window (one big entry, or a merge extending past it), and `pack_chunk`
+  materialized `r.len` in one `read_range`. Reads are now hard-capped at
+  WINDOW; oversized entries are emitted as fragment reads — `ents` carries
+  byte ranges, so output stays byte-identical and the trailer hash is correct.
+- **GC streamed copy**: `build` splits each chunk by wire length — entries
+  ≤ 8 MiB ride `read_entries` as before; larger ones stream fragment-by-fragment
+  into the writer via `raw_extend` + `drain_parts`. Drained parts are recorded
+  in `gc_parts` only inside `flush()`'s span, alongside the WriterCkpt that
+  accounts for their bytes — recording earlier would break resume numbering.
+  Mid-entry yield is safe: nothing commits until a checkpoint and replay is
+  deterministic.
+- **Mid-upload error UX**: post-header receive-pack failures now drain the
+  request body (bounded at 2 GiB) before answering — previously Cloudflare
+  reset the connection mid-upload and the client saw a transport error instead
+  of `unpack <reason>`/`ng`. Verified: a delta result over 16 MiB returns HTTP
+  200 + `unpack object too large` + `ng refs/heads/main unpack failed` on
+  production.
+- **Per-repo tokens**: `tokens(id, hash, level, name, created_at)` table in the
+  DO; edge `authenticate` tries global secrets first, then one `/_do/auth`
+  stub call keyed by `sha1(token)` — raw tokens never cross the stub boundary
+  and only hashes are stored. Admin surface: `POST /_admin/tokens {name,level}`
+  (mints `ge_<64 hex>`, shown once), `GET /_admin/tokens` (list), `DELETE
+  /_admin/tokens/<id>` (revoke) — all gated on the global write token only, so
+  repo credentials can't mint more credentials. A repo read token gets 403 on
+  push, 401 on other repos and after revoke. Principal in the reflog is the
+  token's `name`.
+- **Analytics Engine**: `GE_METRICS` binding (dataset `git_edge`) — one
+  datapoint per edge request: index = `owner/repo`, blob = op
+  (info-refs/fetch/push/state/admin/other), doubles = status, ms to response,
+  subrequests used. Absent binding (local dev) is a no-op.
+
+Verified: conformance `== PASS` locally and on prod; 30 MiB blob push (9 s) +
+clone fsck-clean byte-identical on prod; 20 MiB blob through GC consolidate
+locally (streamed copy, fsck clean); token create/use/403/401/revoke on prod;
+delta-over-cap `unpack`/`ng` report-status on prod.

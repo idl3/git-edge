@@ -573,19 +573,32 @@ fn coalesce(pack: usize, locs: &[ObjLoc], gap: u64) -> Vec<Read> {
     for l in locs {
         let end = l.offset.saturating_add(u64::from(l.len));
         match out.last_mut() {
+            // pack_chunk materializes a whole Read in one range read, so a merged
+            // span must never exceed WINDOW — check the new end, not the start
             Some(r)
                 if l.offset.saturating_sub(r.off.saturating_add(r.len)) < gap
-                    && l.offset.saturating_sub(r.off) < WINDOW =>
+                    && end.saturating_sub(r.off) <= WINDOW =>
             {
-                r.len = r.len.max(end.saturating_sub(r.off));
+                r.len = end.saturating_sub(r.off);
                 r.ents.push((l.offset, l.len));
             }
-            _ => out.push(Read {
-                pack,
-                off: l.offset,
-                len: end.saturating_sub(l.offset),
-                ents: vec![(l.offset, l.len)],
-            }),
+            _ => {
+                // an entry (or remainder) too big for one read is emitted as
+                // WINDOW-sized fragments; ents carry byte ranges, so a fragment
+                // of one entry is just a smaller copy span — output stays
+                // byte-identical and the trailer hash sees the same bytes in order
+                let mut pos = l.offset;
+                while pos < end {
+                    let n = end.saturating_sub(pos).min(WINDOW);
+                    out.push(Read {
+                        pack,
+                        off: pos,
+                        len: n,
+                        ents: vec![(pos, u32::try_from(n).unwrap_or(u32::MAX))],
+                    });
+                    pos = pos.saturating_add(n);
+                }
+            }
         }
     }
     out

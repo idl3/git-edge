@@ -11,6 +11,7 @@ use worker::{Env, Method, Request, Response};
 use crate::auth::{self, Level};
 use crate::error::{respond, Error};
 use crate::pack;
+use crate::platform;
 use crate::store::{Bucket, PushId, RepoId};
 use crate::wire::{
     self,
@@ -95,10 +96,26 @@ impl BodyReader {
             self.buf = b;
         }
     }
+    /// Consume the rest of the request body, bounded. On error paths the response
+    /// must not go out while the client is still uploading — Cloudflare resets the
+    /// connection and the client sees a transport failure instead of our report-status.
+    /// The cap keeps a never-ending upload from pinning the isolate; past it we answer
+    /// anyway (status quo, strictly better than not draining at all).
+    pub async fn drain(&mut self) {
+        const MAX_DRAIN: u64 = 2 << 30; // the same ceiling a pushed pack gets
+        self.buf.clear();
+        while self.total < MAX_DRAIN && !self.eof {
+            match self.stream.next().await {
+                Some(Ok(chunk)) => self.total = self.total.saturating_add(chunk.len() as u64),
+                Some(Err(_)) | None => break,
+            }
+        }
+    }
 }
 
 /// The one public entry point (lib.rs #[event(fetch)]).
 pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
+    let started = platform::now_ms();
     let path = req.path();
     if path == "/healthz" {
         return Response::ok("ok");
@@ -109,14 +126,60 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
     };
     // section 10: git-protocol POSTs get a pkt-line ERR; info/refs and _state get plain text
     let git_pkt = matches!((&req.method(), rest.as_str()), (Method::Post, "git-upload-pack" | "git-receive-pack"));
+    let (op, repo) = (op_name(&req.method(), &rest), route.name());
+    // resolved before the handlers move `env` — absent in local dev, never fatal
+    let ds = env.analytics_engine("GE_METRICS").ok();
     let r = match (req.method(), rest.as_str()) {
         (Method::Get, "info/refs") => info_refs(&req, &env, &route).await,
         (Method::Get, "_state") => state_probe(&req, &env, &route).await,
         (Method::Post, "git-upload-pack") => upload_pack(req, &env, &route).await,
         (Method::Post, "git-receive-pack") => receive_pack(req, env, route).await,
+        (Method::Post, "_admin/tokens") => token_create(req, &env, &route).await,
+        (Method::Get, "_admin/tokens") => token_list(&req, &env, &route).await,
+        (Method::Delete, p) if p.starts_with("_admin/tokens/") => {
+            token_revoke(&req, &env, &route, &p["_admin/tokens/".len()..]).await
+        }
         _ => Err(Error::NotFound),
     };
-    respond(r, git_pkt)
+    let resp = respond(r, git_pkt);
+    metric(ds.as_ref(), &repo, op, started, resp.as_ref().ok());
+    resp
+}
+
+fn op_name(method: &Method, rest: &str) -> &'static str {
+    match (method, rest) {
+        (Method::Get, "info/refs") => "info-refs",
+        (Method::Get, "_state") => "state",
+        (Method::Post, "git-upload-pack") => "fetch",
+        (Method::Post, "git-receive-pack") => "push",
+        (_, p) if p.starts_with("_admin/") => "admin",
+        _ => "other",
+    }
+}
+
+/// One Analytics Engine datapoint per request when GE_METRICS is bound; absent in
+/// local dev — never fatal. For streamed fetch responses the duration is
+/// time-to-first-byte: the stream outlives the handler.
+fn metric(
+    ds: Option<&worker::AnalyticsEngineDataset>,
+    repo: &str,
+    op: &'static str,
+    started: i64,
+    resp: Option<&Response>,
+) {
+    let Some(ds) = ds else {
+        return;
+    };
+    let status = resp.map(|r| f64::from(r.status_code())).unwrap_or(0.0);
+    let subreqs = resp
+        .and_then(|r| r.headers().get("x-ge-subrequests").ok().flatten())
+        .and_then(|v| v.split('/').next().and_then(|n| n.parse::<f64>().ok()))
+        .unwrap_or(0.0);
+    let _ = worker::AnalyticsEngineDataPointBuilder::new()
+        .indexes([repo])
+        .blobs([op])
+        .doubles([status, (platform::now_ms().saturating_sub(started)) as f64, subreqs])
+        .write_to(ds);
 }
 
 fn git_resp(body: Vec<u8>, content_type: &str) -> Result<Response, Error> {
@@ -161,7 +224,7 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
         Some("git-receive-pack") => (Service::ReceivePack, Level::Write, "application/x-git-receive-pack-advertisement"),
         _ => return Err(Error::Protocol("service must be git-upload-pack or git-receive-pack".into())),
     };
-    auth::authenticate(req, env, level)?; // before the DO wakes (8.1)
+    auth::authenticate(req, env, level, route).await?; // before the DO wakes (8.1)
     let mut w = PktWriter::default();
     if protocol_version(req)? == Some(2) && matches!(service, Service::UploadPack { .. }) {
         wire::write_capability_advertisement_v2(&mut w);
@@ -211,7 +274,7 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
 
 /// GET /:owner/:repo/_state — internal observability probe (write-token gated).
 async fn state_probe(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
-    auth::authenticate(req, env, Level::Write)?;
+    auth::authenticate(req, env, Level::Write, route).await?;
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
     let mut init = worker::RequestInit::new();
     init.with_method(Method::Get);
@@ -229,7 +292,7 @@ async fn state_probe(req: &Request, env: &Env, route: &RepoRoute) -> Result<Resp
 
 /// POST /:owner/:repo/git-upload-pack — v2 only; route on the command name, forward raw.
 async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
-    auth::authenticate(&req, env, Level::Read)?;
+    auth::authenticate(&req, env, Level::Read, route).await?;
     if protocol_version(&req)? != Some(2) {
         // contract 1.1 rule 7: v0 upload-pack POST -> HTTP 400 with the ERR pkt-line
         let mut w = PktWriter::default();
@@ -287,32 +350,68 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<R
     Ok(out)
 }
 
+/// POST /:owner/:repo/_admin/tokens {name, level} — mint a per-repo credential.
+/// Global-write-token only (authenticate_admin): a repo-level token must not mint
+/// more credentials. The token value is returned once and only its hash is stored.
+async fn token_create(mut req: Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+    auth::authenticate_admin(&req, env)?;
+    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("token create body: {e}")))?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let out: serde_json::Value = stub_json(&stub, route, "/_do/tokens", &v, &mut budget).await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
+/// GET /:owner/:repo/_admin/tokens — list per-repo credentials (never the secrets).
+async fn token_list(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+    auth::authenticate_admin(req, env)?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let mut init = worker::RequestInit::new();
+    init.with_method(Method::Get);
+    let mut r = worker::Request::new_with_init("https://do/_do/tokens", &init)
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    route.apply_headers(&mut r)?;
+    budget.charge(1)?;
+    let mut resp = stub.fetch_with_request(r).await?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp).await);
+    }
+    let bytes = resp.bytes().await.map_err(|e| Error::Internal(e.to_string()))?;
+    git_resp(bytes, "application/json")
+}
+
+/// DELETE /:owner/:repo/_admin/tokens/<id> — revoke a per-repo credential.
+async fn token_revoke(req: &Request, env: &Env, route: &RepoRoute, id: &str) -> Result<Response, Error> {
+    auth::authenticate_admin(req, env)?;
+    if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(Error::Protocol("bad token id".into()));
+    }
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let out: serde_json::Value = stub_json(
+        &stub,
+        route,
+        "/_do/tokens/revoke",
+        &serde_json::json!({ "id": id }),
+        &mut budget,
+    )
+    .await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
 /// POST /:owner/:repo/git-receive-pack — two-phase push (2.4, 3) with the A2 error arm.
 async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Response, Error> {
-    let principal = auth::authenticate(&req, &env, Level::Write)?;
+    let principal = auth::authenticate(&req, &env, Level::Write, &route).await?;
     let mut body = BodyReader::new(&mut req)?;
 
     // ---- pre-header: parse errors are still normal HTTP errors (A2 arm not yet active) ----
-    let mut pr = PktReader::default();
-    // parse_receive_header builds fresh accumulators per call, so an Incomplete
-    // result must not lose consumed lines — re-parse the whole accumulated buffer
-    // each round (bounded by CMD_CAP) instead of resuming mid-stream
-    let (hdr, leftover) = loop {
-        let mut fresh = PktReader::default();
-        fresh.push(&pr.buf);
-        match wire::parse_receive_header(&mut fresh)? {
-            Some(h) => break (h, fresh.remainder()),
-            None => {
-                body.fill(FILL_STEP).await?;
-                if body.buffered().is_empty() {
-                    return Err(Error::Protocol("truncated receive header".into()));
-                }
-                pr.push(&body.buffered().to_vec());
-                body.consume(usize::MAX);
-                if pr.buf.len() > CMD_CAP {
-                    return Err(Error::Protocol("receive header > 1 MiB".into()));
-                }
-            }
+    let (hdr, leftover) = match receive_header(&mut body).await {
+        Ok(x) => x,
+        Err(e) => {
+            // let the client finish uploading first — answering mid-upload gets the
+            // connection reset and the client sees a transport error, not our message
+            body.drain().await;
+            return Err(e);
         }
     };
     body.unread(leftover);
@@ -327,7 +426,35 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Re
     // ---- post-header (A2): everything from here reports HTTP 200 + report-status ----
     match receive_inner(&mut body, &env, &route, &hdr, &principal).await {
         Ok(resp) => Ok(resp),
-        Err(e) => report_status_200(&hdr, Err(e.client_message()), &[]),
+        Err(e) => {
+            body.drain().await; // finish the client's upload before answering (see drain)
+            report_status_200(&hdr, Err(e.client_message()), &[])
+        }
+    }
+}
+
+/// Parse the receive-pack command header: pkt-lines up to the first flush, then the
+/// pack follows. Re-parses the whole accumulated buffer each round (bounded by CMD_CAP)
+/// because parse_receive_header's accumulators don't survive an Incomplete result.
+async fn receive_header(body: &mut BodyReader) -> Result<(wire::ReceiveHeader, Vec<u8>), Error> {
+    let mut pr = PktReader::default();
+    loop {
+        let mut fresh = PktReader::default();
+        fresh.push(&pr.buf);
+        match wire::parse_receive_header(&mut fresh)? {
+            Some(h) => return Ok((h, fresh.remainder())),
+            None => {
+                body.fill(FILL_STEP).await?;
+                if body.buffered().is_empty() {
+                    return Err(Error::Protocol("truncated receive header".into()));
+                }
+                pr.push(&body.buffered().to_vec());
+                body.consume(usize::MAX);
+                if pr.buf.len() > CMD_CAP {
+                    return Err(Error::Protocol("receive header > 1 MiB".into()));
+                }
+            }
+        }
     }
 }
 

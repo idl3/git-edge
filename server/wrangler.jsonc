@@ -6,5 +6,6 @@
   "durable_objects": { "bindings": [{ "name": "REPO", "class_name": "RepoDo" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RepoDo"] }],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "git-edge" }],
+  "analytics_engine_datasets": [{ "binding": "GE_METRICS", "dataset": "git_edge" }],
   "limits": { "cpu_ms": 300000 }
 }

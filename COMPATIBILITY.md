@@ -4,7 +4,8 @@ What git-edge is: a Git smart-HTTP server compiled to WASM on a Cloudflare
 Worker. One SQLite Durable Object per repository holds refs, the object index,
 and job state; R2 holds normalized packfiles. There is no always-on machine and
 no upstream Git service in the request path. All claims below are verified
-against a real stock `git` client (2.54) on local workerd; see
+against a real stock `git` client on local workerd **and** against a live
+Cloudflare deployment (`git-edge.grain.workers.dev`, Paid plan); see
 `findings/implementation.md` for the test evidence.
 
 ## Transport & protocol versions
@@ -107,9 +108,12 @@ object-format=sha1`
 
 | Limit | git-edge | Upstream |
 |---|---|---|
-| Single object (inflated) | **16 MiB** | none in git (GitHub: 100 MiB) |
-| Pack entry wire size | 32 MiB | none |
+| Full object (blob/commit/tree/tag pushed whole) | **~2 GiB** (the pending-pack bound) — streamed verbatim, never materialized | none in git (GitHub: 100 MiB) |
+| Delta *result* object | **16 MiB** — delta resolution materializes in isolate memory | none |
+| Non-delta commit/tree/tag | 16 MiB (parsed for links; always tiny in practice) | none |
+| Pack entry wire size (non-blob) | 32 MiB | none |
 | Pending pack per push | 2 GiB | none (disk) |
+| HTTP request body per push (Cloudflare platform) | **~100 MB** — larger pushes must be split (`git push <mid>:main` then `git push main`) | none |
 | Objects per pack | 2,000,000 | none |
 | Delta chain depth | 64 (git default: 50) | unbounded-ish |
 | Aggregate delta-chain bytes | 64 MiB compressed / 128 MiB live | none |
@@ -145,16 +149,25 @@ truncation, or corrupted ref state.
 6. **v0/v1 fetch, `tree:`/`sparse:`/`combine:` filters, `packfile-uris`,
    `sideband-all`, `object-info`, `bundle-uri`, sha256** — deliberately
    unadvertised; clients get a protocol error, never silent misbehavior.
-7. **Auth is two static tokens** (`GE_READ_TOKEN`/`GE_WRITE_TOKEN`, HTTP Basic).
-   No anonymous access, no per-user ACLs, no per-branch permissions.
-8. **No LFS.** Objects > 16 MiB are rejected — LFS-class payloads are out of
-   scope by design.
-9. **No hooks, config surface, admin API, repo rename/delete, or web UI.** A
-   repo is created by pushing to it; `/_state` (write-auth) is the only
-   introspection endpoint.
-10. **Real-deploy items pending:** R2 abandoned-multipart semantics and
-    subrequest-limit enforcement are simulated by workerd; first real
-    `wrangler deploy` must re-verify both (documented in CONTRACTS.md §7).
+7. **Auth is static tokens, but now per-repo too.** `GE_READ_TOKEN`/
+   `GE_WRITE_TOKEN` remain the deployment-wide admin credentials (HTTP Basic or
+   Bearer). Per-repo tokens are minted via `POST /:owner/:repo/_admin/tokens`
+   `{name, level}` (global-write-token only — repo credentials cannot mint more),
+   listed via `GET`, revoked via `DELETE /_admin/tokens/<id>`. Only sha1 hashes
+   are stored; a token is shown once at creation. Read tokens get 403 on push.
+   Still no anonymous access, per-branch permissions, or user accounts.
+8. **No LFS.** Full objects now stream verbatim up to the 2 GiB pending-pack
+   bound, so ordinary large blobs are fine — but anything pushed *as a delta*
+   whose result exceeds 16 MiB is still rejected (`unpack object too large`),
+   and the ~100 MB platform body cap applies per request. Very large assets
+   should still live outside git.
+9. **No hooks, repo rename/delete, or web UI.** A repo is created by pushing to
+   it; `/_state` (write-auth) and `/_admin/tokens` are the only introspection /
+   management endpoints. Basic request metrics (op, status, ms, subrequests per
+   repo) are emitted to Analytics Engine when the `GE_METRICS` binding exists.
+10. **Real-deploy verified:** R2 multipart semantics, DO alarms, and Paid-plan
+    subrequest limits are all confirmed against a live deployment
+    (`git-edge.grain.workers.dev`); the ~100 MB body cap is real.
 
 ## Verified performance envelope (local workerd)
 
@@ -169,6 +182,10 @@ truncation, or corrupted ref state.
 | GC during concurrent clone (60k objects) | mark→sweep < 4 s, clone clean |
 | Nested forward `REF_DELTA` pack | resolved, byte-exact |
 | Cyclic `REF_DELTA` pack | `unpack missing base` in ~60 ms |
+| Push 30 MiB single blob (prod) | 9 s, clone fsck-clean, byte-identical |
+| Push 20 MiB blob → GC consolidate → clone (local) | streamed verbatim copy, fsck clean |
+| Push ~95 MiB pack (prod) | 35 s — near the ~100 MB platform body cap |
+| Push ~130 MiB pack (prod) | HTTP 413 at the zone before app code — split the push |
 
 ## Interoperability test matrix (git 2.54, live)
 

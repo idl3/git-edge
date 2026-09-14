@@ -22,6 +22,7 @@ pub struct EntryRec {
     pub header_len: u8,
     pub kind_or_delta: Header,
     pub compressed_len: u32,
+    pub size: u64,
 }
 
 // EntryRec is ~40 B (offset + Header enum + two lengths): the record vec alone must
@@ -99,7 +100,11 @@ async fn stream_inner(
         body.fill(30).await?;
         let e = PackEntry::from_bytes(body.buffered(), pos, H::Sha1)
             .map_err(|e| unpack(format!("entry at {pos}: {e}")))?;
-        if e.decompressed_size > MAX_OBJ {
+        // Blobs may exceed MAX_OBJ: pass B streams them verbatim (their compressed
+        // bytes are already the normalized form) with a running sha1 — memory stays
+        // flat. Everything else still materializes in isolate memory to resolve.
+        let streamable = e.header == Header::Blob;
+        if e.decompressed_size > MAX_OBJ && !streamable {
             return Err(Error::Limit("object too large (16 MiB max)".into()));
         }
         let hlen = e.header_size();
@@ -127,7 +132,7 @@ async fn stream_inner(
         if z.total_out() != e.decompressed_size {
             return Err(unpack(format!("object at {pos}: size mismatch")));
         }
-        if clen > MAX_ENTRY_WIRE {
+        if clen > MAX_ENTRY_WIRE && !streamable {
             return Err(unpack(format!("entry at {pos}: wire size exceeds 32 MiB")));
         }
         recs.push(EntryRec {
@@ -135,6 +140,7 @@ async fn stream_inner(
             header_len: u8::try_from(hlen).map_err(|_| unpack("header too long"))?,
             kind_or_delta: e.header,
             compressed_len: u32::try_from(clen).map_err(|_| Error::Limit("entry too large".into()))?,
+            size: e.decompressed_size,
         });
         pos = pos.saturating_add(hlen as u64).saturating_add(clen);
     }
@@ -504,6 +510,12 @@ async fn one_entry(
     budget: &mut ReqBudget,
 ) -> Result<Step, Error> {
     let rec = entries.get(i).ok_or_else(|| internal("idx"))?;
+    // A blob past MAX_OBJ rides the verbatim path: its compressed bytes are already
+    // the normalized form, so we copy them through and re-inflate only to hash —
+    // the object never materializes in isolate memory.
+    if rec.kind_or_delta == Header::Blob && rec.size > MAX_OBJ {
+        return stream_blob(cx, rec, i, need_ids, out, sink, rows, budget).await;
+    }
     let base = match rec.kind_or_delta {
         Header::OfsDelta { base_distance } => Some(
             resolve_at(
@@ -553,6 +565,86 @@ async fn one_entry(
         cx.by_id.insert(id, i);
     }
     cx.cache.put(Key::Off(rec.offset), kind, Rc::new(data));
+    if rows.len() >= 10_000 {
+        sink.post(rows, budget).await?;
+        rows.clear();
+    }
+    Ok(Step::Done(id))
+}
+
+/// Verbatim pass-through for a blob over MAX_OBJ: emit the pending entry's wire
+/// bytes (header + zlib body) unchanged in <= 8 MiB reads while a resumable zlib
+/// stream re-inflates them purely to compute the object id. A delta that names a
+/// streamed blob as its base still fails cleanly at `Window::entry`'s size guard —
+/// it was never materialized, and a > 16 MiB delta base is not resolvable anyway.
+async fn stream_blob(
+    cx: &mut Cx<'_>,
+    rec: &EntryRec,
+    i: usize,
+    need_ids: bool,
+    out: &mut PackWriter,
+    sink: &mut IndexSink<'_>,
+    rows: &mut Vec<ObjRow>,
+    budget: &mut ReqBudget,
+) -> Result<Step, Error> {
+    let start = out.offset();
+    let body_start = rec.offset.saturating_add(u64::from(rec.header_len));
+    let end = body_start.saturating_add(u64::from(rec.compressed_len));
+    let hdr = cx
+        .win
+        .bucket
+        .read_range(cx.win.key, rec.offset, u64::from(rec.header_len), budget)
+        .await?;
+    out.raw_extend(&hdr);
+    let (mut z, mut h, mut sinkbuf) = (Decompress::new(), gix_hash::hasher(H::Sha1), vec![0u8; 1 << 20]);
+    h.update(format!("blob {}\0", rec.size).as_bytes());
+    let (mut pos, mut produced, mut st) = (body_start, 0u64, Status::Ok);
+    while pos < end && st != Status::StreamEnd {
+        let n = end.saturating_sub(pos).min(WINDOW);
+        let chunk = cx.win.bucket.read_range(cx.win.key, pos, n, budget).await?;
+        let mut inp: &[u8] = &chunk;
+        loop {
+            let (bi, bo) = (z.total_in(), z.total_out());
+            st = z
+                .decompress(inp, &mut sinkbuf, FlushDecompress::None)
+                .map_err(|e| unpack(format!("zlib at {pos}: {e}")))?;
+            let (used, made) = (
+                usize::try_from(z.total_in().saturating_sub(bi)).map_err(internal)?,
+                usize::try_from(z.total_out().saturating_sub(bo)).map_err(internal)?,
+            );
+            h.update(sinkbuf.get(..made).unwrap_or(&[]));
+            produced = produced.saturating_add(made as u64);
+            inp = &inp[used..];
+            if inp.is_empty() || st == Status::StreamEnd {
+                break;
+            }
+            if used == 0 && made == 0 {
+                return Err(unpack(format!("zlib stalled at {pos}")));
+            }
+        }
+        out.raw_extend(&chunk);
+        out.flush_if_full(budget).await?;
+        pos = pos.saturating_add(n);
+    }
+    if st != Status::StreamEnd
+        || produced != rec.size
+        || z.total_in() != u64::from(rec.compressed_len)
+    {
+        return Err(unpack(format!("object at {}: size mismatch", rec.offset)));
+    }
+    let id = h.try_finalize().map_err(|_| unpack("sha1 collision"))?;
+    let (offset, len) = out.raw_entry_done(Kind::Blob, start)?;
+    rows.push(ObjRow {
+        sha: id,
+        idx: u32::try_from(i).map_err(|_| unpack("too many objects"))?,
+        offset,
+        len,
+        kind: Kind::Blob,
+        size: rec.size,
+    });
+    if need_ids {
+        cx.by_id.insert(id, i);
+    }
     if rows.len() >= 10_000 {
         sink.post(rows, budget).await?;
         rows.clear();
