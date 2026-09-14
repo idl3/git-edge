@@ -430,7 +430,7 @@ async fn load(
         .zip(idx.lookup(ids)?)
         .map(|(id, l)| l.map(|l| (*id, l)).ok_or_else(|| Error::Internal(format!("reachable {id} is not live"))))
         .collect::<Result<_, _>>()?;
-    for (id, entry) in bucket.read_entries(&locs, budget).await? {
+    for (id, entry) in bucket.read_entries_chunked(&locs, budget).await? {
         let (k, data) = codec::decode_entry(&entry)?;
         mem.insert(id, k, data);
         if mem.bytes > MAX_MEM {
@@ -485,7 +485,9 @@ async fn load_commits(
         }
         missing.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         missing.dedup_by(|a, b| a.0 == b.0);
-        for (id, entry) in bucket.read_entries(&missing, budget).await? {
+        // a wide history spread over many packs can prefetch past the read-batch
+        // bound — chunked splits the set on Limit rather than failing the fetch
+        for (id, entry) in bucket.read_entries_chunked(&missing, budget).await? {
             let (k, data) = codec::decode_entry(&entry)?;
             mem.insert(id, k, data);
             if mem.bytes > MAX_MEM {

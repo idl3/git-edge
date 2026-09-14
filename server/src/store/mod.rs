@@ -329,6 +329,28 @@ impl Bucket {
         }
         Ok(out)
     }
+    /// `read_entries` that survives a locs set wider than the read-batch bound:
+    /// splits the set and reads the halves. Entries arrive in each half's span
+    /// order — callers consume (id, entry) pairs, never positions. A single
+    /// oversized span still propagates the Limit.
+    pub async fn read_entries_chunked(
+        &self,
+        locs: &[(ObjectId, ObjLoc)],
+        budget: &mut ReqBudget,
+    ) -> Result<Vec<(ObjectId, Vec<u8>)>, Error> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&[(ObjectId, ObjLoc)]> = vec![locs];
+        while let Some(chunk) = stack.pop() {
+            match self.read_entries(chunk, budget).await {
+                Err(Error::Limit(_)) if chunk.len() > 1 => {
+                    stack.push(&chunk[chunk.len() / 2..]);
+                    stack.push(&chunk[..chunk.len() / 2]);
+                }
+                r => out.extend(r?),
+            }
+        }
+        Ok(out)
+    }
     /// <= 1000 keys per call (R2 delete_multiple).
     pub async fn delete(&self, keys: &[String]) -> Result<(), Error> {
         for chunk in keys.chunks(1_000) {

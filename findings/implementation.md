@@ -368,3 +368,28 @@ Remaining known gaps (documented, not blocking):
 - Error responses still drop `x-ge-subrequests` (P3 observability).
 - `coalesce` keeps a defensive `unwrap_or(u32::MAX)` on a value bounded by
   WINDOW (P3); a future invariant change should fail loudly instead.
+
+## Round 7 — real-repo benchmark (atlas-core, grain-core)
+
+Pushed two production repos (staged by commit ranges, local worker):
+
+- **atlas-core `master`**: 5,376 commits, ~150k objects across refs, 153 MiB
+  pack — 4 pushes ~63 s, clone 11.6 s, fsck clean.
+- **grain-core `main`**: 6,570 commits, ~403k objects across refs, 434 MiB
+  pack — 8 pushes ~26 s, clone 20.3 s, fsck clean.
+
+The benchmark surfaced two production bugs, both fixed:
+
+- **Clone 413 `read batch exceeds memory budget`** — `read_entries` bounds one
+  call at 48 MiB of *coalesced spans*; the expansion `load()` (CHUNK=10,000
+  trees) and the `load_commits` prefetch (±2 MiB per touched pack) could exceed
+  it on wide, multi-pack histories. New `Bucket::read_entries_chunked` splits
+  the locs set on `Limit` and retries halves; `load`, `load_commits`, and both
+  `gc.rs` call sites use it.
+- **Dangling `HEAD` on `master`-first push** — `meta.head` was hardcoded
+  `refs/heads/main` at boot; a repo whose first push is `master` cloned with
+  `remote HEAD refers to nonexistent ref`. `commit_push` now adopts the
+  alphabetically-first existing `refs/heads/*` when the configured head is
+  dangling (GitHub-style first-push adoption).
+
+Prioritized backlog lives in `ROADMAP.md`.

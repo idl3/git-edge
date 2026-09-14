@@ -595,6 +595,15 @@ impl RepoDo {
         }
         if any_ok {
             self.q("UPDATE meta SET value=value+1 WHERE key='refs_version'", vec![])?; // step 5
+            // a repo created by pushing a non-main history (e.g. master-first) leaves
+            // meta.head dangling — adopt an existing branch or clones can't check out
+            self.q(
+                "UPDATE meta SET value=(SELECT name FROM refs WHERE name LIKE 'refs/heads/%' \
+                 ORDER BY name LIMIT 1) WHERE key='head' \
+                 AND NOT EXISTS(SELECT 1 FROM refs WHERE name=meta.value) \
+                 AND EXISTS(SELECT 1 FROM refs WHERE name LIKE 'refs/heads/%')",
+                vec![],
+            )?;
             jobs::enqueue(&sql, JobKind::GcMark, now + self.gc_quiet_ms(), "{}")?; // step 7 (dedups)
         }
         self.finish_push(req, "committed", now, results) // step 6
@@ -695,7 +704,10 @@ impl RepoDo {
         match self.fetch_v2_inner(body).await {
             Ok(r) => Ok(r),
             Err(e @ (Error::Storage(_) | Error::Internal(_))) => Err(worker::Error::RustError(e.message())),
-            Err(e) => do_error_response(&e).map_err(worker::Error::from),
+            Err(e) => {
+                worker::console_log!("fetch_v2: {e}");
+                do_error_response(&e).map_err(worker::Error::from)
+            }
         }
     }
 
