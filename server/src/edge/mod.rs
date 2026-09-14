@@ -233,7 +233,7 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<R
     if protocol_version(&req)? != Some(2) {
         // contract 1.1 rule 7: v0 upload-pack POST -> HTTP 400 with the ERR pkt-line
         let mut w = PktWriter::default();
-        let _ = w.data(b"ERR protocol v2 required\n");
+        let _ = w.data(b"ERR protocol v2 required (git >= 2.26)\n");
         w.flush();
         return git_resp(w.out, "application/x-git-upload-pack-result")
             .map(|r| r.with_status(400));
@@ -274,9 +274,17 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<R
         return Err(Error::from_do_response(resp).await);
     }
     // fetch responses carry immutable headers; rebuild around the same stream so the
-    // pack flows through the edge instead of being buffered whole in memory
+    // pack flows through the edge instead of being buffered whole in memory — and
+    // propagate the DO's subrequest accounting so clients see the real budget cost
+    let subreqs = resp.headers().get("x-ge-subrequests").ok().flatten();
     let stream = resp.stream().map_err(|e| Error::Internal(e.to_string()))?;
-    git_resp_stream(stream, "application/x-git-upload-pack-result")
+    let mut out = git_resp_stream(stream, "application/x-git-upload-pack-result")?;
+    if let Some(v) = subreqs {
+        out.headers_mut()
+            .set("x-ge-subrequests", &v)
+            .map_err(|e| Error::Internal(e.to_string()))?;
+    }
+    Ok(out)
 }
 
 /// POST /:owner/:repo/git-receive-pack — two-phase push (2.4, 3) with the A2 error arm.

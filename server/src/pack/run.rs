@@ -13,7 +13,7 @@ use crate::store::{keys, Bucket, ObjLoc, ObjRow, PackId, PackMeta, PackWriter, P
 use crate::wire::http::{stub_json, RepoRoute};
 use crate::ReqBudget;
 
-const MAX_LINKS: usize = 1_000_000; // A5
+pub(crate) const MAX_LINKS: usize = 1_000_000; // A5
 
 fn unpack(m: impl Into<String>) -> Error {
     Error::Unpack(m.into())

@@ -28,6 +28,14 @@ pub struct EntryRec {
 // leave room for Cache (48 MiB) + window + part buffer inside a 128 MiB isolate
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_OBJ: u64 = 16 << 20; // A7
+/// One entry's *compressed* wire size. `decompressed_size` ≤ 16 MiB bounds output but a
+/// deflate stream can carry ~5 bytes-in/0 bytes-out padding, so an entry could claim a
+/// ~2 GiB compressed length — which pass B would then range-read into memory whole.
+/// A real 16 MiB object compresses to < ~17 MiB; 32 MiB is generous headroom.
+const MAX_ENTRY_WIRE: u64 = 32 << 20;
+/// Total compressed bytes held by in-flight delta chains across every nested
+/// resolve_at frame — the aggregate bound MAX_CHAIN_BYTES alone can't provide.
+const MAX_CHAIN_LIVE: u64 = 128 << 20;
 const MAX_PENDING: u64 = 2 << 30; // 2 GiB compressed ceiling on one pushed pack
 const WINDOW: u64 = 8 << 20;
 const CACHE: usize = 48 << 20; // 16 MiB resolved LRU + 32 MiB external bases as one cache
@@ -42,14 +50,33 @@ fn internal(e: impl std::fmt::Display) -> Error {
 }
 
 /// Pass A. Each zlib boundary comes from a resumable `Decompress` whose `total_in` survives awaits.
+/// Any error after the MPU is created aborts it — a dropped RawWriter would orphan the
+/// upload and its already-uploaded parts in R2.
 pub async fn stream_to_pending(
     body: &mut BodyReader,
     bucket: &Bucket,
     push: &PushId,
     budget: &mut ReqBudget,
 ) -> Result<(Vec<EntryRec>, u32), Error> {
-    let mut hasher = gix_hash::hasher(H::Sha1);
     let mut out = RawWriter::create(bucket, keys::pending(&bucket.repo, push), budget).await?;
+    match stream_inner(body, &mut out, budget).await {
+        Ok(r) => match out.finish(budget).await {
+            Ok(()) => Ok(r),
+            Err(e) => Err(e), // finish aborts the MPU itself on failure
+        },
+        Err(e) => {
+            out.abort().await;
+            Err(e)
+        }
+    }
+}
+
+async fn stream_inner(
+    body: &mut BodyReader,
+    out: &mut RawWriter,
+    budget: &mut ReqBudget,
+) -> Result<(Vec<EntryRec>, u32), Error> {
+    let mut hasher = gix_hash::hasher(H::Sha1);
     if !body.fill(12).await? {
         return Err(unpack("pack header truncated"));
     }
@@ -63,7 +90,7 @@ pub async fn stream_to_pending(
     if version != gix_pack::data::Version::V2 {
         return Err(unpack("pack version"));
     }
-    take(body, &mut hasher, &mut out, 12, budget).await?;
+    take(body, &mut hasher, out, 12, budget).await?;
     let (mut recs, mut pos, mut z, mut sink) = (Vec::new(), 12u64, Decompress::new(), vec![0u8; 64 << 10]);
     for _ in 0..count {
         if recs.len() >= MAX_ENTRIES {
@@ -76,7 +103,7 @@ pub async fn stream_to_pending(
             return Err(Error::Limit("object too large (16 MiB max)".into()));
         }
         let hlen = e.header_size();
-        take(body, &mut hasher, &mut out, hlen, budget).await?;
+        take(body, &mut hasher, out, hlen, budget).await?;
         let (mut clen, mut st) = (0u64, Status::Ok);
         z.reset();
         while st != Status::StreamEnd {
@@ -91,7 +118,7 @@ pub async fn stream_to_pending(
             if used == 0 && z.total_out() == bo {
                 return Err(unpack(format!("zlib stalled at {pos}")));
             }
-            take(body, &mut hasher, &mut out, used, budget).await?;
+            take(body, &mut hasher, out, used, budget).await?;
             clen = clen.saturating_add(used as u64);
             if body.total > MAX_PENDING {
                 return Err(Error::Limit("pack exceeds the 2 GiB limit".into()));
@@ -99,6 +126,9 @@ pub async fn stream_to_pending(
         }
         if z.total_out() != e.decompressed_size {
             return Err(unpack(format!("object at {pos}: size mismatch")));
+        }
+        if clen > MAX_ENTRY_WIRE {
+            return Err(unpack(format!("entry at {pos}: wire size exceeds 32 MiB")));
         }
         recs.push(EntryRec {
             offset: pos,
@@ -120,7 +150,6 @@ pub async fn stream_to_pending(
     if body.fill(1).await? {
         return Err(Error::Protocol("bytes after pack trailer".into()));
     }
-    out.finish(budget).await?;
     Ok((recs, count))
 }
 
@@ -182,6 +211,11 @@ impl Window<'_> {
     /// Raw bytes of one entry; slides to [offset, +8 MiB) with one range read when outside.
     async fn entry(&mut self, rec: &EntryRec, budget: &mut ReqBudget) -> Result<Vec<u8>, Error> {
         let len = u64::from(rec.header_len).saturating_add(u64::from(rec.compressed_len));
+        // pass A enforces MAX_ENTRY_WIRE; keep the bound explicit here so a huge range
+        // read can never be issued even if the invariant is ever broken upstream
+        if len > MAX_ENTRY_WIRE.saturating_add(64) {
+            return Err(unpack("entry window too large"));
+        }
         let lo = match rec
             .offset
             .checked_sub(self.start)
@@ -209,6 +243,12 @@ struct Cx<'a> {
     z: Inflate,
     by_id: HashMap<ObjectId, usize>,
     external: &'a HashMap<ObjectId, ObjLoc>,
+    /// Nested `resolve_at` depth (ref-delta -> ref-delta hops). Each level keeps its
+    /// `chain` alive across the inner await, so depth without a byte bound is an OOM.
+    res_depth: u32,
+    /// Compressed bytes held by in-flight delta chains across ALL nested resolve_at
+    /// calls — decremented when a chain finishes or aborts.
+    chain_live: u64,
 }
 
 /// One decode_entry over `[PACK v2][base as a level-0 zlib full entry][delta re-headed as ofs-delta][20 zero bytes]`.
@@ -298,8 +338,14 @@ async fn base_by_id(
     match cx.by_id.get(&base_id).copied() {
         Some(j) => {
             // async recursion (resolve_at -> base_by_id -> resolve_at) needs boxing;
-            // depth is bounded by MAX_DEPTH hops per nested call
-            Box::pin(resolve_at(cx, entries, entries.get(j).ok_or_else(|| internal("idx"))?.offset, budget)).await
+            // bounded twice: nested hop depth AND shared in-flight chain bytes
+            if cx.res_depth >= MAX_DEPTH as u32 {
+                return Err(unpack("delta chain too deep"));
+            }
+            cx.res_depth += 1;
+            let r = Box::pin(resolve_at(cx, entries, entries.get(j).ok_or_else(|| internal("idx"))?.offset, budget)).await;
+            cx.res_depth -= 1;
+            r
         }
         None if cx.external.contains_key(&base_id) => {
             Ok(Base::Ready(external(cx, base_id, budget).await?))
@@ -329,9 +375,12 @@ async fn resolve_at(
         let rec = entries.get(i).ok_or_else(|| internal("idx"))?;
         let raw = cx.win.entry(rec, budget).await?;
         // the chain holds each delta's compressed bytes: 64 × ~16 MiB worst case is a
-        // GiB-scale allocation — bound the bytes, not just the depth
+        // GiB-scale allocation — bound the bytes, not just the depth. chain_live bounds
+        // the SAME memory summed across every nested resolve_at frame.
         chain_bytes = chain_bytes.saturating_add(raw.len() as u64);
-        if chain_bytes > MAX_CHAIN_BYTES {
+        cx.chain_live = cx.chain_live.saturating_add(raw.len() as u64);
+        if chain_bytes > MAX_CHAIN_BYTES || cx.chain_live > MAX_CHAIN_LIVE {
+            cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
             return Err(unpack("delta chain too large"));
         }
         match rec.kind_or_delta {
@@ -344,7 +393,10 @@ async fn resolve_at(
                 chain.push((off, raw));
                 match base_by_id(cx, entries, base_id, budget).await? {
                     // an unresolved in-pack base: abandon the walk; the whole entry defers
-                    Base::Await(id) => return Ok(Base::Await(id)),
+                    Base::Await(id) => {
+                        cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
+                        return Ok(Base::Await(id));
+                    }
                     Base::Ready(obj) => break obj,
                 }
             }
@@ -358,6 +410,7 @@ async fn resolve_at(
         let (_, d) = decode_mini(&mut cx.z, Some((kind, &data)), &raw)?;
         data = cx.cache.put(Key::Off(o), kind, Rc::new(d)).1;
     }
+    cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
     Ok(Base::Ready((kind, data)))
 }
 
@@ -383,6 +436,8 @@ pub async fn resolve_and_normalize(
         z: Inflate::default(),
         by_id: HashMap::new(),
         external: external_bases,
+        res_depth: 0,
+        chain_live: 0,
     };
     let (mut pre, mut sum) = (Vec::new(), 0u64);
     for (id, loc) in external_bases {
@@ -392,9 +447,14 @@ pub async fn resolve_and_normalize(
         }
         pre.push((*id, loc.clone()));
     }
-    for (id, entry) in bucket.read_entries(&pre, budget).await? {
-        let (k, d) = codec::decode_entry(&entry)?;
-        cx.cache.put(Key::Id(id), k, Rc::new(d));
+    // prefetch is opportunistic: `read_entries` bounds *merged span* bytes (gaps
+    // included), which `pre`'s plain size sum can't predict — on Limit just skip the
+    // batch; every base still resolves lazily through `external()`
+    if let Ok(entries) = bucket.read_entries(&pre, budget).await {
+        for (id, entry) in entries {
+            let (k, d) = codec::decode_entry(&entry)?;
+            cx.cache.put(Key::Id(id), k, Rc::new(d));
+        }
     }
     let need_ids = entries.iter().any(|r| matches!(r.kind_or_delta, Header::RefDelta { .. }));
     let mut rows = Vec::new();
@@ -474,6 +534,11 @@ async fn one_entry(
         }
     }
     sink.links.extend(links);
+    // bound inside the loop too — a single giant tree can spike `links` far past
+    // the limit between post() batches otherwise
+    if sink.links.len() > super::run::MAX_LINKS {
+        return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
+    }
     let (offset, len) = out.append_entry(kind, &data)?;
     out.flush_if_full(budget).await?;
     rows.push(ObjRow {

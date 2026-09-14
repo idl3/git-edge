@@ -109,14 +109,15 @@ fn loc(r: &R) -> Result<(ObjectId, ObjLoc), Error> {
 }
 
 // ---- marked-bitmap helpers (one bit per entry idx) ----
-fn bm_set(bm: &mut Vec<u8>, i: u32) {
+fn bm_set(bm: &mut Vec<u8>, i: u32) -> Result<(), Error> {
     let byte = usize::try_from(i / 8).unwrap_or(usize::MAX);
-    if byte >= bm.len() {
-        bm.resize(byte + 1, 0);
-    }
-    if let Some(b) = bm.get_mut(byte) {
-        *b |= 1 << (i % 8);
-    }
+    // bitmaps are sized (count+7)/8 at mark start — an idx past the end is a corrupt
+    // objects row, not a reason to allocate (idx = u32::MAX would try 512 MiB)
+    let b = bm
+        .get_mut(byte)
+        .ok_or_else(|| Error::Internal("idx past pack count".into()))?;
+    *b |= 1 << (i % 8);
+    Ok(())
 }
 fn bm_idxs_from(bm: &[u8], from: u32, limit: usize) -> Vec<u32> {
     let mut out = Vec::new();
@@ -215,9 +216,12 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
         }
         let rows = exec(
             &sql,
+            // GROUP BY keeps one row per sha — N duplicate live packs per sha would
+            // otherwise materialize N×batch rows (attacker-seeded OOM, and only the
+            // first row per sha is ever used below)
             "SELECT o.sha, o.pack_id, o.idx, o.offset, o.len, o.kind, o.size FROM objects o \
              JOIN packs p ON p.id=o.pack_id WHERE p.state='live' AND \
-             o.sha IN (SELECT value FROM json_each(?)) ORDER BY o.sha",
+             o.sha IN (SELECT value FROM json_each(?)) GROUP BY o.sha ORDER BY o.sha",
             vec![js(&batch)?],
         )?
         .to_array::<R>()?;
@@ -242,7 +246,7 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
                     bits.insert(r.pack_id.clone(), b);
                 }
                 if let Some(bm) = bits.get_mut(&r.pack_id) {
-                    bm_set(bm, u32::try_from(r.idx).map_err(|_| Error::Internal("idx".into()))?);
+                    bm_set(bm, u32::try_from(r.idx).map_err(|_| Error::Internal("idx".into()))?)?;
                     marked_sha = true;
                 }
             }
@@ -294,7 +298,27 @@ fn commit_ids(
         vec![js(kids)?],
     )?;
     exec(sql, "DELETE FROM gc_frontier WHERE sha IN (SELECT value FROM json_each(?))", vec![js(ids)?])?;
-    for (p, bm) in bits.drain() {
+    for (p, mut bm) in bits.drain() {
+        // a duplicate concurrent mark slice may have flushed different bits since our
+        // last SELECT — OR-merge with the stored bitmap inside this sync span so a
+        // last-writer-wins overwrite can never drop a reachable object's mark
+        #[derive(serde::Deserialize)]
+        struct Cur {
+            #[serde(with = "serde_bytes")]
+            bitmap: Vec<u8>,
+        }
+        if let Some(old) = exec(sql, "SELECT bitmap FROM marked WHERE pack_id=?", vec![p.clone().into()])?
+            .to_array::<Cur>()?
+            .into_iter()
+            .next()
+        {
+            if old.bitmap.len() > bm.len() {
+                bm.resize(old.bitmap.len(), 0);
+            }
+            for (a, b) in bm.iter_mut().zip(old.bitmap.iter()) {
+                *a |= *b;
+            }
+        }
         exec(sql, "UPDATE marked SET bitmap=? WHERE pack_id=?", vec![bm.into(), p.into()])?;
     }
     Ok(())
@@ -431,8 +455,10 @@ async fn build(
         }
         let rows = exec(
             sql,
+            // ORDER BY idx makes the build fully deterministic: a replay after a kill
+            // must reproduce identical append offsets, or ON CONFLICT keeps stale rows
             "SELECT sha, pack_id, idx, offset, len, kind, size FROM objects WHERE pack_id=? \
-             AND idx IN (SELECT value FROM json_each(?))",
+             AND idx IN (SELECT value FROM json_each(?)) ORDER BY idx",
             vec![cands.get(pos.ci as usize).cloned().unwrap_or_default().into(), js(&idxs)?],
         )?
         .to_array::<R>()?;
@@ -467,11 +493,23 @@ async fn build(
                         .max(i64::try_from(off.saturating_add(u64::from(len))).unwrap_or((1 << 53) - 1));
                 }
             }
+            // flush per chunk, not per batch: `out.part` would otherwise accumulate the
+            // whole 90-entry batch (~1.4 GiB of buffered pack bytes) and OOM the isolate
+            if in_part >= MIN_PART {
+                if let Some(f) =
+                    flush(d, sql, bucket, key, &mut out, pos, &mut staged, &mut in_part, job_id, budget).await?
+                {
+                    return Ok(f);
+                }
+            }
         }
         if staged.len() >= ROWS {
             Index(sql).insert_objects(&PackId(pos.pack.clone()), &staged)?;
             staged.clear();
         }
+        // a multi-MiB chunk loop can run past the 60 s straggler window on slow R2 —
+        // heartbeat so repair doesn't requeue a live consolidate into a duplicate slice
+        super::heartbeat(sql, job_id)?;
         if let Some(f) = flush(d, sql, bucket, key, &mut out, pos, &mut staged, &mut in_part, job_id, budget).await? {
             return Ok(f);
         }

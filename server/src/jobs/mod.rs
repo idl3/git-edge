@@ -189,9 +189,35 @@ pub fn repair(sql: &SqlStorage) -> Result<(), Error> {
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
             }
+            // bound resurrection: a deterministically failing chain (corrupt pack,
+            // wedge) would otherwise restart at every boot forever — a ~400-subrequest
+            // slice of doomed work each time. resurrected.<kind> counts restarts and
+            // resets when the chain completes (gc_sweep Done clears it).
+            let key = format!("resurrected.{}", kind.as_str());
+            #[derive(serde::Deserialize)]
+            struct M {
+                value: String,
+            }
+            let tries = sql
+                .exec("SELECT value FROM meta WHERE key=?", Some(vec![V::from(key.as_str())]))
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .to_array::<M>()
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .into_iter()
+                .next()
+                .and_then(|m| m.value.parse::<i64>().ok())
+                .unwrap_or(0);
+            if tries >= 3 {
+                continue; // leave the dead rows and dead.<kind> for inspection
+            }
             sql.exec("DELETE FROM jobs WHERE kind=? AND state='dead'", Some(vec![V::from(kind.as_str())]))
                 .map_err(|e| Error::Storage(e.to_string()))?;
             enqueue(sql, kind, now, "{}")?;
+            sql.exec(
+                "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                Some(vec![V::from(key.as_str()), V::from((tries + 1).to_string())]),
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
         }
     }
     Ok(())
@@ -228,10 +254,14 @@ async fn dispatch_inner(d: &RepoDo) -> Result<(), Error> {
         .into_iter()
         .next();
     let Some(r) = row else { return Ok(()) };
-    // mark running + record started_at (A12) in one sync span
+    // mark running + record started_at (A12) + a lease token in one sync span. The
+    // lease survives heartbeats (which rewrite started_at) and fences the outcome
+    // span: a slice whose row was repair-requeued and reclaimed by another dispatch
+    // can no longer mutate the row when it finally finishes.
+    let lease = platform::hex16()?;
     d.q(
-        "UPDATE jobs SET state='running', started_at=? WHERE id=? AND state='queued'",
-        vec![V::from(now), V::from(r.id)],
+        "UPDATE jobs SET state='running', started_at=?, lease=? WHERE id=? AND state='queued'",
+        vec![V::from(now), V::from(lease.as_str()), V::from(r.id)],
     )?;
     if d.changes()? != 1 {
         return Ok(()); // someone else took it; impossible inside a span, but harmless
@@ -251,24 +281,38 @@ async fn dispatch_inner(d: &RepoDo) -> Result<(), Error> {
             Ok(SliceOutcome::Continue { .. }) => "continue".into(),
             Ok(SliceOutcome::Reschedule { .. }) => "reschedule".into(),
             Err(e) => format!("err {e}") });
-    // apply the outcome in a sync span (4.2, 4.4)
+    // apply the outcome in a sync span (4.2, 4.4) — fenced on our lease: if `repair`
+    // requeued this row mid-slice and another dispatch claimed it (started_at changed),
+    // this slice is stale and must not mutate the row or run Done-side-effects — a
+    // concurrent gc_mark sibling would otherwise lose its bitmap updates.
+    let fenced = |q: &str, mut args: Vec<V>| -> Result<bool, Error> {
+        args.push(V::from(r.id));
+        args.push(V::from(lease.as_str()));
+        d.q(q, args)?;
+        Ok(d.changes()? == 1)
+    };
     match out {
         Ok(SliceOutcome::Done) => {
-            d.q("DELETE FROM jobs WHERE id=?", vec![V::from(r.id)])?;
-            if job.kind == JobKind::Janitor {
-                enqueue(&d.sql(), JobKind::Janitor, now + 15 * 60 * 1000, "{}")?;
+            if fenced("DELETE FROM jobs WHERE id=? AND state='running' AND lease=?", vec![])? {
+                if job.kind == JobKind::Janitor {
+                    enqueue(&d.sql(), JobKind::Janitor, now + 15 * 60 * 1000, "{}")?;
+                }
+                if job.kind == JobKind::GcSweep {
+                    // chain completed — clear the resurrection counters repair uses
+                    d.q("DELETE FROM meta WHERE key LIKE 'resurrected.gc_%'", vec![])?;
+                }
             }
         }
         Ok(SliceOutcome::Continue { cursor }) => {
-            d.q(
-                "UPDATE jobs SET state='queued', run_at=?, cursor=? WHERE id=?",
-                vec![V::from(now), V::from(cursor.as_str()), V::from(r.id)],
+            fenced(
+                "UPDATE jobs SET state='queued', run_at=?, cursor=?, lease=NULL WHERE id=? AND state='running' AND lease=?",
+                vec![V::from(now), V::from(cursor.as_str())],
             )?;
         }
         Ok(SliceOutcome::Reschedule { run_at }) => {
-            d.q(
-                "UPDATE jobs SET state='queued', run_at=?, cursor=NULL WHERE id=?",
-                vec![V::from(run_at), V::from(r.id)],
+            fenced(
+                "UPDATE jobs SET state='queued', run_at=?, cursor=NULL, lease=NULL WHERE id=? AND state='running' AND lease=?",
+                vec![V::from(run_at)],
             )?;
         }
         Err(e) => {
@@ -276,14 +320,14 @@ async fn dispatch_inner(d: &RepoDo) -> Result<(), Error> {
             let backoff = (30_000i64).saturating_mul(1i64.checked_shl(attempts.min(20)).unwrap_or(1 << 20));
             let next = now.saturating_add(backoff.min(3_600_000));
             if attempts >= 8 {
-                d.q(
-                    "UPDATE jobs SET state='dead', last_error=? WHERE id=?",
-                    vec![V::from(e.to_string().as_str()), V::from(r.id)],
+                fenced(
+                    "UPDATE jobs SET state='dead', last_error=? WHERE id=? AND state='running' AND lease=?",
+                    vec![V::from(e.to_string().as_str())],
                 )?;
             } else {
-                d.q(
-                    "UPDATE jobs SET state='queued', attempts=?, last_error=?, run_at=? WHERE id=?",
-                    vec![V::from(i64::from(attempts)), V::from(e.to_string().as_str()), V::from(next), V::from(r.id)],
+                fenced(
+                    "UPDATE jobs SET state='queued', attempts=?, last_error=?, run_at=?, lease=NULL WHERE id=? AND state='running' AND lease=?",
+                    vec![V::from(i64::from(attempts)), V::from(e.to_string().as_str()), V::from(next)],
                 )?;
             }
         }
