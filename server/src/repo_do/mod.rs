@@ -185,11 +185,9 @@ impl RepoDo {
         Ok(self.q("SELECT changes() AS n", vec![])?.one::<N>()?.n)
     }
     pub fn meta(&self, key: &str) -> Result<String, Error> {
-        #[derive(serde::Deserialize)]
-        struct S {
-            value: String,
-        }
-        Ok(self.q("SELECT value FROM meta WHERE key=?", vec![V::from(key)])?.one::<S>()?.value)
+        // one() on an empty cursor throws at the JS boundary (not a catchable Rust
+        // Err) — a missing key must not crash the isolate, so go through meta_opt
+        self.meta_opt(key)?.ok_or_else(|| Error::Storage(format!("meta.{key} missing")))
     }
     pub fn meta_opt(&self, key: &str) -> Result<Option<String>, Error> {
         #[derive(serde::Deserialize)]
@@ -370,7 +368,7 @@ impl RepoDo {
             "INSERT INTO tokens(id,hash,level,name,created_at) VALUES(?,?,?,?,?)",
             vec![
                 V::from(id.as_str()),
-                V::from(crate::auth::token_hash(&token)),
+                V::from(crate::auth::token_hash(&token)?),
                 V::from(b.level.as_str()),
                 V::from(b.name.as_str()),
                 V::from(platform::now_ms()),

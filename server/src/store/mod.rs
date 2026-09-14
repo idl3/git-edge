@@ -439,8 +439,9 @@ impl PackWriter {
         budget.charge(1)?;
         let mpu = bucket.inner.create_multipart_upload(key).custom_metadata(meta).execute().await?;
         let header = gix_pack::data::header::encode(gix_pack::data::Version::V2, expected);
-        let mut sha1 = CkptSha1::new();
-        sha1.update(&header);
+        // sha1 is fed only as bytes are uploaded (flush_if_full/checkpoint/finish), so a
+        // WriterCkpt's hasher covers exactly the durable prefix — never buffered bytes
+        let sha1 = CkptSha1::new();
         Ok(Self {
             mpu,
             pack: PackId(name.to_string()),
@@ -461,7 +462,6 @@ impl PackWriter {
         codec::encode_entry(kind, data, &mut self.part)?;
         let entry = self.part.get(start..).ok_or_else(|| Error::Internal("part buffer".into()))?;
         let len = u32::try_from(entry.len()).map_err(|_| Error::Limit("entry too long".into()))?;
-        self.sha1.update(entry);
         let offset = self.offset;
         self.offset = offset.saturating_add(u64::from(len));
         if kind == Kind::Commit {
@@ -486,7 +486,6 @@ impl PackWriter {
     /// entry with `raw_entry_done` — checkpoints and index rows must never split one.
     pub fn raw_extend(&mut self, bytes: &[u8]) {
         self.part.extend_from_slice(bytes);
-        self.sha1.update(bytes);
         self.offset = self.offset.saturating_add(bytes.len() as u64);
     }
     /// Seal an entry appended via `raw_extend`; `start` was `offset()` before its first
@@ -508,6 +507,7 @@ impl PackWriter {
             let n = u16::try_from(self.parts.len().saturating_add(1))
                 .map_err(|_| Error::Limit("too many parts".into()))?;
             budget.charge(1)?;
+            self.sha1.update(&chunk);
             self.parts.push(self.mpu.upload_part(n, chunk).await?);
         }
         Ok(())
@@ -548,7 +548,13 @@ impl PackWriter {
                 self.count, self.expected
             )));
         }
-        let trailer = self.sha1.clone().fin();
+        // the trailer hashes header+entries: self.sha1 covers only uploaded bytes, so
+        // clone it and feed the still-buffered tail before sealing
+        let trailer = {
+            let mut h = self.sha1.clone();
+            h.update(&self.part);
+            h.fin()
+        };
         self.part.extend_from_slice(&trailer);
         self.flush_if_full(budget).await?;
         if !self.part.is_empty() {
@@ -587,44 +593,24 @@ impl PackWriter {
         Ok((offset, len))
     }
 
-    /// Upload buffered bytes in `min`-sized parts while at least `min` remains, returning
-    /// each (part_no, etag) in order. GC's verbatim copy of an entry too large to buffer
-    /// whole drains as it goes — the caller must persist the returned parts at the next
-    /// checkpoint (never earlier: a part in gc_parts without a matching WriterCkpt breaks
-    /// resume's part numbering).
-    pub async fn drain_parts(
-        &mut self,
-        min: usize,
-        budget: &mut ReqBudget,
-    ) -> Result<Vec<(u16, String)>, Error> {
-        let mut uploaded = Vec::new();
-        while self.part.len() >= min {
-            let chunk: Vec<u8> = self.part.drain(..min).collect();
-            let n = u16::try_from(self.parts.len().saturating_add(1))
-                .map_err(|_| Error::Limit("too many parts".into()))?;
-            budget.charge(1)?;
-            let p = self.mpu.upload_part(n, chunk).await?;
-            uploaded.push((p.part_number(), p.etag()));
-            self.parts.push(p);
-        }
-        Ok(uploaded)
-    }
-
-    /// Force-upload the buffered part as the next part when it is non-empty (callers guarantee
-    /// the >= 5 MiB rule for non-final parts), and export a serde checkpoint: the trailer hasher
-    /// state (gix_hash::Hasher cannot be exported, hence CkptSha1), offset and count.
+    /// Upload the oldest PART bytes as the next uniform part — R2 rejects complete()
+    /// when non-final parts differ in size, so the whole variable buffer must NOT be
+    /// drained in one call. Returns None under a full part. The exported checkpoint
+    /// describes only the durable prefix: pos is the uploaded offset (appended minus
+    /// buffered) and the hasher covers exactly those bytes.
     /// Returns (part_number, etag, checkpoint) — UploadedPart is not Clone.
     pub async fn checkpoint(
         &mut self,
         budget: &mut ReqBudget,
     ) -> Result<Option<(u16, String, WriterCkpt)>, Error> {
-        if self.part.is_empty() {
+        if self.part.len() < PART {
             return Ok(None);
         }
-        let chunk = std::mem::take(&mut self.part);
+        let chunk: Vec<u8> = self.part.drain(..PART).collect();
         let n = u16::try_from(self.parts.len().saturating_add(1))
             .map_err(|_| Error::Limit("too many parts".into()))?;
         budget.charge(1)?;
+        self.sha1.update(&chunk);
         let part = self.mpu.upload_part(n, chunk).await?;
         let rec = (part.part_number(), part.etag());
         self.parts.push(part);
@@ -632,7 +618,7 @@ impl PackWriter {
             rec.0,
             rec.1,
             WriterCkpt {
-                pos: self.offset,
+                pos: self.offset.saturating_sub(self.part.len() as u64),
                 sha: self.sha1.clone(),
                 count: self.count,
                 expected: self.expected,

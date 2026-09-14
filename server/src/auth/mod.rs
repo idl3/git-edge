@@ -27,13 +27,15 @@ fn scheme<'a>(hdr: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// sha1 hex of a presented token — the DO stores hashes, never raw tokens, so the
-/// edge sends only the hash across the stub boundary.
-pub fn token_hash(token: &str) -> String {
+/// edge sends only the hash across the stub boundary. Infallible in practice, but a
+/// Result anyway: an unwrap_or_default would collapse every hash to "" and match the
+/// first such row — a fail-open, not a fail-closed, error.
+pub fn token_hash(token: &str) -> Result<String, Error> {
     let mut h = gix_hash::hasher(gix_hash::Kind::Sha1);
     h.update(token.as_bytes());
     h.try_finalize()
         .map(|id| id.to_string())
-        .unwrap_or_default()
+        .map_err(|_| Error::Internal("token hash".into()))
 }
 
 /// Extract (token, principal) from the Authorization header.
@@ -94,6 +96,12 @@ pub async fn authenticate(req: &Request, env: &Env, need: Level, route: &RepoRou
             Level::Write => Err(Error::Forbidden),
         };
     }
+    // per-repo tokens are `ge_` + 64 lowercase hex — anything else can be rejected
+    // here without waking the DO (a non-global credential must not cost a DO boot
+    // + SQLite work + a billable subrequest at attacker-controlled line rate)
+    if !is_repo_token(&token) {
+        return Err(Error::Auth);
+    }
     // per-repo tokens live in the DO's tokens table — one stub call. Storage errors
     // fail closed (propagate): never silently treat a DO failure as unauthenticated.
     #[derive(serde::Deserialize)]
@@ -107,17 +115,24 @@ pub async fn authenticate(req: &Request, env: &Env, need: Level, route: &RepoRou
         &stub,
         route,
         "/_do/auth",
-        &serde_json::json!({ "hash": token_hash(&token) }),
+        &serde_json::json!({ "hash": token_hash(&token)? }),
         &mut budget,
     )
     .await;
     match row {
         Ok(r) if r.level == "write" => Ok(r.name),
-        Ok(r) if matches!(need, Level::Read) => Ok(r.name),
+        Ok(r) if r.level == "read" && matches!(need, Level::Read) => Ok(r.name),
         Ok(_) => Err(Error::Forbidden), // repo read token on a write route
         Err(Error::Auth) | Err(Error::NotFound) => Err(Error::Auth),
         Err(e) => Err(e),
     }
+}
+
+/// `ge_` + 64 lowercase hex — the shape token_create mints.
+fn is_repo_token(token: &str) -> bool {
+    token.len() == 67
+        && token.starts_with("ge_")
+        && token[3..].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// Constant-time token compare: length mismatch still exits early (token length is not

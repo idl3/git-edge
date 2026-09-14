@@ -15,14 +15,13 @@ use crate::pack::ingest::extract_links;
 use crate::platform::now_ms;
 use crate::repo_do::{oid, RepoDo};
 use crate::store::{
-    codec, keys, Bucket, Index, ObjLoc, ObjRow, PackId, PackMeta, PackWriter, WriterCkpt,
+    codec, keys, Bucket, Index, ObjLoc, ObjRow, PackId, PackMeta, PackWriter, WriterCkpt, PART,
 };
 
 const ROUND: i64 = 512; // frontier ids per round
 const ROWS: usize = 9_000; // insert_objects cap is 10_000 (1.2)
 const LOAD: u64 = 32 << 20; // A4 read cap per chunk
 const SPANS: usize = 64; // A4: one read_entries call charges <= 64 coalesced spans
-const MIN_PART: u64 = 5 << 20; // R2 non-final part minimum
 const BATCH_N: usize = 90; // idx batch, <= A6's 100 bound params
 /// One buffered read's ceiling: entries with more wire bytes than this are copied
 /// fragment-by-fragment instead of through read_entries (which reads whole entries).
@@ -65,20 +64,44 @@ struct R {
     size: i64,
 }
 #[derive(serde::Deserialize)]
-struct E {
+struct PE {
+    part_no: i64,
     etag: String,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+// container-level serde(default): checkpoints written by older binaries must
+// still parse — a missing field degrades to its zero value (frag=0 = fresh entry)
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+#[serde(default)]
 struct Pos {
     ci: u32,
+    /// bitmap cursor into cands[ci]: the idx of the next entry to copy — or, when
+    /// frag > 0, the idx of the in-flight streamed entry. Only ever points at
+    /// entries whose bytes have landed (or are mid-copy at a checkpoint); it must
+    /// never run ahead of the WriterCkpt, or a replay silently skips entries.
     idx: u32,
     pack: String,
     upload: String,
     st: Option<WriterCkpt>,
+    /// bytes of the in-flight streamed entry already appended at the last
+    /// checkpoint — 0 means the next copy of cands[ci].idx starts at its offset.
+    frag: u64,
     total: u32,
     lo: i64,
     hi: i64,
+}
+
+/// One appended entry's span in the NEW pack — the durable-cursor lookup table.
+/// `checkpoint` uploads uniform parts whose boundaries ignore entry edges, so the
+/// durable offset can land mid-entry; the persisted cursor rewinds to whichever
+/// span (or the in-flight `cur`) contains it.
+#[derive(Clone, Copy)]
+struct Span {
+    ci: u32,
+    idx: u32,
+    ord: u32,
+    off: u64,
+    len: u64,
 }
 
 fn exec(sql: &SqlStorage, q: &str, args: Vec<V>) -> Result<worker::SqlCursor, Error> {
@@ -360,21 +383,47 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
     let bucket = d.bucket()?;
     loop {
         let Some(mut pos) = (match d.meta_opt("gc.pos")? {
-            Some(j) => serde_json::from_str::<Pos>(&j).ok(),
+            Some(j) => Some(
+                // a corrupt cursor is not "nothing to repack" — Done would wipe the job
+                // and strand marked/gc_parts/the ingesting pack forever. Fail loudly.
+                serde_json::from_str::<Pos>(&j)
+                    .map_err(|e| Error::Internal(format!("corrupt gc.pos: {e}")))?,
+            ),
             None => begin_build(d, &sql)?,
         }) else {
             return Ok(SliceOutcome::Done); // nothing to repack: state already wiped
         };
         let key = keys::pack(&bucket.repo, &PackId(pos.pack.clone()));
-        let etags: Vec<String> = exec(&sql, "SELECT etag FROM gc_parts ORDER BY part_no", vec![])?
-            .to_array::<E>()?
+        let etags: Vec<String> = exec(&sql, "SELECT part_no, etag FROM gc_parts ORDER BY part_no", vec![])?
+            .to_array::<PE>()?
             .into_iter()
-            .map(|r| r.etag)
-            .collect();
+            .enumerate()
+            .map(|(i, r)| {
+                // resume re-derives part numbers from position — a gap would silently
+                // rebind every later etag to the wrong part number
+                if r.part_no != i64::try_from(i).unwrap_or(0) + 1 {
+                    Err(Error::Internal("gc_parts not contiguous".into()))
+                } else {
+                    Ok(r.etag)
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        if pos.st.is_none() && !pos.upload.is_empty() {
+            // upload id persisted but no checkpoint: nothing was uploaded — the MPU
+            // is an orphan; abort it rather than recreate-and-leak
+            if let Ok(mpu) = bucket.inner.resume_multipart_upload(&key, &pos.upload) {
+                mpu.abort().await.ok();
+            }
+            pos.upload.clear();
+        }
         let out = if pos.upload.is_empty() {
             let w = PackWriter::create(&bucket, &key, pos.total, &mut budget.req).await?;
-            pos.upload = w.upload_id().await; // upload id commits with the first part;
-            w // a kill before then only orphans the MPU (~7d)
+            pos.upload = w.upload_id().await;
+            // persist immediately: a kill before the first checkpoint would otherwise
+            // leave the id invisible, and the orphan MPU would sit in R2 (~7d) instead
+            // of being aborted on the next slice
+            put(d, "gc.pos", serde_json::to_string(&pos).map_err(|e| Error::Internal(e.to_string()))?)?;
+            w
         } else {
             PackWriter::resume(
                 &bucket,
@@ -414,10 +463,10 @@ async fn build(
         .map(|r| r.pack_id)
         .collect();
     let (mut staged, mut bm): (Vec<ObjRow>, (u32, Vec<u8>)) = (vec![], (u32::MAX, vec![]));
-    // parts drain_parts uploaded mid-entry but no checkpoint has recorded yet —
-    // flushed into gc_parts by the next flush(), in the same span as the WriterCkpt
-    let mut unrecorded: Vec<(u16, String)> = Vec::new();
     let mut ordinal: u32 = pos.st.as_ref().map(|s| s.count).unwrap_or(0);
+    // appended-entry spans + the in-flight entry: the durable-cursor table for flush
+    let mut spans: VecDeque<Span> = VecDeque::new();
+    let mut cur: Option<Span> = None;
     loop {
         if budget.spent_80pct() {
             return Ok(Flow::Yield);
@@ -449,12 +498,13 @@ async fn build(
                         bm.0 = pos.ci;
                     }
                     idxs = bm_idxs_from(&bm.1, pos.idx, BATCH_N);
-                    match idxs.last() {
-                        Some(l) => pos.idx = l.saturating_add(1),
-                        None => {
-                            pos.ci = pos.ci.saturating_add(1);
-                            pos.idx = 0;
-                        }
+                    // pos.idx is NOT advanced at planning time: it is the persisted
+                    // copy cursor and may only move once a chunk's bytes have landed
+                    // — advancing it here would let a checkpoint claim entries that
+                    // were never copied, and a yield would then skip them forever
+                    if idxs.is_empty() {
+                        pos.ci = pos.ci.saturating_add(1);
+                        pos.idx = 0;
                     }
                 }
             }
@@ -479,43 +529,97 @@ async fn build(
             // An entry too big for one buffered read can't ride read_entries (it
             // materializes whole entries and refuses > 48 MiB). Small entries coalesce
             // as before; big ones stream SPAN-sized fragments straight into the writer
-            // via raw_extend, draining full parts as they form. Order stays the chunk's
-            // idx order, so replay is byte-identical.
+            // via raw_extend, checkpointing mid-entry so a slice boundary or a kill
+            // never loses more than ~one buffered part of progress. Order stays the
+            // chunk's idx order, so replay is byte-identical.
             let mut got: HashMap<ObjectId, VecDeque<Vec<u8>>> = HashMap::new();
+            // a frag-resumed small entry rides the streamed path — exclude it here or
+            // its read_entries bytes would be fetched but never consumed
             let small: Vec<(ObjectId, ObjLoc)> = chunk
                 .iter()
-                .filter(|(_, l)| u64::from(l.len) <= SPAN)
+                .filter(|(_, l)| u64::from(l.len) <= SPAN && !(l.idx == pos.idx && pos.frag > 0))
                 .cloned()
                 .collect();
             for (id, entry) in bucket.read_entries(&small, &mut budget.req).await? {
                 got.entry(id).or_default().push_back(entry);
             }
             for (id, l) in &chunk {
-                let (off, len) = if u64::from(l.len) > SPAN {
-                    let start = out.offset();
-                    let key = keys::pack(&bucket.repo, &l.pack);
+                pos.idx = l.idx; // the in-flight cursor: any checkpoint now names this entry
+                if pos.frag > u64::from(l.len) {
+                    return Err(Error::Internal("gc.pos frag past entry end".into()));
+                }
+                let (off, len) = if u64::from(l.len) > SPAN || pos.frag > 0 {
+                    // start = the entry's true offset in the new pack — on a mid-entry
+                    // resume the writer offset already includes pos.frag of this entry
+                    let start = out.offset().saturating_sub(pos.frag);
+                    cur = Some(Span {
+                        ci: pos.ci,
+                        idx: l.idx,
+                        ord: ordinal,
+                        off: start,
+                        len: u64::from(l.len),
+                    });
+                    let src = keys::pack(&bucket.repo, &l.pack);
                     let end = l.offset.saturating_add(u64::from(l.len));
-                    let mut p = l.offset;
+                    // resume mid-entry: pos.frag is bytes already appended & checkpointed
+                    let mut p = l.offset.saturating_add(pos.frag);
                     while p < end {
                         if budget.spent_80pct() {
-                            // mid-entry abandon is safe: nothing commits until the next
-                            // checkpoint, and replay restarts this entry deterministically
+                            // try to checkpoint the progress first — flush persists
+                            // the durable cursor in the same span as the part etags
+                            // + WriterCkpt
+                            if let Some(f) = flush(
+                                d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur,
+                                job_id, budget,
+                            )
+                            .await?
+                            {
+                                return Ok(f);
+                            }
                             return Ok(Flow::Yield);
                         }
                         let frag = bucket
-                            .read_range(&key, p, end.saturating_sub(p).min(SPAN), &mut budget.req)
+                            .read_range(&src, p, end.saturating_sub(p).min(SPAN), &mut budget.req)
                             .await?;
+                        if p == l.offset {
+                            // parity with append_stored's entry_header check: the
+                            // wire header must be a full object matching objects.kind
+                            let (k, _, _) = crate::store::codec::entry_header(&frag)?;
+                            if k != l.kind {
+                                return Err(Error::Internal("objects.kind disagrees with wire header".into()));
+                            }
+                        }
                         p = p.saturating_add(u64::try_from(frag.len()).map_err(|_| Error::Internal("frag".into()))?);
                         out.raw_extend(&frag);
-                        unrecorded.extend(out.drain_parts(MIN_PART as usize, &mut budget.req).await?);
+                        pos.frag = p.saturating_sub(l.offset);
+                        if let Some(f) = flush(
+                            d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur,
+                            job_id, budget,
+                        )
+                        .await?
+                        {
+                            return Ok(f);
+                        }
                     }
-                    out.raw_entry_done(l.kind, start)?
+                    let r = out.raw_entry_done(l.kind, start)?;
+                    spans.push_back(cur.take().ok_or_else(|| {
+                        Error::Internal("streamed entry missing cur span".into())
+                    })?);
+                    r
                 } else {
                     let entry = got
                         .get_mut(id)
                         .and_then(|q| q.pop_front())
                         .ok_or_else(|| Error::Storage("entry missing from read".into()))?;
-                    out.append_stored(&entry)? // verbatim; sha+count inside
+                    let r = out.append_stored(&entry)?; // verbatim; sha+count inside
+                    spans.push_back(Span {
+                        ci: pos.ci,
+                        idx: l.idx,
+                        ord: ordinal,
+                        off: r.0,
+                        len: u64::from(r.1),
+                    });
+                    r
                 };
                 staged.push(ObjRow {
                     sha: *id,
@@ -526,6 +630,8 @@ async fn build(
                     size: l.size,
                 });
                 ordinal = ordinal.saturating_add(1);
+                pos.frag = 0;
+                pos.idx = l.idx.saturating_add(1);
                 if l.kind == Kind::Commit {
                     pos.lo = pos.lo.min(i64::try_from(off).unwrap_or((1 << 53) - 1));
                     pos.hi = pos
@@ -535,8 +641,10 @@ async fn build(
             }
             // flush per chunk, not per batch: `out.part` would otherwise accumulate the
             // whole 90-entry batch (~1.4 GiB of buffered pack bytes) and OOM the isolate
-            if let Some(f) =
-                flush(d, sql, bucket, key, &mut out, pos, &mut staged, &mut unrecorded, job_id, budget).await?
+            if let Some(f) = flush(
+                d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job_id, budget,
+            )
+            .await?
             {
                 return Ok(f);
             }
@@ -548,17 +656,23 @@ async fn build(
         // a multi-MiB chunk loop can run past the 60 s straggler window on slow R2 —
         // heartbeat so repair doesn't requeue a live consolidate into a duplicate slice
         super::heartbeat(sql, job_id)?;
-        if let Some(f) = flush(d, sql, bucket, key, &mut out, pos, &mut staged, &mut unrecorded, job_id, budget).await? {
+        if let Some(f) = flush(
+            d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job_id, budget,
+        )
+        .await?
+        {
             return Ok(f);
         }
     }
 }
 
-/// Upload the buffered part once it reaches MIN_PART, then commit — one span — the rows, the
-/// etags and the position. `unrecorded` holds parts drain_parts already uploaded mid-entry;
-/// they must join gc_parts in this same span, alongside the WriterCkpt that accounts for
-/// their bytes — recorded earlier, resume would count parts the checkpoint state doesn't.
-/// The sub-5 MiB tail is never checkpointed: finish folds it into the final part.
+/// Upload every full PART-sized part, then commit — one span — the rows, the etags and
+/// the position. Parts are uniform because R2 rejects complete() when non-final part
+/// sizes differ. The durable boundary (WriterCkpt.pos = appended minus buffered) can
+/// land mid-entry and even inside an entry that finished copying: the persisted cursor
+/// rewinds (ci, idx, frag) to the entry containing that byte — and st.count to its
+/// ordinal — so a resume re-copies only bytes that were never uploaded. The in-memory
+/// pos keeps the appended cursor; only the serialized copy rewinds.
 async fn flush(
     d: &RepoDo,
     sql: &SqlStorage,
@@ -567,30 +681,62 @@ async fn flush(
     out: &mut PackWriter,
     pos: &mut Pos,
     staged: &mut Vec<ObjRow>,
-    unrecorded: &mut Vec<(u16, String)>,
+    spans: &mut VecDeque<Span>,
+    cur: &Option<Span>,
     job_id: i64,
     budget: &mut SliceBudget,
 ) -> Result<Option<Flow>, Error> {
-    if out.buffered() < MIN_PART {
-        return Ok(None);
+    let mut news: Vec<(u16, String)> = Vec::new();
+    let mut st = None;
+    while out.buffered() >= PART as u64 {
+        match out.checkpoint(&mut budget.req).await {
+            Ok(Some((n, e, s))) => {
+                news.push((n, e));
+                st = Some(s);
+            }
+            Ok(None) => break,
+            Err(e) => return mpu_err(d, sql, bucket, key, pos, e, budget).await.map(Some),
+        }
     }
-    let Some((part_no, etag, st)) = (match out.checkpoint(&mut budget.req).await {
-        Ok(x) => x,
-        Err(e) => return mpu_err(d, sql, bucket, key, pos, e, budget).await.map(Some),
-    }) else {
-        return Ok(None);
-    };
+    let Some(mut st) = st else { return Ok(None) };
     Index(sql).insert_objects(&PackId(pos.pack.clone()), staged)?; // OR IGNORE: replay-safe
     staged.clear();
-    for (no, tag) in unrecorded.drain(..).chain(std::iter::once((part_no, etag))) {
+    for (n, e) in news {
         exec(
             sql,
             "INSERT OR REPLACE INTO gc_parts(part_no,etag) VALUES(?,?)",
-            vec![i64::from(no).into(), tag.into()],
+            vec![i64::from(n).into(), e.into()],
         )?;
     }
-    pos.st = Some(st);
-    put(d, "gc.pos", serde_json::to_string(pos).map_err(|e| Error::Internal(e.to_string()))?)?;
+    // durable = last uploaded byte. If it falls short of appended, the persisted
+    // cursor must point at the entry containing it (buffered bytes die with the slice)
+    let durable = st.pos;
+    let mut pp = pos.clone();
+    if durable < out.offset() {
+        let hit = cur
+            .filter(|c| durable >= c.off)
+            .or_else(|| spans.iter().copied().find(|s| durable >= s.off && durable < s.off + s.len));
+        let Some(s) = hit else {
+            return Err(Error::Internal(format!(
+                "durable boundary {durable} outside appended spans"
+            )));
+        };
+        pp.ci = s.ci;
+        pp.idx = s.idx;
+        pp.frag = durable - s.off;
+        st.count = s.ord; // entries fully durable = the boundary entry's ordinal
+    }
+    pp.st = Some(st);
+    put(
+        d,
+        "gc.pos",
+        serde_json::to_string(&pp).map_err(|e| Error::Internal(e.to_string()))?,
+    )?;
+    pos.st = pp.st;
+    // spans behind the durable boundary can't contain a later one — durable is monotone
+    while spans.front().map(|s| s.off + s.len <= durable) == Some(true) {
+        spans.pop_front();
+    }
     super::heartbeat(sql, job_id)?; // checkpoint span: refresh the repair lease
     Ok(None)
 }
@@ -681,6 +827,9 @@ fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
             vec![now_ms().into(), p.into()],
         )?;
     }
+    // stale gc_parts from a dead build must not survive into the new upload — resume
+    // numbers parts by these rows, so leftovers would rebind etags to wrong part numbers
+    exec(sql, "DELETE FROM gc_parts", vec![])?;
     let pack = PackId::random()?;
     exec(
         sql,

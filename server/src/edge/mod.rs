@@ -99,15 +99,22 @@ impl BodyReader {
     /// Consume the rest of the request body, bounded. On error paths the response
     /// must not go out while the client is still uploading — Cloudflare resets the
     /// connection and the client sees a transport failure instead of our report-status.
-    /// The cap keeps a never-ending upload from pinning the isolate; past it we answer
-    /// anyway (status quo, strictly better than not draining at all).
+    /// Bounded by bytes AND wall-clock: a stalled or slow-drip client could otherwise
+    /// pin the isolate forever — idle awaits don't burn the cpu_ms budget.
     pub async fn drain(&mut self) {
         const MAX_DRAIN: u64 = 2 << 30; // the same ceiling a pushed pack gets
+        const IDLE_MS: u64 = 15_000; // per-chunk stall bound, not total
         self.buf.clear();
         while self.total < MAX_DRAIN && !self.eof {
-            match self.stream.next().await {
-                Some(Ok(chunk)) => self.total = self.total.saturating_add(chunk.len() as u64),
-                Some(Err(_)) | None => break,
+            let next = self.stream.next();
+            let timeout = worker::Delay::from(std::time::Duration::from_millis(IDLE_MS));
+            futures_util::pin_mut!(next, timeout);
+            match futures_util::future::select(next, timeout).await {
+                futures_util::future::Either::Left((Some(Ok(chunk)), _)) => {
+                    self.total = self.total.saturating_add(chunk.len() as u64);
+                }
+                // stream end, read error, or stalled past IDLE_MS — answer anyway
+                _ => break,
             }
         }
     }
@@ -355,7 +362,23 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<R
 /// more credentials. The token value is returned once and only its hash is stored.
 async fn token_create(mut req: Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
     auth::authenticate_admin(&req, env)?;
+    // {name, level} needs a few hundred bytes; cap before buffering the body whole
+    let too_big = req
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|n| n > 65_536)
+        .unwrap_or(false);
+    if too_big {
+        return Err(Error::Protocol("token create body too large".into()));
+    }
     let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    if body.len() > 65_536 {
+        // chunked upload had no content-length to check up front
+        return Err(Error::Protocol("token create body too large".into()));
+    }
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("token create body: {e}")))?;
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
