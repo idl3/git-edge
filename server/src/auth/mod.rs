@@ -1,10 +1,13 @@
-//! Edge authentication (CONTRACTS.md 1.1/8): GE_READ_TOKEN, GE_WRITE_TOKEN.
-//! Runs before the DO is woken. Anonymous gets a 401 challenge; a read token on a write
-//! route gets 403, not a second challenge.
+//! Edge authentication (CONTRACTS.md 1.1/8): GE_READ_TOKEN, GE_WRITE_TOKEN, then
+//! per-repo tokens held by the repo's DO. Global secrets answer without waking the
+//! DO; anything else is one `/_do/auth` round-trip. Anonymous gets a 401 challenge;
+//! a read-level token on a write route gets 403, not a second challenge.
 
 use worker::{Env, Request};
 
 use crate::error::Error;
+use crate::wire::http::{stub_json, RepoRoute};
+use crate::ReqBudget;
 
 #[derive(Clone, Copy)]
 pub enum Level {
@@ -23,8 +26,18 @@ fn scheme<'a>(hdr: &'a str, name: &str) -> Option<&'a str> {
     (s.eq_ignore_ascii_case(name) && rest.starts_with(' ')).then(|| &rest[1..])
 }
 
-/// Returns the principal string recorded in the reflog.
-pub fn authenticate(req: &Request, env: &Env, need: Level) -> Result<String, Error> {
+/// sha1 hex of a presented token — the DO stores hashes, never raw tokens, so the
+/// edge sends only the hash across the stub boundary.
+pub fn token_hash(token: &str) -> String {
+    let mut h = gix_hash::hasher(gix_hash::Kind::Sha1);
+    h.update(token.as_bytes());
+    h.try_finalize()
+        .map(|id| id.to_string())
+        .unwrap_or_default()
+}
+
+/// Extract (token, principal) from the Authorization header.
+fn credentials(req: &Request) -> Result<(String, String), Error> {
     let hdr = req
         .headers()
         .get("authorization")
@@ -48,6 +61,25 @@ pub fn authenticate(req: &Request, env: &Env, need: Level) -> Result<String, Err
     if token.is_empty() {
         return Err(Error::Auth);
     }
+    Ok((token, principal))
+}
+
+/// Deployment-admin check: the global write token only. Token management can't be
+/// delegated to repo-level tokens or any write holder could mint more credentials.
+pub fn authenticate_admin(req: &Request, env: &Env) -> Result<String, Error> {
+    let (token, principal) = credentials(req)?;
+    let write = secret_opt(env, "GE_WRITE_TOKEN");
+    if write.map(|w| ct_eq(token.as_bytes(), w.as_bytes())) == Some(true) {
+        Ok(principal)
+    } else {
+        Err(Error::Auth)
+    }
+}
+
+/// Returns the principal string recorded in the reflog — for a repo token, its
+/// admin-assigned name, so pushes attribute to a meaningful identity.
+pub async fn authenticate(req: &Request, env: &Env, need: Level, route: &RepoRoute) -> Result<String, Error> {
+    let (token, principal) = credentials(req)?;
     // optional for read-only deployments: an unset write secret just never matches,
     // it must not 500 a read route
     let write = secret_opt(env, "GE_WRITE_TOKEN");
@@ -55,22 +87,36 @@ pub fn authenticate(req: &Request, env: &Env, need: Level) -> Result<String, Err
         return Ok(principal);
     }
     let read = secret_opt(env, "GE_READ_TOKEN");
-    match need {
-        Level::Read => {
-            if read.map(|r| ct_eq(token.as_bytes(), r.as_bytes())) == Some(true) {
-                Ok(principal)
-            } else {
-                Err(Error::Auth)
-            }
-        }
-        Level::Write => {
+    if read.map(|r| ct_eq(token.as_bytes(), r.as_bytes())) == Some(true) {
+        return match need {
+            Level::Read => Ok(principal),
             // a valid read token is forbidden, not unauthenticated: no second challenge
-            if read.map(|r| ct_eq(token.as_bytes(), r.as_bytes())) == Some(true) {
-                Err(Error::Forbidden)
-            } else {
-                Err(Error::Auth)
-            }
-        }
+            Level::Write => Err(Error::Forbidden),
+        };
+    }
+    // per-repo tokens live in the DO's tokens table — one stub call. Storage errors
+    // fail closed (propagate): never silently treat a DO failure as unauthenticated.
+    #[derive(serde::Deserialize)]
+    struct AuthRow {
+        level: String,
+        name: String,
+    }
+    let stub = route.stub(env)?;
+    let mut budget = ReqBudget::paid();
+    let row: Result<AuthRow, Error> = stub_json(
+        &stub,
+        route,
+        "/_do/auth",
+        &serde_json::json!({ "hash": token_hash(&token) }),
+        &mut budget,
+    )
+    .await;
+    match row {
+        Ok(r) if r.level == "write" => Ok(r.name),
+        Ok(r) if matches!(need, Level::Read) => Ok(r.name),
+        Ok(_) => Err(Error::Forbidden), // repo read token on a write route
+        Err(Error::Auth) | Err(Error::NotFound) => Err(Error::Auth),
+        Err(e) => Err(e),
     }
 }
 

@@ -44,6 +44,19 @@ struct BeginDto {
     principal: String,
 }
 #[derive(serde::Deserialize)]
+struct AuthDto {
+    hash: String,
+}
+#[derive(serde::Deserialize)]
+struct NewToken {
+    name: String,
+    level: String,
+}
+#[derive(serde::Deserialize)]
+struct RevokeDto {
+    id: String,
+}
+#[derive(serde::Deserialize)]
 struct N {
     n: i64,
 }
@@ -98,6 +111,10 @@ impl DurableObject for RepoDo {
                     self.commit_push(&parse::<CommitRequest>(&body)?).and_then(|r| json(serde_json::to_value(&r)?))
                 }
                 (Method::Post, "/_do/ls-refs") => self.ls_refs(&meta, &body),
+                (Method::Post, "/_do/auth") => self.auth_lookup(&parse(&body)?),
+                (Method::Post, "/_do/tokens") => self.token_create(&parse(&body)?),
+                (Method::Get, "/_do/tokens") => self.token_list(),
+                (Method::Post, "/_do/tokens/revoke") => self.token_revoke(&parse(&body)?),
                 _ => return Ok(None),
             }
             .map(Some)
@@ -312,7 +329,82 @@ impl RepoDo {
             "jobs_dead": count("SELECT COUNT(*) AS n FROM jobs WHERE state='dead'")?,
             "pushes": count("SELECT COUNT(*) AS n FROM pushes")?,
             "marked": count("SELECT COUNT(*) AS n FROM marked")?,
+            "tokens": count("SELECT COUNT(*) AS n FROM tokens")?,
         }))
+    }
+
+    /// POST /_do/auth {hash} — edge authenticates a presented token by its sha1 hash.
+    /// The raw token never crosses the stub boundary. No row: Auth, which the edge
+    /// maps back to a 401 challenge.
+    fn auth_lookup(&self, b: &AuthDto) -> Result<Response, Error> {
+        #[derive(serde::Deserialize)]
+        struct R {
+            level: String,
+            name: String,
+        }
+        let row = self
+            .q("SELECT level, name FROM tokens WHERE hash=?", vec![V::from(b.hash.as_str())])?
+            .to_array::<R>()?
+            .into_iter()
+            .next()
+            .ok_or(Error::Auth)?;
+        json(serde_json::json!({ "level": row.level, "name": row.name }))
+    }
+
+    /// POST /_do/tokens {name, level} — the edge has already gated this on the global
+    /// write token. Returns the token value once; only its sha1 hash is stored.
+    fn token_create(&self, b: &NewToken) -> Result<Response, Error> {
+        if !matches!(b.level.as_str(), "read" | "write") {
+            return Err(Error::Protocol("level must be read or write".into()));
+        }
+        if b.name.is_empty() || b.name.len() > 128 {
+            return Err(Error::Protocol("name must be 1-128 bytes".into()));
+        }
+        let n = self.q("SELECT COUNT(*) AS n FROM tokens", vec![])?.one::<N>()?.n;
+        if n >= 256 {
+            return Err(Error::Limit("too many tokens (256 max)".into()));
+        }
+        let token = format!("ge_{}{}", platform::hex16()?, platform::hex16()?);
+        let id = platform::hex16()?;
+        self.q(
+            "INSERT INTO tokens(id,hash,level,name,created_at) VALUES(?,?,?,?,?)",
+            vec![
+                V::from(id.as_str()),
+                V::from(crate::auth::token_hash(&token)),
+                V::from(b.level.as_str()),
+                V::from(b.name.as_str()),
+                V::from(platform::now_ms()),
+            ],
+        )?;
+        json(serde_json::json!({ "id": id, "token": token, "level": b.level, "name": b.name }))
+    }
+
+    /// GET /_do/tokens — id/name/level only; hashes and token values never leave.
+    fn token_list(&self) -> Result<Response, Error> {
+        #[derive(serde::Deserialize)]
+        struct T {
+            id: String,
+            name: String,
+            level: String,
+            created_at: i64,
+        }
+        let rows = self
+            .q("SELECT id, name, level, created_at FROM tokens ORDER BY created_at", vec![])?
+            .to_array::<T>()?;
+        json(serde_json::json!({
+            "tokens": rows
+                .iter()
+                .map(|t| serde_json::json!({
+                    "id": t.id, "name": t.name, "level": t.level, "created_at": t.created_at,
+                }))
+                .collect::<Vec<_>>()
+        }))
+    }
+
+    /// POST /_do/tokens/revoke {id}.
+    fn token_revoke(&self, b: &RevokeDto) -> Result<Response, Error> {
+        self.q("DELETE FROM tokens WHERE id=?", vec![V::from(b.id.as_str())])?;
+        json(serde_json::json!({ "revoked": self.changes()? > 0 }))
     }
 
     /// GET /_do/refs (1.3, awaits: none).

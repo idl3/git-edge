@@ -471,6 +471,36 @@ impl PackWriter {
         self.count = self.count.saturating_add(1);
         Ok((offset, len))
     }
+    /// Current write offset — the caller records it before a chunked raw entry so
+    /// `raw_entry_done` can derive the entry's wire length.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+    /// Bytes buffered but not yet uploaded — GC gates its checkpoint on this reaching
+    /// the 5 MiB non-final-part minimum.
+    pub fn buffered(&self) -> u64 {
+        self.part.len() as u64
+    }
+    /// Append raw pack bytes verbatim: any chunk of an entry's `varint header + zlib
+    /// body`, exactly as it appeared in the source pack. The caller ends each logical
+    /// entry with `raw_entry_done` — checkpoints and index rows must never split one.
+    pub fn raw_extend(&mut self, bytes: &[u8]) {
+        self.part.extend_from_slice(bytes);
+        self.sha1.update(bytes);
+        self.offset = self.offset.saturating_add(bytes.len() as u64);
+    }
+    /// Seal an entry appended via `raw_extend`; `start` was `offset()` before its first
+    /// chunk. Returns (offset, len) for the index row — same contract as append_entry.
+    pub fn raw_entry_done(&mut self, kind: Kind, start: u64) -> Result<(u64, u32), Error> {
+        let len = u32::try_from(self.offset.saturating_sub(start))
+            .map_err(|_| Error::Limit("entry too long".into()))?;
+        if kind == Kind::Commit {
+            self.commit_lo = self.commit_lo.min(start);
+            self.commit_hi = self.offset;
+        }
+        self.count = self.count.saturating_add(1);
+        Ok((start, len))
+    }
     /// Uploads whole 8 MiB parts while the buffer holds that much.
     pub async fn flush_if_full(&mut self, budget: &mut ReqBudget) -> Result<(), Error> {
         while self.part.len() >= PART {
@@ -555,6 +585,29 @@ impl PackWriter {
         }
         self.count = self.count.saturating_add(1);
         Ok((offset, len))
+    }
+
+    /// Upload buffered bytes in `min`-sized parts while at least `min` remains, returning
+    /// each (part_no, etag) in order. GC's verbatim copy of an entry too large to buffer
+    /// whole drains as it goes — the caller must persist the returned parts at the next
+    /// checkpoint (never earlier: a part in gc_parts without a matching WriterCkpt breaks
+    /// resume's part numbering).
+    pub async fn drain_parts(
+        &mut self,
+        min: usize,
+        budget: &mut ReqBudget,
+    ) -> Result<Vec<(u16, String)>, Error> {
+        let mut uploaded = Vec::new();
+        while self.part.len() >= min {
+            let chunk: Vec<u8> = self.part.drain(..min).collect();
+            let n = u16::try_from(self.parts.len().saturating_add(1))
+                .map_err(|_| Error::Limit("too many parts".into()))?;
+            budget.charge(1)?;
+            let p = self.mpu.upload_part(n, chunk).await?;
+            uploaded.push((p.part_number(), p.etag()));
+            self.parts.push(p);
+        }
+        Ok(uploaded)
     }
 
     /// Force-upload the buffered part as the next part when it is non-empty (callers guarantee
@@ -866,6 +919,8 @@ pub mod schema {
         "CREATE TABLE IF NOT EXISTS gc_frontier (sha TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_seen (sha TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_parts (part_no INTEGER PRIMARY KEY, etag TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL, level TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID",
+        "CREATE INDEX IF NOT EXISTS tokens_hash ON tokens(hash)",
     ];
     /// Columns added after first deploy. CREATE TABLE IF NOT EXISTS never updates an
     /// existing table, so DOs booted under an older schema need ALTER TABLE — SQLite

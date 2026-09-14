@@ -3,9 +3,10 @@
 //! gc_seen, gc_parts, gc.* meta), so a requeued 'running' row resumes mid-flight and a kill
 //! mid-slice replays idempotently.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use gix_hash::ObjectId;
+use gix_object::Kind;
 use worker::{SqlStorage, SqlStorageValue as V};
 
 use super::{enqueue, Job, JobKind, SliceBudget, SliceOutcome};
@@ -23,6 +24,9 @@ const LOAD: u64 = 32 << 20; // A4 read cap per chunk
 const SPANS: usize = 64; // A4: one read_entries call charges <= 64 coalesced spans
 const MIN_PART: u64 = 5 << 20; // R2 non-final part minimum
 const BATCH_N: usize = 90; // idx batch, <= A6's 100 bound params
+/// One buffered read's ceiling: entries with more wire bytes than this are copied
+/// fragment-by-fragment instead of through read_entries (which reads whole entries).
+const SPAN: u64 = 8 << 20;
 
 #[derive(serde::Deserialize)]
 struct N {
@@ -409,8 +413,10 @@ async fn build(
         .into_iter()
         .map(|r| r.pack_id)
         .collect();
-    let (mut staged, mut bm, mut in_part): (Vec<ObjRow>, (u32, Vec<u8>), u64) =
-        (vec![], (u32::MAX, vec![]), 0);
+    let (mut staged, mut bm): (Vec<ObjRow>, (u32, Vec<u8>)) = (vec![], (u32::MAX, vec![]));
+    // parts drain_parts uploaded mid-entry but no checkpoint has recorded yet —
+    // flushed into gc_parts by the next flush(), in the same span as the WriterCkpt
+    let mut unrecorded: Vec<(u16, String)> = Vec::new();
     let mut ordinal: u32 = pos.st.as_ref().map(|s| s.count).unwrap_or(0);
     loop {
         if budget.spent_80pct() {
@@ -470,23 +476,57 @@ async fn build(
             if budget.spent_80pct() {
                 return Ok(Flow::Yield); // the inner batch can run ~90 reads — still bounded
             }
-            for (id, entry) in bucket.read_entries(&chunk, &mut budget.req).await? {
-                let r = rows
-                    .iter()
-                    .find(|r| r.sha == id.to_string())
-                    .ok_or_else(|| Error::Internal("row".into()))?;
-                let (off, len) = out.append_stored(&entry)?; // verbatim; sha+count inside
+            // An entry too big for one buffered read can't ride read_entries (it
+            // materializes whole entries and refuses > 48 MiB). Small entries coalesce
+            // as before; big ones stream SPAN-sized fragments straight into the writer
+            // via raw_extend, draining full parts as they form. Order stays the chunk's
+            // idx order, so replay is byte-identical.
+            let mut got: HashMap<ObjectId, VecDeque<Vec<u8>>> = HashMap::new();
+            let small: Vec<(ObjectId, ObjLoc)> = chunk
+                .iter()
+                .filter(|(_, l)| u64::from(l.len) <= SPAN)
+                .cloned()
+                .collect();
+            for (id, entry) in bucket.read_entries(&small, &mut budget.req).await? {
+                got.entry(id).or_default().push_back(entry);
+            }
+            for (id, l) in &chunk {
+                let (off, len) = if u64::from(l.len) > SPAN {
+                    let start = out.offset();
+                    let key = keys::pack(&bucket.repo, &l.pack);
+                    let end = l.offset.saturating_add(u64::from(l.len));
+                    let mut p = l.offset;
+                    while p < end {
+                        if budget.spent_80pct() {
+                            // mid-entry abandon is safe: nothing commits until the next
+                            // checkpoint, and replay restarts this entry deterministically
+                            return Ok(Flow::Yield);
+                        }
+                        let frag = bucket
+                            .read_range(&key, p, end.saturating_sub(p).min(SPAN), &mut budget.req)
+                            .await?;
+                        p = p.saturating_add(u64::try_from(frag.len()).map_err(|_| Error::Internal("frag".into()))?);
+                        out.raw_extend(&frag);
+                        unrecorded.extend(out.drain_parts(MIN_PART as usize, &mut budget.req).await?);
+                    }
+                    out.raw_entry_done(l.kind, start)?
+                } else {
+                    let entry = got
+                        .get_mut(id)
+                        .and_then(|q| q.pop_front())
+                        .ok_or_else(|| Error::Storage("entry missing from read".into()))?;
+                    out.append_stored(&entry)? // verbatim; sha+count inside
+                };
                 staged.push(ObjRow {
-                    sha: id,
+                    sha: *id,
                     idx: ordinal,
                     offset: off,
                     len,
-                    kind: loc(r)?.1.kind,
-                    size: u64::try_from(r.size).map_err(|_| Error::Internal("size".into()))?,
+                    kind: l.kind,
+                    size: l.size,
                 });
                 ordinal = ordinal.saturating_add(1);
-                in_part = in_part.saturating_add(u64::from(len));
-                if r.kind == 1 {
+                if l.kind == Kind::Commit {
                     pos.lo = pos.lo.min(i64::try_from(off).unwrap_or((1 << 53) - 1));
                     pos.hi = pos
                         .hi
@@ -495,12 +535,10 @@ async fn build(
             }
             // flush per chunk, not per batch: `out.part` would otherwise accumulate the
             // whole 90-entry batch (~1.4 GiB of buffered pack bytes) and OOM the isolate
-            if in_part >= MIN_PART {
-                if let Some(f) =
-                    flush(d, sql, bucket, key, &mut out, pos, &mut staged, &mut in_part, job_id, budget).await?
-                {
-                    return Ok(f);
-                }
+            if let Some(f) =
+                flush(d, sql, bucket, key, &mut out, pos, &mut staged, &mut unrecorded, job_id, budget).await?
+            {
+                return Ok(f);
             }
         }
         if staged.len() >= ROWS {
@@ -510,15 +548,17 @@ async fn build(
         // a multi-MiB chunk loop can run past the 60 s straggler window on slow R2 —
         // heartbeat so repair doesn't requeue a live consolidate into a duplicate slice
         super::heartbeat(sql, job_id)?;
-        if let Some(f) = flush(d, sql, bucket, key, &mut out, pos, &mut staged, &mut in_part, job_id, budget).await? {
+        if let Some(f) = flush(d, sql, bucket, key, &mut out, pos, &mut staged, &mut unrecorded, job_id, budget).await? {
             return Ok(f);
         }
     }
 }
 
 /// Upload the buffered part once it reaches MIN_PART, then commit — one span — the rows, the
-/// etag and the position. The sub-5 MiB tail is never checkpointed: finish folds it into the
-/// final part (R2's last-part rule).
+/// etags and the position. `unrecorded` holds parts drain_parts already uploaded mid-entry;
+/// they must join gc_parts in this same span, alongside the WriterCkpt that accounts for
+/// their bytes — recorded earlier, resume would count parts the checkpoint state doesn't.
+/// The sub-5 MiB tail is never checkpointed: finish folds it into the final part.
 async fn flush(
     d: &RepoDo,
     sql: &SqlStorage,
@@ -527,11 +567,11 @@ async fn flush(
     out: &mut PackWriter,
     pos: &mut Pos,
     staged: &mut Vec<ObjRow>,
-    in_part: &mut u64,
+    unrecorded: &mut Vec<(u16, String)>,
     job_id: i64,
     budget: &mut SliceBudget,
 ) -> Result<Option<Flow>, Error> {
-    if *in_part < MIN_PART {
+    if out.buffered() < MIN_PART {
         return Ok(None);
     }
     let Some((part_no, etag, st)) = (match out.checkpoint(&mut budget.req).await {
@@ -540,14 +580,15 @@ async fn flush(
     }) else {
         return Ok(None);
     };
-    *in_part = 0;
     Index(sql).insert_objects(&PackId(pos.pack.clone()), staged)?; // OR IGNORE: replay-safe
     staged.clear();
-    exec(
-        sql,
-        "INSERT OR REPLACE INTO gc_parts(part_no,etag) VALUES(?,?)",
-        vec![i64::from(part_no).into(), etag.into()],
-    )?;
+    for (no, tag) in unrecorded.drain(..).chain(std::iter::once((part_no, etag))) {
+        exec(
+            sql,
+            "INSERT OR REPLACE INTO gc_parts(part_no,etag) VALUES(?,?)",
+            vec![i64::from(no).into(), tag.into()],
+        )?;
+    }
     pos.st = Some(st);
     put(d, "gc.pos", serde_json::to_string(pos).map_err(|e| Error::Internal(e.to_string()))?)?;
     super::heartbeat(sql, job_id)?; // checkpoint span: refresh the repair lease
