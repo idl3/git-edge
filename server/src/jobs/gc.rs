@@ -282,7 +282,7 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
         for chunk in chunks(&loads) {
             let ids: Vec<String> = chunk.iter().map(|(id, _)| id.to_string()).collect();
             let mut kids: Vec<String> = Vec::new();
-            for (_id, entry) in bucket.read_entries(&chunk, &mut budget.req).await? {
+            for (_id, entry) in bucket.read_entries_chunked(&chunk, &mut budget.req).await? {
                 let (kind, data) = codec::decode_entry(&entry)?; // A7 cap inside
                 for l in extract_links(kind, &data)? {
                     kids.push(l.to_string());
@@ -540,7 +540,7 @@ async fn build(
                 .filter(|(_, l)| u64::from(l.len) <= SPAN && !(l.idx == pos.idx && pos.frag > 0))
                 .cloned()
                 .collect();
-            for (id, entry) in bucket.read_entries(&small, &mut budget.req).await? {
+            for (id, entry) in bucket.read_entries_chunked(&small, &mut budget.req).await? {
                 got.entry(id).or_default().push_back(entry);
             }
             for (id, l) in &chunk {
