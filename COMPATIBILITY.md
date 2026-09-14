@@ -159,8 +159,12 @@ truncation, or corrupted ref state.
 8. **No LFS.** Full objects now stream verbatim up to the 2 GiB pending-pack
    bound, so ordinary large blobs are fine — but anything pushed *as a delta*
    whose result exceeds 16 MiB is still rejected (`unpack object too large`),
-   and the ~100 MB platform body cap applies per request. Very large assets
-   should still live outside git.
+   and a REF_DELTA whose *base* is a streamed >16 MiB object is rejected with
+   `delta base <oid> exceeds 16 MiB`. Note `git push --no-thin` does **not**
+   prevent a client from sending REF_DELTA (verified on git 2.54) — the
+   reliable workaround is pushing the object undeltified, e.g.
+   `git -c core.bigFileThreshold=1 push`. The ~100 MB platform body cap
+   applies per request. Very large assets should still live outside git.
 9. **No hooks, repo rename/delete, or web UI.** A repo is created by pushing to
    it; `/_state` (write-auth) and `/_admin/tokens` are the only introspection /
    management endpoints. Basic request metrics (op, status, ms, subrequests per
