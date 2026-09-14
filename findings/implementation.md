@@ -289,3 +289,65 @@ Verified: conformance `== PASS` locally and on prod; 30 MiB blob push (9 s) +
 clone fsck-clean byte-identical on prod; 20 MiB blob through GC consolidate
 locally (streamed copy, fsck clean); token create/use/403/401/revoke on prod;
 delta-over-cap `unpack`/`ng` report-status on prod.
+
+## Round 6 — post-feature audit (5 parallel auditors + adversarial executor)
+
+Findings fixed this round:
+
+- **GC cursor claimed unwritten entries (P0, fixed).** `pos.idx` advanced a
+  whole planned batch at *planning* time; a checkpoint after the first chunk
+  persisted a cursor past uncopied entries — replay skipped them, `count !=
+  expected` wedged consolidate into a rebuild loop. `pos` now advances per
+  completed entry; `pos.frag` records mid-entry fragment progress (serde
+  `default` keeps old checkpoints parseable).
+- **Non-uniform MPU parts (P0, fixed).** `checkpoint()` drained the whole
+  variable-size buffer as one part; R2 (and miniflare) reject `complete()`
+  when non-final parts differ in size — `BadUpload` 10048, retry/rebuild
+  loop forever. `checkpoint()` now drains exactly `PART` (8 MiB) per call,
+  `sha1` feeds only at upload so `WriterCkpt` describes the durable prefix,
+  and `flush()` rewinds the *persisted* cursor (ci, idx, frag, count) to the
+  entry containing the durable byte — buffered bytes are never claimed.
+- **Meta crash masked real errors (P1, fixed).** `RepoDo::meta()` called
+  `cursor.one()` on possibly-empty results; the missing `gc.fails` row threw
+  uncatchably across the JS/WASM boundary ("Critical error"), hiding the
+  root error and looking like an isolate crash. `meta()` now delegates to
+  `meta_opt()` — a missing key is a catchable storage error.
+- **Delta-base prefetch shadowed the actionable error (P1, fixed).** The
+  external-base prefetch called `decode_entry` on a streamed >16 MiB base,
+  throwing `object too large` before `external()`'s friendly message; bases
+  over `MAX_OBJ` are now excluded from prefetch. Verified locally:
+  `unpack delta base <sha> exceeds 16 MiB; push the object as a full blob
+  (e.g. git -c core.bigFileThreshold=1 push)` — and the workaround push
+  lands byte-identical. Note `git push --no-thin` still sends REF_DELTA on
+  git 2.54 — the message no longer suggests it.
+- **Auth hardening (P1/P2, fixed).** `token_hash` returns `Result` (a hash
+  failure can no longer collapse to an empty hash); a `ge_`-prefix prefilter
+  rejects non-token strings before the DO lookup; token levels must be
+  exactly `read`/`write`; admin token bodies are bounded (64 KiB).
+- **Drain deadline (P2, fixed).** `BodyReader::drain` now races each read
+  against `worker::Delay` — a stalled client can't hold the isolate on I/O
+  await forever.
+
+Adversarial executor (independent, final binary): 16 MiB boundary push
+byte-exact; delta-result-over-cap `unpack`/`ng` clean; REF_DELTA against
+streamed bases fails deterministically in all four variants (external,
+in-pack, forward-ref, oversized-window); token API edges all correct;
+CAS failure yields `ng` report-status; `clone --filter=blob:none` backfills
+the 17 MiB blob byte-identical.
+
+Verified after fixes: conformance `== PASS` on the fixed binary; fresh
+22 MiB + 18 MiB blob repo consolidated by GC (`packs_live 2 -> 1`, uniform
+8 MiB parts in miniflare's R2 state) with a byte-identical fsck-clean clone.
+
+Remaining known gaps (documented, not blocking):
+
+- A repo whose GC build began under the pre-fix binary has stale
+  `gc_parts`/non-uniform parts; resume fails `InvalidPart`/`BadUpload`,
+  `gc.fails` reaches 2 and the Rebuild path wipes and restarts uniformly —
+  self-healing, at most a couple of backoff cycles.
+- `jobs` repair requeues `running` rows after the 60 s lease; two
+  overlapping executions could interleave awaited writes. Heartbeats at
+  every checkpoint narrow the window; lease fencing remains the guard.
+- Error responses still drop `x-ge-subrequests` (P3 observability).
+- `coalesce` keeps a defensive `unwrap_or(u32::MAX)` on a value bounded by
+  WINDOW (P3); a future invariant change should fail loudly instead.

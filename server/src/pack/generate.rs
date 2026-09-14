@@ -594,7 +594,9 @@ fn coalesce(pack: usize, locs: &[ObjLoc], gap: u64) -> Vec<Read> {
                         pack,
                         off: pos,
                         len: n,
-                        ents: vec![(pos, u32::try_from(n).unwrap_or(u32::MAX))],
+                        // n <= WINDOW = 8 MiB — the cast cannot fail; panic if that
+                        // ever changes rather than silently truncating the copy span
+                        ents: vec![(pos, u32::try_from(n).expect("fragment <= WINDOW"))],
                     });
                     pos = pos.saturating_add(n);
                 }

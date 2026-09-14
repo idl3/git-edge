@@ -25,10 +25,15 @@ pub struct EntryRec {
     pub size: u64,
 }
 
-// EntryRec is ~40 B (offset + Header enum + two lengths): the record vec alone must
-// leave room for Cache (48 MiB) + window + part buffer inside a 128 MiB isolate
-const MAX_ENTRIES: usize = 1_000_000;
+// EntryRec is ~48 B (offset + Header enum + two lengths + u64 size): the record vec
+// alone must leave room for Cache (48 MiB) + window + part buffer inside a 128 MiB
+// isolate — 750k records ≈ 36 MiB keeps the worst-case sum comfortably under it
+const MAX_ENTRIES: usize = 750_000;
 const MAX_OBJ: u64 = 16 << 20; // A7
+/// A8: ceiling on a streamed blob's *decompressed* size, checked from the header in
+/// pass A. Pass A inflates the whole stream to validate and pass B re-inflates it to
+/// hash — with zlib's ~1000:1 ratio an uncapped entry could cost terabytes of CPU.
+const MAX_STREAM_BLOB: u64 = 2 << 30;
 /// One entry's *compressed* wire size. `decompressed_size` ≤ 16 MiB bounds output but a
 /// deflate stream can carry ~5 bytes-in/0 bytes-out padding, so an entry could claim a
 /// ~2 GiB compressed length — which pass B would then range-read into memory whole.
@@ -104,6 +109,9 @@ async fn stream_inner(
         // bytes are already the normalized form) with a running sha1 — memory stays
         // flat. Everything else still materializes in isolate memory to resolve.
         let streamable = e.header == Header::Blob;
+        if e.decompressed_size > MAX_STREAM_BLOB {
+            return Err(Error::Limit("object too large (2 GiB max)".into()));
+        }
         if e.decompressed_size > MAX_OBJ && !streamable {
             return Err(Error::Limit("object too large (16 MiB max)".into()));
         }
@@ -319,6 +327,14 @@ async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> Resu
         .get(&id)
         .ok_or_else(|| unpack(format!("missing base {id}")))?
         .clone();
+    if loc.size > MAX_OBJ {
+        // a streamed (>16 MiB) blob can't materialize as a delta base — name the
+        // cause and the client-side workaround instead of decode_entry's bare limit
+        return Err(unpack(format!(
+            "delta base {id} exceeds 16 MiB; push the object as a full blob \
+             (e.g. git -c core.bigFileThreshold=1 push)"
+        )));
+    }
     let (_, entry) = cx
         .win
         .bucket
@@ -407,6 +423,11 @@ async fn resolve_at(
                 }
             }
             _ => {
+                if rec.size > MAX_OBJ {
+                    // a streamed (>16 MiB) blob can't serve as a delta base — fail
+                    // here rather than surfacing decode_mini's allocation-limit error
+                    return Err(unpack("delta base exceeds 16 MiB and cannot be resolved"));
+                }
                 let (k, d) = decode_mini(&mut cx.z, None, &raw)?;
                 break cx.cache.put(Key::Off(off), k, Rc::new(d));
             }
@@ -447,11 +468,16 @@ pub async fn resolve_and_normalize(
     };
     let (mut pre, mut sum) = (Vec::new(), 0u64);
     for (id, loc) in external_bases {
-        sum = sum.saturating_add(u64::from(loc.len));
-        if sum > 32 << 20 {
-            break;
+        // oversized streamed bases must not be decoded here — external() reports the
+        // actionable "delta base too large" error; decode_entry would throw its bare
+        // object-too-large limit first
+        if loc.size <= MAX_OBJ {
+            sum = sum.saturating_add(u64::from(loc.len));
+            if sum > 32 << 20 {
+                break;
+            }
+            pre.push((*id, loc.clone()));
         }
-        pre.push((*id, loc.clone()));
     }
     // prefetch is opportunistic: `read_entries` bounds *merged span* bytes (gaps
     // included), which `pre`'s plain size sum can't predict — on Limit just skip the
@@ -575,8 +601,9 @@ async fn one_entry(
 /// Verbatim pass-through for a blob over MAX_OBJ: emit the pending entry's wire
 /// bytes (header + zlib body) unchanged in <= 8 MiB reads while a resumable zlib
 /// stream re-inflates them purely to compute the object id. A delta that names a
-/// streamed blob as its base still fails cleanly at `Window::entry`'s size guard —
-/// it was never materialized, and a > 16 MiB delta base is not resolvable anyway.
+/// streamed blob as its base fails at explicit guards: `resolve_at`'s size check
+/// for in-pack bases, `external`'s for repo-resident ones — a > 16 MiB base is not
+/// resolvable regardless of how well it compressed.
 async fn stream_blob(
     cx: &mut Cx<'_>,
     rec: &EntryRec,
@@ -614,7 +641,10 @@ async fn stream_blob(
             );
             h.update(sinkbuf.get(..made).unwrap_or(&[]));
             produced = produced.saturating_add(made as u64);
-            inp = &inp[used..];
+            if produced > rec.size {
+                return Err(unpack(format!("object at {pos}: size mismatch")));
+            }
+            inp = inp.get(used..).ok_or_else(|| internal("zlib input"))?;
             if inp.is_empty() || st == Status::StreamEnd {
                 break;
             }
