@@ -434,6 +434,12 @@ pub enum RefResult {
     Ng(BString, &'static str),
 }
 
+/// A name echoed into report lines may be one the server rejected: non-graphic bytes
+/// (control chars, spaces) are replaced so a hostile name cannot inject text.
+fn echo_name(n: &[u8]) -> BString {
+    n.iter().map(|b| if b.is_ascii_graphic() { *b } else { b'?' }).collect()
+}
+
 /// Rule 4: `unpack ok`/`unpack <err>` then `ok <ref>`/`ng <ref> <reason>`, band 1 under side-band-64k.
 pub fn write_report_status(
     w: &mut PktWriter,
@@ -448,8 +454,8 @@ pub fn write_report_status(
     }
     for r in results {
         match r {
-            RefResult::Ok(n) => body.text(&format!("ok {}", n.as_bstr()))?,
-            RefResult::Ng(n, why) => body.text(&format!("ng {} {why}", n.as_bstr()))?,
+            RefResult::Ok(n) => body.text(&format!("ok {}", echo_name(n).as_bstr()))?,
+            RefResult::Ng(n, why) => body.text(&format!("ng {} {why}", echo_name(n).as_bstr()))?,
         }
     }
     // the inner pkt-stream must end with a flush: without it the client's demuxed

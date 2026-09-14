@@ -124,6 +124,20 @@ fn git_resp(body: Vec<u8>, content_type: &str) -> Result<Response, Error> {
     Ok(Response::from_bytes(body).map_err(|e| Error::Internal(e.to_string()))?.with_headers(h))
 }
 
+/// Same as git_resp but streams the body — the DO's fetch response is a stream and must
+/// stay one: buffering it would hold an entire clone's pack in edge memory.
+fn git_resp_stream<S>(stream: S, content_type: &str) -> Result<Response, Error>
+where
+    S: Stream<Item = Result<Vec<u8>, worker::Error>> + 'static,
+{
+    let h = worker::Headers::new();
+    h.set("Content-Type", content_type).map_err(|e| Error::Internal(e.to_string()))?;
+    h.set("Cache-Control", "no-cache").map_err(|e| Error::Internal(e.to_string()))?;
+    Response::from_stream(stream)
+        .map(|r| r.with_headers(h))
+        .map_err(|e| Error::Internal(e.to_string()))
+}
+
 fn v2_requested(req: &Request) -> Result<bool, Error> {
     Ok(req
         .headers()
@@ -218,7 +232,29 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<R
         w.flush();
         return git_resp(w.out, "application/x-git-upload-pack-result");
     }
-    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    // bound the read: a declared Content-Length is rejected before any byte is buffered,
+    // and a chunked body is still capped at CMD_CAP while streaming in
+    if let Some(n) = req
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if n > CMD_CAP as u64 {
+            return Err(Error::Limit("upload-pack body > 1 MiB".into()));
+        }
+    }
+    let mut reader = BodyReader::new(&mut req)?;
+    let mut body = Vec::new();
+    while reader.fill(FILL_STEP).await? {
+        if reader.buffered().len() > CMD_CAP {
+            return Err(Error::Limit("upload-pack body > 1 MiB".into()));
+        }
+        body.extend_from_slice(reader.buffered());
+        reader.consume(usize::MAX);
+    }
+    body.extend_from_slice(reader.buffered()); // EOF tail shorter than FILL_STEP
     if body.len() > CMD_CAP {
         return Err(Error::Limit("upload-pack body > 1 MiB".into()));
     }
@@ -231,9 +267,10 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<R
     if resp.status_code() != 200 {
         return Err(Error::from_do_response(resp).await);
     }
-    // fetch responses carry immutable headers; rebuild to set the git content type
-    let bytes = resp.bytes().await.map_err(|e| Error::Internal(e.to_string()))?;
-    git_resp(bytes, "application/x-git-upload-pack-result")
+    // fetch responses carry immutable headers; rebuild around the same stream so the
+    // pack flows through the edge instead of being buffered whole in memory
+    let stream = resp.stream().map_err(|e| Error::Internal(e.to_string()))?;
+    git_resp_stream(stream, "application/x-git-upload-pack-result")
 }
 
 /// POST /:owner/:repo/git-receive-pack — two-phase push (2.4, 3) with the A2 error arm.
@@ -265,7 +302,7 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Re
     // ---- post-header (A2): everything from here reports HTTP 200 + report-status ----
     match receive_inner(&mut body, &env, &route, &hdr, &principal).await {
         Ok(resp) => Ok(resp),
-        Err(e) => report_status_200(&hdr, Err(e.message()), &[]),
+        Err(e) => report_status_200(&hdr, Err(e.client_message()), &[]),
     }
 }
 

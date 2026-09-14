@@ -37,12 +37,12 @@ pub fn authenticate(req: &Request, env: &Env, need: Level) -> Result<String, Err
         return Err(Error::Auth);
     };
     let write = secret(env, "GE_WRITE_TOKEN")?;
-    if token == write {
+    if ct_eq(token.as_bytes(), write.as_bytes()) {
         return Ok(principal);
     }
     match need {
         Level::Read => {
-            if token == secret(env, "GE_READ_TOKEN")? {
+            if ct_eq(token.as_bytes(), secret(env, "GE_READ_TOKEN")?.as_bytes()) {
                 Ok(principal)
             } else {
                 Err(Error::Auth)
@@ -50,13 +50,22 @@ pub fn authenticate(req: &Request, env: &Env, need: Level) -> Result<String, Err
         }
         Level::Write => {
             // a valid read token is forbidden, not unauthenticated: no second challenge
-            if token == secret(env, "GE_READ_TOKEN")? {
+            if ct_eq(token.as_bytes(), secret(env, "GE_READ_TOKEN")?.as_bytes()) {
                 Err(Error::Forbidden)
             } else {
                 Err(Error::Auth)
             }
         }
     }
+}
+
+/// Constant-time token compare: length mismatch still exits early (token length is not
+/// secret — it is observable in the request anyway), content compare never short-circuits.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// RFC 4648, no dependencies (the Workers runtime's `atob` is not reachable from workers-rs

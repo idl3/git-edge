@@ -44,6 +44,31 @@ DO+R2 with no GitHub anywhere in the path. The edge tier (forks-as-refs, session
 reviews, GC under real load) keeps its proof status — the designs compile against the same
 contract the server now implements, but they are not yet endpoints.
 
+## Audit pass (A19)
+
+A line-by-line review of all ~4,900 lines found eight issues, all fixed and verified:
+
+- **Edge buffered entire fetch packs** — `upload_pack` reassembled the DO's streaming
+  response into memory; a large clone would OOM the worker. Now streams through.
+- **Body read unbounded** — `req.bytes()` held the whole body before the 1 MiB check;
+  chunked bodies now stream through `BodyReader` (which also fixed gzipped fetch bodies,
+  previously fed raw to the parser).
+- **No pack-size ceiling** — pushes are now capped at 2 GiB compressed, 64 open pushes.
+- **Ref names** — must be full refnames under `refs/`; `ok`/`ng` lines echo names with
+  non-graphic bytes replaced, closing a response-injection path (verified: a name
+  containing `\n` echoes as `?`).
+- **Error leakage** — `Internal`/`Storage` detail (R2 keys, SQL errors) no longer reaches
+  clients; full errors go to the worker log.
+- **Constant-time token compare**, and a `reflog(at)` index for the janitor scan.
+
+Reviewed and deliberately left: `include-tag` is parsed but unimplemented (tags still
+arrive via explicit wants); only `blob:none`/`blob:limit` filters are supported — others
+fail cleanly rather than silently misbehave.
+
+Verified sound: all SQL parameterized; DO atomicity via the platform output gate;
+the ≥5 MiB multipart rule is honored (`checkpoint` only fires at `MIN_PART`); the 2.5
+connectivity check is transitive; job retry/backoff/repair and GC idempotence hold.
+
 ## Known production gaps (honest list)
 
 - GC is exercised end to end: a force-push orphaning a pack triggers the full

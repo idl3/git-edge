@@ -657,3 +657,18 @@ directly. Verified live: a force-push orphaning a full pack collects it cleanly
 in `wrangler dev` and staging. Production deployments leave both unset. `GET
 /:owner/:repo/_state` (write-token gated) returns row counts for refs/objects/packs/jobs —
 the observability surface the GC tests use.
+
+**A19. Audit-hardening round (amends 6.3, 10, 3).** The live pass review surfaced eight fixes:
+- The edge must stream the DO's fetch response through (`Response::from_stream`); buffering
+  it holds an entire clone's pack in edge memory.
+- `upload-pack` bodies are read through `BodyReader` (gzip honoured) with a declared
+  `Content-Length` rejected before buffering and a streamed cap at the 1 MiB command limit.
+- One pushed pack is capped at 2 GiB compressed (`MAX_PENDING`); `pushes` holds at most 64
+  `open` rows.
+- Ref names must be full refnames under `refs/` (`gix_validate::reference::name`); `ok`/`ng`
+  report lines echo names with non-graphic bytes replaced by `?` so a rejected name cannot
+  inject text into the response stream.
+- `Internal`/`Storage` error detail never reaches clients (`client_message` = "internal
+  error"); the full error goes to the worker log.
+- Token comparison is constant-time.
+- `reflog(at)` is indexed for the janitor expiry scan.

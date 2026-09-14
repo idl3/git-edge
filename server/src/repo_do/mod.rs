@@ -335,6 +335,12 @@ impl RepoDo {
 
     /// Section 3 step 0: the push row carrying the gc_epoch the whole push validates against.
     fn push_begin(&self, meta: &Meta, b: &BeginDto) -> Result<Response, Error> {
+        // an 'open' push owns a pending/ key and eventually a packs row; bound how many
+        // a client may hold at once (expired ones are reaped by the janitor)
+        let open = self.q("SELECT COUNT(*) AS n FROM pushes WHERE state='open'", vec![])?.one::<N>()?.n;
+        if open >= 64 {
+            return Err(Error::Limit("too many open pushes".into()));
+        }
         self.q(
             "INSERT INTO pushes(id,state,principal,began_at,gc_epoch) VALUES(?,'open',?,?,?)",
             vec![
@@ -481,7 +487,10 @@ impl RepoDo {
         who: &str,
         now: i64,
     ) -> Result<Option<&'static str>, Error> {
-        if gix_validate::reference::name_partial(c.name.as_bytes().as_bstr()).is_err() {
+        // refs live under refs/ only — a full valid refname, never HEAD or a bare word
+        if !c.name.as_bytes().starts_with(b"refs/")
+            || gix_validate::reference::name(c.name.as_bytes().as_bstr()).is_err()
+        {
             return Ok(Some("funny refname"));
         }
         if c.old.is_null() && c.new.is_null() {
@@ -608,7 +617,7 @@ impl RepoDo {
                 Err(e) => {
                     // mid-stream: one band-3 ERR frame, then the stream ends (section 10)
                     let mut w = PktWriter::default();
-                    wire::Sideband::new(&mut w).error(&format!("ERR {}", e.message()));
+                    wire::Sideband::new(&mut w).error(&format!("ERR {}", e.client_message()));
                     Some((Ok(w.out), st))
                 }
             }
