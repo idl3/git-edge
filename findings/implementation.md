@@ -175,3 +175,43 @@ Parallel reviewers attacked the round-2 diff itself. Findings fixed and verified
 | Multi-round fetch (partial ACKs) | negotiates, correct pack |
 
 No worker errors/panics in the log across all of the above.
+
+## Round 5 — post-merge full-surface audit (PR #4)
+
+Three reviewers swept merged main (scale/limits, jobs/reliability, protocol).
+Findings fixed, verified, and merged as `788f192`:
+
+- **GC data-loss race**: a duplicate or reclaimed `gc_mark` slice could read a
+  bitmap, set a bit, and overwrite a newer bitmap — losing live-object marks and
+  sweeping reachable objects. `commit_ids` now re-reads and OR-merges the stored
+  bitmap inside the same sync span.
+- **Job fencing**: outcome writes fence on a stable `lease` token (not
+  `started_at` — `heartbeat` rewrites it, which would break every heartbeat).
+  GC slices heartbeat during long consolidation so `repair` can't strand them;
+  a resurrection cap stops deterministically-failing GC chains restarting
+  forever; `alarm` swallows dispatch errors per contract 4.4; `rearm` runs on
+  fetch error paths.
+- **Unbounded memory under adversarial packs**: client-declared compressed
+  entry size is capped before reads (padded zlib → ~2 GiB `read_range` alloc);
+  nested `REF_DELTA` recursion shares a live-bytes counter + depth cap;
+  `IndexSink.links` enforced at extend-time (giant tree → link-vector spike);
+  fetch tree/base expansion shares `Rc` bases (~260 MB spike removed); pending
+  MPU aborted on any post-create error in `stream_to_pending`/`finish`.
+- **GC consolidation**: `build` flushes per read-chunk instead of buffering a
+  ~1.4 GiB batch; `ORDER BY idx` makes replay byte-identical so staged index
+  rows can't carry wrong offsets.
+- **Shallow-fetch semantics**: walk descends *through* client-shallow commits in
+  `deepen`/`deepen-since`/`deepen-not` modes (depth-1 clone can deepen below its
+  boundary — verified); `unshallow` only when parents are now delivered;
+  client-held commits never emitted as `shallow`; relative deepen counts depth
+  beneath the old boundary; `deepen`+`deepen-since`/`deepen-not` rejected;
+  `deepen-not` peels annotated tags and errors on unresolvable names;
+  `acknowledgments` omitted when `done` was sent (contract rule 3);
+  `x-ge-subrequests` propagated through the edge response.
+- Verified live: cyclic `REF_DELTA` → `unpack missing base` in ~60 ms, no hang;
+  conformance `== PASS`; full shallow battery green.
+
+**Genuinely left (unchanged from round 3):** real-deploy items only — R2
+abandoned-MPU semantics and plan-limit enforcement require a real Cloudflare
+account; `packfile-uris`/`sideband-all`/`no-done`/sha256/non-blob filters/v0-v1
+negotiation remain deliberately unadvertised with clean protocol errors.
