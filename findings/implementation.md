@@ -121,3 +121,35 @@ re-verified; the audit reports live in `findings/audit/`.
 - `packfile-uris`, `sideband-all`, `no-done`, `object-format=sha256`, filters beyond
   `blob:none`/`blob:limit`, v0/v1 upload-pack negotiation — deliberately unadvertised;
   clients get a clean protocol error, not silent misbehavior.
+
+## Round 3 — adversarial review of PR #3 (second pass)
+
+Parallel reviewers attacked the round-2 diff itself. Findings fixed and verified:
+
+- **Nested forward REF_DELTA**: a REF_DELTA whose base is later in the pack *and*
+  inside another delta chain now defers via `Base::Await`/`Step::Await` — waiters are
+  keyed by base id and woken exactly once (O(n), not O(k^2) fixpoint). Verified live:
+  pack `delta->deferred->delta->base` pushed, cloned byte-exact, `fsck --strict` clean.
+  Delta cycles reject cleanly with `unpack missing base`.
+- **idx vs offset invariant**: deferred entries append out of physical order, so
+  `Index::entries_of` now sorts by `offset`; `commits_in_range` got
+  `ORDER BY o.offset`; `read_entries` already sorts internally. `idx` remains the
+  bitmap position token only.
+- **Janitor poisoned-delete**: per-key failure handling — one bad R2 delete no longer
+  wedges the phase; `swept_at` only after a confirmed delete; deterministic
+  `ORDER BY` so the same row can't sit at the head forever; failures surface as the
+  slice's recorded error.
+- **Repair resurrection**: stranded `running` rows now consume an attempt and dead-end
+  at the threshold instead of retrying at every boot; dead maintenance jobs keep their
+  `last_error` in `meta` (`dead.<kind>`) before the row is deleted.
+- **Schema migration**: `PRAGMA table_info`-checked `ALTER TABLE` for late columns
+  (`pushes.swept_at`, `packs.dead_at`, `jobs.started_at`) on DOs booted under older DDL.
+- **Push/commit liveness**: `/_do/push/commit` failures also abort the open push
+  (idempotent); the `ingesting`->`live` pack transition is bound to `push_id` so one
+  push's commit can't promote another push's pack; `begin_build` retry dead-marks the
+  previous `gc.new_pack` row (was an orphan the janitor deliberately never touches).
+- **Protocol**: `Git-Protocol: version=1` now emits the `version 1` packet;
+  `deepen-not` resolves unqualified names via git's ref search order
+  (`mid` -> `refs/tags/mid`); `info/refs`/`_state` errors are plain text per contract.
+- **Auth**: empty presented tokens never match; `GE_WRITE_TOKEN` unset no longer 500s
+  read-only deployments.

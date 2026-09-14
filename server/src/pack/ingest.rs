@@ -255,6 +255,14 @@ fn decode_mini(z: &mut Inflate, base: Option<(Kind, &[u8])>, raw: &[u8]) -> Resu
     Ok((oc.kind, out))
 }
 
+/// A chain walk that can't proceed because a base id isn't resolvable *yet* — the base
+/// may be a later in-pack entry (forward REF_DELTA), so the caller defers rather than
+/// erroring. `Await` is only raised for ids not in `by_id`, `external`, or the caches.
+pub enum Base {
+    Ready(Obj),
+    Await(ObjectId),
+}
+
 /// Thin-pack base (2.4): prefetched cache, else one coalesced read of its live location.
 async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> Result<Obj, Error> {
     if let Some(hit) = cx.cache.get(&Key::Id(id)) {
@@ -276,13 +284,37 @@ async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> Resu
     Ok(cx.cache.put(Key::Id(id), k, Rc::new(d)))
 }
 
+/// Resolve a ref-delta base id: resolved in-pack entry -> chain walk; repo base -> read;
+/// unknown -> `Await` so the caller can defer until the entry is processed.
+async fn base_by_id(
+    cx: &mut Cx<'_>,
+    entries: &[EntryRec],
+    base_id: ObjectId,
+    budget: &mut ReqBudget,
+) -> Result<Base, Error> {
+    if let Some(hit) = cx.cache.get(&Key::Id(base_id)) {
+        return Ok(Base::Ready(hit));
+    }
+    match cx.by_id.get(&base_id).copied() {
+        Some(j) => {
+            // async recursion (resolve_at -> base_by_id -> resolve_at) needs boxing;
+            // depth is bounded by MAX_DEPTH hops per nested call
+            Box::pin(resolve_at(cx, entries, entries.get(j).ok_or_else(|| internal("idx"))?.offset, budget)).await
+        }
+        None if cx.external.contains_key(&base_id) => {
+            Ok(Base::Ready(external(cx, base_id, budget).await?))
+        }
+        None => Ok(Base::Await(base_id)),
+    }
+}
+
 /// In-pack base at `start`: walk the chain back to a cached or full entry, then apply forward.
 async fn resolve_at(
     cx: &mut Cx<'_>,
     entries: &[EntryRec],
     start: u64,
     budget: &mut ReqBudget,
-) -> Result<Obj, Error> {
+) -> Result<Base, Error> {
     let (mut off, mut chain, mut chain_bytes) = (start, Vec::new(), 0u64);
     let (kind, mut data) = loop {
         if let Some(hit) = cx.cache.get(&Key::Off(off)) {
@@ -310,9 +342,10 @@ async fn resolve_at(
             }
             Header::RefDelta { base_id } => {
                 chain.push((off, raw));
-                match cx.by_id.get(&base_id).copied() {
-                    Some(j) => off = entries.get(j).ok_or_else(|| internal("idx"))?.offset,
-                    None => break external(cx, base_id, budget).await?,
+                match base_by_id(cx, entries, base_id, budget).await? {
+                    // an unresolved in-pack base: abandon the walk; the whole entry defers
+                    Base::Await(id) => return Ok(Base::Await(id)),
+                    Base::Ready(obj) => break obj,
                 }
             }
             _ => {
@@ -325,7 +358,7 @@ async fn resolve_at(
         let (_, d) = decode_mini(&mut cx.z, Some((kind, &data)), &raw)?;
         data = cx.cache.put(Key::Off(o), kind, Rc::new(d)).1;
     }
-    Ok((kind, data))
+    Ok(Base::Ready((kind, data)))
 }
 
 /// `sink` posts `/_do/push/index` in 10,000-row batches and collects links (2.5).
@@ -365,43 +398,37 @@ pub async fn resolve_and_normalize(
     }
     let need_ids = entries.iter().any(|r| matches!(r.kind_or_delta, Header::RefDelta { .. }));
     let mut rows = Vec::new();
-    // A REF_DELTA may name a base that appears LATER in the same pack (forward ref):
-    // defer it and resolve in a fixpoint pass once more ids are known (index-pack parity).
-    let mut pending: Vec<usize> = Vec::new();
-    for i in 0..entries.len() {
-        if let Some(&Header::RefDelta { base_id }) = entries.get(i).map(|r| &r.kind_or_delta) {
-            if !cx.by_id.contains_key(&base_id) && !external_bases.contains_key(&base_id) {
-                pending.push(i);
-                continue;
+    // A REF_DELTA may name a base that appears LATER in the same pack — including
+    // mid-chain inside another delta. `one_entry` returns `Await(base)` for those;
+    // resolving an entry wakes exactly its waiters (index-pack parity, O(n) not O(n^2)).
+    let mut pending: HashMap<ObjectId, Vec<usize>> = HashMap::new();
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    let mut i = 0;
+    while i < order.len() {
+        let at = order[i];
+        i += 1;
+        match one_entry(&mut cx, entries, at, need_ids, out, sink, &mut rows, budget).await? {
+            Step::Done(id) => {
+                if let Some(ws) = pending.remove(&id) {
+                    order.extend(ws);
+                }
+            }
+            Step::Await(base) => {
+                pending.entry(base).or_default().push(at);
             }
         }
-        one_entry(&mut cx, entries, i, need_ids, out, sink, &mut rows, budget).await?;
     }
-    while !pending.is_empty() {
-        let mut still = Vec::with_capacity(pending.len());
-        let mut progressed = false;
-        for i in pending.drain(..) {
-            let base_id = match entries.get(i).map(|r| &r.kind_or_delta) {
-                Some(&Header::RefDelta { base_id }) => base_id,
-                _ => continue,
-            };
-            if cx.by_id.contains_key(&base_id) || external_bases.contains_key(&base_id) {
-                one_entry(&mut cx, entries, i, need_ids, out, sink, &mut rows, budget).await?;
-                progressed = true;
-            } else {
-                still.push(i);
-            }
-        }
-        if !progressed {
-            let bid = still.first().and_then(|&i| match entries.get(i).map(|r| &r.kind_or_delta) {
-                Some(&Header::RefDelta { base_id }) => Some(base_id),
-                _ => None,
-            });
-            return Err(unpack(format!("missing base {}", bid.map(|b| b.to_string()).unwrap_or_default())));
-        }
-        pending = still;
+    if let Some((&base, _)) = pending.iter().next() {
+        return Err(unpack(format!("missing base {base}")));
     }
     Ok(rows)
+}
+
+/// The per-entry outcome: resolved+emitted (`Done`), or blocked on a base id that a later
+/// in-pack entry will produce (`Await`).
+enum Step {
+    Done(ObjectId),
+    Await(ObjectId),
 }
 
 /// Resolve + normalize one pack entry: base resolution, decode, hash, links, append, index row.
@@ -415,9 +442,8 @@ async fn one_entry(
     sink: &mut IndexSink<'_>,
     rows: &mut Vec<ObjRow>,
     budget: &mut ReqBudget,
-) -> Result<(), Error> {
+) -> Result<Step, Error> {
     let rec = entries.get(i).ok_or_else(|| internal("idx"))?;
-    let raw = cx.win.entry(rec, budget).await?;
     let base = match rec.kind_or_delta {
         Header::OfsDelta { base_distance } => Some(
             resolve_at(
@@ -429,14 +455,15 @@ async fn one_entry(
             )
             .await?,
         ),
-        Header::RefDelta { base_id } => Some(match cx.by_id.get(&base_id).copied() {
-            Some(j) => {
-                resolve_at(cx, entries, entries.get(j).ok_or_else(|| internal("idx"))?.offset, budget).await?
-            }
-            None => external(cx, base_id, budget).await?,
-        }),
+        Header::RefDelta { base_id } => Some(base_by_id(cx, entries, base_id, budget).await?),
         _ => None,
     };
+    let base = match base {
+        Some(Base::Ready(o)) => Some(o),
+        Some(Base::Await(id)) => return Ok(Step::Await(id)),
+        None => None,
+    };
+    let raw = cx.win.entry(rec, budget).await?;
     let (kind, data) =
         decode_mini(&mut cx.z, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw)?;
     let id = gix_object::compute_hash(H::Sha1, kind, &data).map_err(|_| unpack("sha1 collision"))?;
@@ -465,7 +492,7 @@ async fn one_entry(
         sink.post(rows, budget).await?;
         rows.clear();
     }
-    Ok(())
+    Ok(Step::Done(id))
 }
 
 /// Object references for the 2.5 connectivity check (1.4): commit -> tree + parents,

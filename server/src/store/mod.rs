@@ -734,6 +734,9 @@ impl<'s> Index<'s> {
                 break;
             }
         }
+        // idx order != offset order when a forward REF_DELTA was resolved late: the
+        // object kept its original idx but was appended at the pack's tail
+        out.sort_by_key(|l| l.offset);
         Ok(out)
     }
     /// Commit-kind entries of one pack in the byte range [lo, hi) — 7.4 prefetch:
@@ -758,7 +761,7 @@ impl<'s> Index<'s> {
                 "SELECT o.sha, o.idx, o.offset, o.len, o.size FROM objects o \
                  JOIN packs p ON p.id = o.pack_id \
                  WHERE o.pack_id=? AND o.kind=1 AND o.offset>=? AND o.offset<? \
-                 AND p.state='live' LIMIT 100000",
+                 AND p.state='live' ORDER BY o.offset LIMIT 100000",
                 vec![V::from(pack.0.as_str()), i(lo)?, i(hi)?],
             )?
             .to_array::<R>()?;
@@ -835,9 +838,32 @@ pub mod schema {
         "CREATE TABLE IF NOT EXISTS gc_seen (sha TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_parts (part_no INTEGER PRIMARY KEY, etag TEXT NOT NULL)",
     ];
+    /// Columns added after first deploy. CREATE TABLE IF NOT EXISTS never updates an
+    /// existing table, so DOs booted under an older schema need ALTER TABLE — SQLite
+    /// does that only if the column is missing (checked via PRAGMA table_info).
+    const LATE_COLS: &[(&str, &str, &str)] = &[
+        ("pushes", "swept_at", "swept_at INTEGER"),
+        ("packs", "dead_at", "dead_at INTEGER"),
+        ("jobs", "started_at", "started_at INTEGER"),
+    ];
     pub fn migrate(sql: &SqlStorage) -> Result<(), Error> {
         for q in DDL {
             sql.exec(q, Some(Vec::<V>::new())).map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        #[derive(serde::Deserialize)]
+        struct Col {
+            name: String,
+        }
+        for (table, col, decl) in LATE_COLS {
+            let cols = sql
+                .exec(&format!("PRAGMA table_info({table})"), Some(Vec::<V>::new()))
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .to_array::<Col>()
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if !cols.iter().any(|c| c.name == *col) {
+                sql.exec(&format!("ALTER TABLE {table} ADD COLUMN {decl}"), Some(Vec::<V>::new()))
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
         }
         Ok(())
     }

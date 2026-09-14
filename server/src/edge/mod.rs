@@ -107,6 +107,8 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         Ok(x) => x,
         Err(e) => return respond(Err(e), false),
     };
+    // section 10: git-protocol POSTs get a pkt-line ERR; info/refs and _state get plain text
+    let git_pkt = matches!((&req.method(), rest.as_str()), (Method::Post, "git-upload-pack" | "git-receive-pack"));
     let r = match (req.method(), rest.as_str()) {
         (Method::Get, "info/refs") => info_refs(&req, &env, &route).await,
         (Method::Get, "_state") => state_probe(&req, &env, &route).await,
@@ -114,7 +116,7 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         (Method::Post, "git-receive-pack") => receive_pack(req, env, route).await,
         _ => Err(Error::NotFound),
     };
-    respond(r, true)
+    respond(r, git_pkt)
 }
 
 fn git_resp(body: Vec<u8>, content_type: &str) -> Result<Response, Error> {
@@ -138,13 +140,16 @@ where
         .map_err(|e| Error::Internal(e.to_string()))
 }
 
-fn v2_requested(req: &Request) -> Result<bool, Error> {
+fn protocol_version(req: &Request) -> Result<Option<u8>, Error> {
     Ok(req
         .headers()
         .get("git-protocol")
         .map_err(|e| Error::Internal(e.to_string()))?
-        .map(|v| v.split(':').any(|p| p.trim() == "version=2"))
-        .unwrap_or(false))
+        .and_then(|v| {
+            v.split(':')
+                .filter_map(|p| p.trim().strip_prefix("version=").and_then(|n| n.parse::<u8>().ok()))
+                .next()
+        }))
 }
 
 /// GET /:owner/:repo/info/refs?service=... — v2 advertisement, else v0/v1 (1.1 rules 5, 7).
@@ -152,13 +157,13 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
     let url = req.url().map_err(|e| Error::Internal(e.to_string()))?;
     let service = url.query_pairs().find(|(k, _)| k == "service").map(|(_, v)| v.into_owned());
     let (service, level, ct) = match service.as_deref() {
-        Some("git-upload-pack") => (Service::UploadPack { v1: false }, Level::Read, "application/x-git-upload-pack-advertisement"),
+        Some("git-upload-pack") => (Service::UploadPack { v1: protocol_version(req)? == Some(1) }, Level::Read, "application/x-git-upload-pack-advertisement"),
         Some("git-receive-pack") => (Service::ReceivePack, Level::Write, "application/x-git-receive-pack-advertisement"),
         _ => return Err(Error::Protocol("service must be git-upload-pack or git-receive-pack".into())),
     };
     auth::authenticate(req, env, level)?; // before the DO wakes (8.1)
     let mut w = PktWriter::default();
-    if v2_requested(req)? && matches!(service, Service::UploadPack { .. }) {
+    if protocol_version(req)? == Some(2) && matches!(service, Service::UploadPack { .. }) {
         wire::write_capability_advertisement_v2(&mut w);
     } else {
         let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
@@ -225,7 +230,7 @@ async fn state_probe(req: &Request, env: &Env, route: &RepoRoute) -> Result<Resp
 /// POST /:owner/:repo/git-upload-pack — v2 only; route on the command name, forward raw.
 async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
     auth::authenticate(&req, env, Level::Read)?;
-    if !v2_requested(&req)? {
+    if protocol_version(&req)? != Some(2) {
         // contract 1.1 rule 7: v0 upload-pack POST -> HTTP 400 with the ERR pkt-line
         let mut w = PktWriter::default();
         let _ = w.data(b"ERR protocol v2 required\n");
@@ -372,7 +377,7 @@ async fn receive_inner(
     struct Commit {
         results: Vec<(String, Option<String>)>,
     }
-    let res: Commit = stub_json(
+    let commit = stub_json(
         &stub,
         route,
         "/_do/push/commit",
@@ -381,7 +386,24 @@ async fn receive_inner(
         }),
         &mut budget,
     )
-    .await?;
+    .await;
+    // a failed commit (network error, DO 500) must also close the row — the abort is
+    // idempotent so a DO-side rejection that already ended the push is harmless
+    let res: Commit = match commit {
+        Ok(r) => r,
+        Err(e) => {
+            let _: serde_json::Value = stub_json(
+                &stub,
+                route,
+                "/_do/push/abort",
+                &serde_json::json!({ "push_id": push.0 }),
+                &mut budget,
+            )
+            .await
+            .unwrap_or_default();
+            return Err(e);
+        }
+    };
     let results: Vec<RefResult> = res
         .results
         .into_iter()

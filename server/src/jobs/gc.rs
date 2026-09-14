@@ -591,6 +591,17 @@ fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
         exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
         return Ok(None);
     }
+    // a retried begin re-enters here with gc.new_pack still set — the prior build pack
+    // has push_id IS NULL, which the janitor deliberately never touches, so dead-mark
+    // it now or the row (and eventually its R2 key) is orphaned forever
+    if let Some(p) = d.meta_opt("gc.new_pack")? {
+        exec(sql, "DELETE FROM objects WHERE pack_id=?", vec![p.clone().into()])?;
+        exec(
+            sql,
+            "UPDATE packs SET state='dead', dead_at=? WHERE id=? AND state='ingesting'",
+            vec![now_ms().into(), p.into()],
+        )?;
+    }
     let pack = PackId::random()?;
     exec(
         sql,

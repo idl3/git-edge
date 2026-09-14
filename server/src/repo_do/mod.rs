@@ -483,8 +483,10 @@ impl RepoDo {
         if let Some(pack) = &req.pack_id {
             // step 3
             self.q(
-                "UPDATE packs SET state='live' WHERE id=? AND state='ingesting'",
-                vec![V::from(pack.as_str())],
+                // bound to this push: an ingesting pack that belongs to a different push
+                // must not be promotable by someone else's commit
+                "UPDATE packs SET state='live' WHERE id=? AND state='ingesting' AND push_id=?",
+                vec![V::from(pack.as_str()), V::from(req.push_id.as_str())],
             )?;
             if self.changes()? != 1 {
                 return Err(Error::Conflict("pack not in state ingesting".into()));
@@ -644,7 +646,8 @@ impl RepoDo {
             }
         }
         // deepen-not carries ref names: resolve each to its tip; a name we don't
-        // hold excludes nothing
+        // hold excludes nothing. Clients send unqualified names ("mid"), so resolve
+        // by git's standard search order (exact, refs/, refs/tags/, refs/heads/, ...)
         let mut deepen_not: Vec<ObjectId> = Vec::new();
         if !args.deepen_not.is_empty() {
             #[derive(serde::Deserialize)]
@@ -655,13 +658,23 @@ impl RepoDo {
                 let Ok(qname) = String::from_utf8(name.to_vec()) else {
                     continue;
                 };
-                if let Some(target) = self
-                    .q("SELECT target FROM refs WHERE name=? LIMIT 1", vec![V::from(qname.as_str())])?
-                    .to_array::<T>()?
-                    .into_iter()
-                    .next()
-                {
-                    deepen_not.push(oid(&target.target)?);
+                for cand in [
+                    qname.clone(),
+                    format!("refs/{qname}"),
+                    format!("refs/tags/{qname}"),
+                    format!("refs/heads/{qname}"),
+                    format!("refs/remotes/{qname}"),
+                    format!("refs/remotes/{qname}/HEAD"),
+                ] {
+                    if let Some(target) = self
+                        .q("SELECT target FROM refs WHERE name=? LIMIT 1", vec![V::from(cand.as_str())])?
+                        .to_array::<T>()?
+                        .into_iter()
+                        .next()
+                    {
+                        deepen_not.push(oid(&target.target)?);
+                        break;
+                    }
                 }
             }
         }

@@ -12,9 +12,6 @@ pub enum Level {
     Write,
 }
 
-fn secret(env: &Env, name: &str) -> Result<String, Error> {
-    env.secret(name).map(|s| s.to_string()).map_err(|_| Error::Internal(format!("{name} unset")))
-}
 /// Missing optional secret is not an internal error — the compare just fails.
 fn secret_opt(env: &Env, name: &str) -> Option<String> {
     env.secret(name).ok().map(|s| s.to_string())
@@ -46,8 +43,15 @@ pub fn authenticate(req: &Request, env: &Env, need: Level) -> Result<String, Err
     } else {
         return Err(Error::Auth);
     };
-    let write = secret(env, "GE_WRITE_TOKEN")?;
-    if ct_eq(token.as_bytes(), write.as_bytes()) {
+    // an empty presented token must never match anything — an empty secret value
+    // (misconfigured env) would otherwise authenticate every empty credential
+    if token.is_empty() {
+        return Err(Error::Auth);
+    }
+    // optional for read-only deployments: an unset write secret just never matches,
+    // it must not 500 a read route
+    let write = secret_opt(env, "GE_WRITE_TOKEN");
+    if write.map(|w| ct_eq(token.as_bytes(), w.as_bytes())) == Some(true) {
         return Ok(principal);
     }
     let read = secret_opt(env, "GE_READ_TOKEN");

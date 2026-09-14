@@ -26,7 +26,7 @@ struct N {
     id: i64,
 }
 
-pub async fn run_slice(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Result<SliceOutcome, Error> {
+pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<SliceOutcome, Error> {
     let now = platform::now_ms();
 
     // 1. expire open pushes past PUSH_TIMEOUT
@@ -86,26 +86,39 @@ pub async fn run_slice(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Resu
     //    dead packs past GRACE whose object rows are gone.
     let pend: Vec<I> = d
         .q(
-            "SELECT id FROM pushes WHERE state <> 'open' AND began_at < ? AND swept_at IS NULL LIMIT ?",
+            "SELECT id FROM pushes WHERE state <> 'open' AND began_at < ? AND swept_at IS NULL \
+             ORDER BY began_at LIMIT ?",
             vec![V::from(now.saturating_sub(GRACE_MS)), V::from(BATCH)],
         )?
         .to_array::<I>()?
         .into_iter()
         .collect();
+    // per-key failure is logged and counted but does not wedge the phase — a single
+    // poisoned R2 key must not starve every other sweep (and `swept_at` is still only
+    // written after a confirmed delete)
+    let mut del_fail = 0u32;
     for p in &pend {
         if budget.spent_80pct() {
             return Ok(SliceOutcome::Continue { cursor: "{}".into() });
         }
         let key = keys::pending(&d.repo_id()?, &PushId(p.id.clone()));
         budget.req.charge(1)?;
-        // missing key is fine, but a real failure must retry next run — never mark swept
-        d.bucket()?.inner.delete(key.as_str()).await?;
-        d.q("UPDATE pushes SET swept_at=? WHERE id=?", vec![V::from(now), V::from(p.id.as_str())])?;
+        match d.bucket()?.inner.delete(key.as_str()).await {
+            Ok(()) => {
+                d.q("UPDATE pushes SET swept_at=? WHERE id=?", vec![V::from(now), V::from(p.id.as_str())])?;
+            }
+            Err(e) => {
+                del_fail += 1;
+                worker::console_log!("janitor: pending delete {} failed: {e}", p.id);
+            }
+        }
+        super::heartbeat(&d.sql(), job.id)?;
     }
     let dead: Vec<I> = d
         .q(
             "SELECT id FROM packs WHERE state='dead' AND dead_at < ? \
-             AND NOT EXISTS(SELECT 1 FROM objects o WHERE o.pack_id = packs.id) LIMIT ?",
+             AND NOT EXISTS(SELECT 1 FROM objects o WHERE o.pack_id = packs.id) \
+             ORDER BY dead_at LIMIT ?",
             vec![V::from(now.saturating_sub(GRACE_MS)), V::from(BATCH)],
         )?
         .to_array::<I>()?
@@ -117,8 +130,16 @@ pub async fn run_slice(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Resu
         }
         let key = keys::pack(&d.repo_id()?, &PackId(p.id.clone()));
         budget.req.charge(1)?;
-        d.bucket()?.inner.delete(key.as_str()).await?;
-        d.q("DELETE FROM packs WHERE id=?", vec![V::from(p.id.as_str())])?;
+        match d.bucket()?.inner.delete(key.as_str()).await {
+            Ok(()) => {
+                d.q("DELETE FROM packs WHERE id=?", vec![V::from(p.id.as_str())])?;
+            }
+            Err(e) => {
+                del_fail += 1;
+                worker::console_log!("janitor: pack delete {} failed: {e}", p.id);
+            }
+        }
+        super::heartbeat(&d.sql(), job.id)?;
     }
 
     // 4. reflog expiry: 90 days, keyed by row id.
@@ -134,5 +155,10 @@ pub async fn run_slice(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Resu
         d.q("DELETE FROM reflog WHERE id=?", vec![V::from(r.id)])?;
     }
 
+    // failed deletes stay unmarked and retry next run — but the job records the error
+    // so a persistently-poisoned key is visible rather than silently stuck
+    if del_fail > 0 {
+        return Err(Error::Storage(format!("{del_fail} R2 deletes failed")));
+    }
     Ok(SliceOutcome::Done)
 }
