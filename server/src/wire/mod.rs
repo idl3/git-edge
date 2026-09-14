@@ -215,6 +215,7 @@ pub fn parse_receive_header(r: &mut PktReader) -> Result<Option<ReceiveHeader>, 
         commands.push(RefCommand { old: oid(&old_hex)?, new: oid(new_hex)?, name: name.into() });
         first_command = false;
     }
+    // A flush-only request is legal: "everything up-to-date" pushes carry no commands.
     Ok(Some(ReceiveHeader { commands, caps, shallow }))
 }
 
@@ -230,6 +231,7 @@ pub struct LsRefsArgs {
 }
 pub struct FetchArgs {
     pub wants: Vec<ObjectId>,
+    pub want_refs: Vec<BString>,
     pub haves: Vec<ObjectId>,
     pub done: bool,
     pub thin_pack: bool,
@@ -237,6 +239,10 @@ pub struct FetchArgs {
     pub include_tag: bool,
     pub ofs_delta: bool,
     pub deepen: Option<u32>,
+    pub deepen_since: Option<i64>,
+    /// deepen-not carries ref *names* (not oids) — resolved server-side like want-ref.
+    pub deepen_not: Vec<BString>,
+    pub deepen_relative: bool,
     pub shallow: Vec<ObjectId>,
     pub filter: Option<Filter>,
 }
@@ -267,9 +273,19 @@ pub fn parse_v2_command(body: &[u8]) -> Result<V2Command, Error> {
                 if in_args {
                     args.push(d.into());
                 } else if let Some(c) = d.strip_prefix(b"command=") {
+                    if cmd.is_some() {
+                        return Err(Error::Protocol("duplicate command line".into()));
+                    }
                     cmd = Some(c.to_vec());
                 } else if d == b"object-format=sha256" {
                     return Err(Error::Protocol("object-format sha256 unsupported".into()));
+                } else if !(d.starts_with(b"agent=")
+                    || d.starts_with(b"object-format=")
+                    || d.starts_with(b"session-id="))
+                {
+                    // pre-delim lines are command + capabilities only; an argument line
+                    // here means the request lost its delim — reject rather than drop it
+                    return Err(Error::Protocol(format!("unexpected pre-delim line {}", d.as_bstr())));
                 }
             }
         }
@@ -288,7 +304,12 @@ fn parse_ls_refs(args: &[BString]) -> Result<LsRefsArgs, Error> {
             b"symrefs" => a.symrefs = true,
             b"peel" => a.peel = true,
             b"unborn" => a.unborn = true,
-            x => a.prefixes.push(x.strip_prefix(b"ref-prefix ").ok_or_else(|| bad("ls-refs", x))?.into()),
+            x => {
+                if a.prefixes.len() >= 32 {
+                    return Err(bad("ls-refs", b"too many ref-prefix")); // a prefix scan is O(refs)
+                }
+                a.prefixes.push(x.strip_prefix(b"ref-prefix ").ok_or_else(|| bad("ls-refs", x))?.into());
+            }
         }
     }
     Ok(a)
@@ -297,6 +318,7 @@ fn parse_ls_refs(args: &[BString]) -> Result<LsRefsArgs, Error> {
 fn parse_fetch(args: &[BString]) -> Result<FetchArgs, Error> {
     let mut f = FetchArgs {
         wants: vec![],
+        want_refs: vec![],
         haves: vec![],
         done: false,
         thin_pack: false,
@@ -304,6 +326,9 @@ fn parse_fetch(args: &[BString]) -> Result<FetchArgs, Error> {
         include_tag: false,
         ofs_delta: false,
         deepen: None,
+        deepen_since: None,
+        deepen_not: vec![],
+        deepen_relative: false,
         shallow: vec![],
         filter: None,
     };
@@ -311,6 +336,12 @@ fn parse_fetch(args: &[BString]) -> Result<FetchArgs, Error> {
         let (k, v) = l.split_once_str(" ").unwrap_or((l.as_slice(), b""));
         match k {
             b"want" => f.wants.push(oid(v)?),
+            b"want-ref" => {
+                if v.is_empty() {
+                    return Err(bad("want-ref", v));
+                }
+                f.want_refs.push(v.into());
+            }
             b"have" => f.haves.push(oid(v)?),
             b"shallow" => f.shallow.push(oid(v)?),
             b"done" => f.done = true,
@@ -323,6 +354,17 @@ fn parse_fetch(args: &[BString]) -> Result<FetchArgs, Error> {
                     num(v).and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0).ok_or_else(|| bad("deepen", v))?,
                 )
             }
+            b"deepen-since" => {
+                f.deepen_since = Some(num(v).and_then(|n| i64::try_from(n).ok()).ok_or_else(|| bad("deepen-since", v))?)
+            }
+            b"deepen-not" => {
+                if v.is_empty() {
+                    return Err(bad("deepen-not", v));
+                }
+                f.deepen_not.push(v.into());
+            }
+            b"deepen-relative" => f.deepen_relative = true,
+            b"no-done" => {} // informational: we answer before `done` anyway
             b"filter" if v == b"blob:none" => f.filter = Some(Filter::BlobNone),
             b"filter" => {
                 f.filter = Some(Filter::BlobLimit(
@@ -332,7 +374,7 @@ fn parse_fetch(args: &[BString]) -> Result<FetchArgs, Error> {
             _ => return Err(bad("fetch", k)),
         }
     }
-    if f.wants.is_empty() {
+    if f.wants.is_empty() && f.want_refs.is_empty() {
         Err(Error::Protocol("fetch: no want lines".into()))
     } else {
         Ok(f)
@@ -478,11 +520,14 @@ pub fn write_fetch_prelude(
     w: &mut PktWriter,
     args: &FetchArgs,
     acks: &[ObjectId],
+    wanted_refs: &[(ObjectId, BString)],
     shallow: &[ObjectId],
     unshallow: &[ObjectId],
 ) -> Result<bool, Error> {
-    let ready = args.done || args.haves.is_empty() || !acks.is_empty();
-    if !args.done {
+    let ready = args.done || args.haves.is_empty() || acks.len() >= args.haves.len();
+    // acknowledgments + ready only exist when the client negotiated (sent haves) — a
+    // clone goes straight to shallow-info/packfile and rejects both outright
+    if !args.haves.is_empty() {
         w.text("acknowledgments")?;
         if acks.is_empty() {
             w.text("NAK")?;
@@ -505,6 +550,13 @@ pub fn write_fetch_prelude(
         }
         for u in unshallow {
             w.text(&format!("unshallow {u}"))?;
+        }
+        w.delim();
+    }
+    if !wanted_refs.is_empty() {
+        w.text("wanted-refs")?;
+        for (id, name) in wanted_refs {
+            w.text(&format!("{id} {}", name.as_bstr()))?;
         }
         w.delim();
     }

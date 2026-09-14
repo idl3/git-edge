@@ -290,9 +290,10 @@ impl Bucket {
     ) -> Result<Vec<(ObjectId, Vec<u8>)>, Error> {
         const GAP: u64 = 256 * 1024;
         const SPAN: u64 = 8 << 20;
+        const MAX_READ: u64 = 48 << 20; // a single call must fit inside the isolate
         let mut sorted: Vec<&(ObjectId, ObjLoc)> = locs.iter().collect();
         sorted.sort_by(|a, b| (&a.1.pack.0, a.1.offset).cmp(&(&b.1.pack.0, b.1.offset)));
-        let (mut out, mut i) = (Vec::with_capacity(locs.len()), 0usize);
+        let (mut out, mut i, mut total) = (Vec::with_capacity(locs.len()), 0usize, 0u64);
         while let Some(first) = sorted.get(i) {
             let (start, mut end, mut j) =
                 (first.1.offset, first.1.offset.saturating_add(u64::from(first.1.len)), i + 1);
@@ -306,6 +307,10 @@ impl Bucket {
                 }
                 end = end.max(n_end);
                 j += 1;
+            }
+            total = total.saturating_add(end.saturating_sub(start));
+            if total > MAX_READ {
+                return Err(Error::Limit("read batch exceeds memory budget".into()));
             }
             let key = keys::pack(&self.repo, &first.1.pack);
             let bytes = self.read_range(&key, start, end.saturating_sub(start), budget).await?;
@@ -729,6 +734,53 @@ impl<'s> Index<'s> {
                 break;
             }
         }
+        // idx order != offset order when a forward REF_DELTA was resolved late: the
+        // object kept its original idx but was appended at the pack's tail
+        out.sort_by_key(|l| l.offset);
+        Ok(out)
+    }
+    /// Commit-kind entries of one pack in the byte range [lo, hi) — 7.4 prefetch:
+    /// the commit walk's level reads extend into region reads so a linear history
+    /// costs one range read per window, not one per BFS level.
+    pub fn commits_in_range(
+        &self,
+        pack: &PackId,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Vec<(ObjectId, ObjLoc)>, Error> {
+        #[derive(Deserialize)]
+        struct R {
+            sha: String,
+            idx: u32,
+            offset: u64,
+            len: u32,
+            size: u64,
+        }
+        let rows = self
+            .exec(
+                "SELECT o.sha, o.idx, o.offset, o.len, o.size FROM objects o \
+                 JOIN packs p ON p.id = o.pack_id \
+                 WHERE o.pack_id=? AND o.kind=1 AND o.offset>=? AND o.offset<? \
+                 AND p.state='live' ORDER BY o.offset LIMIT 100000",
+                vec![V::from(pack.0.as_str()), i(lo)?, i(hi)?],
+            )?
+            .to_array::<R>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let id = ObjectId::from_hex(r.sha.as_bytes())
+                .map_err(|_| Error::Internal("bad sha in objects".into()))?;
+            out.push((
+                id,
+                ObjLoc {
+                    pack: pack.clone(),
+                    idx: r.idx,
+                    offset: r.offset,
+                    len: r.len,
+                    kind: Kind::Commit,
+                    size: r.size,
+                },
+            ));
+        }
         Ok(out)
     }
     /// Safe to repeat: ON CONFLICT DO NOTHING per row (a retried /_do/push/index is a no-op).
@@ -774,18 +826,44 @@ pub mod schema {
         "CREATE TABLE IF NOT EXISTS reflog (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, old TEXT NOT NULL, new TEXT NOT NULL, push_id TEXT NOT NULL, principal TEXT NOT NULL, at INTEGER NOT NULL)",
         "CREATE INDEX IF NOT EXISTS reflog_at ON reflog(at)",
         "CREATE TABLE IF NOT EXISTS pushes (id TEXT PRIMARY KEY, state TEXT NOT NULL, pack_id TEXT, principal TEXT NOT NULL, began_at INTEGER NOT NULL, ended_at INTEGER, gc_epoch INTEGER NOT NULL, result TEXT, swept_at INTEGER) WITHOUT ROWID",
+        "CREATE INDEX IF NOT EXISTS pushes_state ON pushes(state)",
         "CREATE TABLE IF NOT EXISTS packs (id TEXT PRIMARY KEY, state TEXT NOT NULL, count INTEGER NOT NULL, bytes INTEGER NOT NULL, commit_lo INTEGER NOT NULL, commit_hi INTEGER NOT NULL, push_id TEXT, created_at INTEGER NOT NULL, dead_at INTEGER) WITHOUT ROWID",
+        "CREATE INDEX IF NOT EXISTS packs_state ON packs(state)",
         "CREATE TABLE IF NOT EXISTS objects (sha TEXT NOT NULL, pack_id TEXT NOT NULL, idx INTEGER NOT NULL, offset INTEGER NOT NULL, len INTEGER NOT NULL, kind INTEGER NOT NULL, size INTEGER NOT NULL, PRIMARY KEY (sha, pack_id)) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS objects_pack ON objects(pack_id, idx)",
+        "CREATE INDEX IF NOT EXISTS objects_pack_off ON objects(pack_id, offset)",
         "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, run_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, cursor TEXT, payload TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'queued', last_error TEXT, started_at INTEGER)",
         "CREATE TABLE IF NOT EXISTS marked (pack_id TEXT PRIMARY KEY, bitmap BLOB NOT NULL) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_frontier (sha TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_seen (sha TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_parts (part_no INTEGER PRIMARY KEY, etag TEXT NOT NULL)",
     ];
+    /// Columns added after first deploy. CREATE TABLE IF NOT EXISTS never updates an
+    /// existing table, so DOs booted under an older schema need ALTER TABLE — SQLite
+    /// does that only if the column is missing (checked via PRAGMA table_info).
+    const LATE_COLS: &[(&str, &str, &str)] = &[
+        ("pushes", "swept_at", "swept_at INTEGER"),
+        ("packs", "dead_at", "dead_at INTEGER"),
+        ("jobs", "started_at", "started_at INTEGER"),
+    ];
     pub fn migrate(sql: &SqlStorage) -> Result<(), Error> {
         for q in DDL {
             sql.exec(q, Some(Vec::<V>::new())).map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        #[derive(serde::Deserialize)]
+        struct Col {
+            name: String,
+        }
+        for (table, col, decl) in LATE_COLS {
+            let cols = sql
+                .exec(&format!("PRAGMA table_info({table})"), Some(Vec::<V>::new()))
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .to_array::<Col>()
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if !cols.iter().any(|c| c.name == *col) {
+                sql.exec(&format!("ALTER TABLE {table} ADD COLUMN {decl}"), Some(Vec::<V>::new()))
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
         }
         Ok(())
     }

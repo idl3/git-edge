@@ -672,3 +672,50 @@ the observability surface the GC tests use.
   error"); the full error goes to the worker log.
 - Token comparison is constant-time.
 - `reflog(at)` is indexed for the janitor expiry scan.
+
+**A20. Adversarial round 2 (amends 3.3, 4, 6.3, 7.4, 10, 11).** Five parallel audits
+(security, concurrency, protocol, perf/scale, plus a manual pass) plus live client probes
+produced these corrections, all verified against git 2.54:
+
+- Receive header parsing is restartable, not resumable: a command section split across a
+  64 KiB fill boundary is re-parsed from the accumulated buffer each round (bounded by the
+  1 MiB cap). A flush-only receive-pack request is legal (an up-to-date push) and answers
+  200 + one flush pkt — never a protocol error.
+- The v2 fetch response emits `acknowledgments`/`ready` only when the client sent `have`
+  lines; a clone (no haves) goes straight to `shallow-info`/`wanted-refs`/`packfile`, and
+  git rejects the negotiation sections when no negotiation happened.
+- `deepen-since`, `deepen-not`, `deepen-relative`, `want-ref`, `include-tag`, and
+  `shallow`/`unshallow` response lines are implemented (sections 9.2/9.3). `deepen-not`
+  carries ref *names* — resolved server-side to tips. The shallow boundary emitted is the
+  sent commit adjacent to the cut, and excluded-side commits are never used as sparse-edge
+  bases. Verified live: `--depth`, `--deepen`, `--shallow-since`, `--shallow-exclude`,
+  `--unshallow`, `--filter=blob:none` with promisor checkout, all `fsck`-clean.
+- A mid-stream fetch error is one band-3 `ERR` frame, then the stream ends; the failing
+  step is never retried.
+- `plan_reads` asserts the objects index still matches the in-memory bitmap: a `gc_sweep`
+  or push-abort landing between mark and plan now fails the fetch instead of writing a
+  wire-corrupt pack.
+- Ingest strictness: commits whose headers do not parse and tags that do not parse are
+  `unpack` failures — a malformed object can never enter the index and poison every later
+  read. Forward `REF_DELTA` bases (a delta naming a later entry) resolve in a bounded
+  fixpoint pass, matching index-pack.
+- Memory is byte-bounded, not object-bounded: delta chains cap at 64 MiB of compressed
+  input (`MAX_CHAIN_BYTES`), `read_entries` refuses a batch over 48 MiB, `MemFind` growth
+  is checked inside the decode loop, `MAX_ENTRIES` is 1M (~40 B/record), refs are capped at
+  65 536, `ls-refs` takes at most 32 `ref-prefix` arguments.
+- `SendSet::mark` is O(1) via a pack-id index, not O(#packs) per object.
+- 7.4 commit-region prefetch is implemented: each walk level's coalesced read extends
+  ±2 MiB (`PREFETCH`) around the needed span and every commit entry inside rides along;
+  `commits_in_range` (objects(pack_id, offset) index) maps the region back to ids. A
+  linear history costs one range read per ~4 MiB of commit bytes, not one per level —
+  the ~9 000-commit depth ceiling is gone.
+- The janitor propagates R2 delete failures (a marked-swept row whose delete failed would
+  orphan bytes forever); `pushes(state)` and `packs(state)` are indexed; post-`begin`
+  failures close the push row via `/_do/push/abort` rather than leaking `open` rows for
+  the 1 h expiry.
+- The fetch and error arms of the DO router rearm the job alarm; `gc` slices heartbeat
+  `jobs.started_at` through checkpoint spans so `repair` never kills live work.
+- Route segments reject `.`/`..`; the auth scheme match is case-insensitive (RFC 7235) and
+  a missing `GE_READ_TOKEN` fails the read-token compare instead of erroring writes;
+  client-derived strings in `ERR`/`unpack`/`ng` lines are sanitized (non-graphic -> `?`)
+  and `x-ge-subrequests: <used+planned>/<max>` rides fetch responses (contract 406).

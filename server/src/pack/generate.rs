@@ -37,6 +37,7 @@ pub struct Read {
 #[derive(Default)]
 pub struct SendSet {
     pub packs: Vec<PackSlice>,
+    by_pack: HashMap<PackId, usize>,
     pub reads: Vec<Read>,
     pub shallow: Vec<ObjectId>,
     pub unshallow: Vec<ObjectId>,
@@ -44,13 +45,15 @@ pub struct SendSet {
 impl SendSet {
     /// Sync, idempotent: one bit per objects.idx (2.3).
     fn mark(&mut self, idx: &Index<'_>, loc: &ObjLoc) -> Result<(), Error> {
-        let i = match self.packs.iter().position(|p| p.pack == loc.pack) {
-            Some(i) => i,
+        let i = match self.by_pack.get(&loc.pack) {
+            Some(&i) => i,
             None => {
                 let (count, bytes) = idx.pack_meta(&loc.pack)?;
                 let bits = usize::try_from(count).map_err(|_| Error::Internal("count".into()))?.div_ceil(8);
                 self.packs.push(PackSlice { pack: loc.pack.clone(), count, bytes, bitmap: vec![0; bits] });
-                self.packs.len().saturating_sub(1)
+                let i = self.packs.len().saturating_sub(1);
+                self.by_pack.insert(loc.pack.clone(), i);
+                i
             }
         };
         let byte = usize::try_from(loc.idx / 8).map_err(|_| Error::Internal("idx".into()))?;
@@ -73,6 +76,10 @@ pub async fn send_set(
     haves: &[ObjectId],
     filter: Option<&Filter>,
     deepen: Option<u32>,
+    deepen_since: Option<i64>,
+    deepen_not: &[ObjectId],
+    deepen_relative: bool,
+    include_tag: bool,
     client_shallow: &[ObjectId],
     budget: &mut ReqBudget,
 ) -> Result<SendSet, Error> {
@@ -86,13 +93,19 @@ pub async fn send_set(
         (SendSet::default(), MemFind::default(), HashSet::<ObjectId>::new(), Vec::new());
     let (mut commits, mut trees, mut bases, mut edge, mut tags) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::<ObjectId>::new());
+    // want commits are marked into the pack unconditionally (seed), so `sent` must
+    // know about them even when the walk later treats them as excluded boundaries
+    let mut sent: HashSet<ObjectId> = HashSet::new();
     for (id, loc) in wants.iter().zip(idx.lookup(wants)?) {
         // step 1: every want must be live
         let loc = loc.ok_or_else(|| Error::Protocol(format!("upload-pack: not our ref {id}")))?;
         set.mark(&idx, &loc)?;
         seen.insert(*id);
         match loc.kind {
-            Kind::Commit => commits.push(*id),
+            Kind::Commit => {
+                commits.push(*id);
+                sent.insert(*id);
+            }
             Kind::Tree => trees.push(*id),
             Kind::Tag => tags.push(*id),
             Kind::Blob => {}
@@ -117,51 +130,157 @@ pub async fn send_set(
         }
         mem.clear();
     }
-    let cap = deepen.unwrap_or(u32::MAX); // deepen n: depths 0..n-1 are sent
-    if deepen == Some(INFINITE) {
-        commits.extend(cs.iter().copied()); // --unshallow
+    let cap = deepen.unwrap_or(u32::MAX); // deepen n: the want tips are depth 1
+    // shallow mode = any of deepen / deepen-since / deepen-not active
+    let shallow_mode = deepen.is_some() || deepen_since.is_some() || !deepen_not.is_empty();
+    let mut mem = MemFind::default();
+    let mut buf = Vec::new();
+    // deepen-not excludes every commit reachable from its tips, not just the tips.
+    // Bounded BFS over the excluded side; a too-big exclusion fails the request.
+    let mut nots: HashSet<ObjectId> = HashSet::new();
+    {
+        let mut frontier: Vec<ObjectId> = deepen_not.to_vec();
+        while !frontier.is_empty() {
+            frontier.sort_unstable();
+            frontier.dedup();
+            frontier.retain(|c| !nots.contains(c));
+            if frontier.is_empty() {
+                break;
+            }
+            if nots.len().saturating_add(frontier.len()) > MAX_COMMITS {
+                return Err(Error::Limit(TOO_BIG.into()));
+            }
+            // a deepen-not tip we don't hold excludes nothing — skip it
+            frontier = frontier
+                .iter()
+                .zip(idx.lookup(&frontier)?)
+                .filter_map(|(c, l)| l.map(|_| *c))
+                .collect();
+            if frontier.is_empty() {
+                break;
+            }
+            // load_commits: prefetched commits stay in `mem` across rounds (7.4)
+            let locs = load_commits(&idx, bucket, &mut mem, &frontier, budget).await?;
+            let mut nxt = Vec::new();
+            for (c, loc) in frontier.drain(..).zip(locs) {
+                nots.insert(c);
+                if loc.kind != Kind::Commit {
+                    continue; // tag tips are already peeled by the client; ignore non-commits
+                }
+                let data = find(&mem, &c, &mut buf)?;
+                for p in CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1).parent_ids() {
+                    if !nots.contains(&p) {
+                        nxt.push(p);
+                    }
+                }
+            }
+            frontier = nxt;
+        }
     }
-    let (mut depth, mut lvl) = (HashMap::<ObjectId, u32>::new(), 0u32);
-    while !commits.is_empty() {
-        commits.sort_unstable();
-        commits.dedup();
-        commits.retain(|c| !depth.contains_key(c)); // BFS by level: first depth wins
-        if depth.len().saturating_add(commits.len()) > MAX_COMMITS {
+    if deepen == Some(INFINITE) {
+        // --unshallow: descend below every *known* client shallow boundary; an id we
+        // don't hold just isn't descended past
+        let known: Vec<ObjectId> = cs
+            .iter()
+            .zip(idx.lookup(&cs.iter().copied().collect::<Vec<_>>())?)
+            .filter_map(|(c, l)| l.map(|_| *c))
+            .collect();
+        commits.extend(known);
+    }
+    // Each queue entry carries its own depth: with deepen-relative (or --unshallow)
+    // a client's shallow boundary is not a wall — the walk continues beneath it at
+    // relative depth 1. Acked commits are walls in every other mode.
+    let mut depth = HashMap::<ObjectId, u32>::new();
+    let mut parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    let mut queue: Vec<(ObjectId, u32)> = commits.into_iter().map(|c| (c, 1)).collect();
+    while !queue.is_empty() {
+        queue.sort_unstable();
+        queue.dedup();
+        queue.dedup_by(|a, b| a.0 == b.0); // same commit twice: keep the shallower depth
+        queue.retain(|(c, _)| !depth.contains_key(c)); // first (shallowest) visit wins
+        if depth.len().saturating_add(queue.len()) > MAX_COMMITS {
             return Err(Error::Limit(TOO_BIG.into()));
         }
-        let (locs, mut next) = (load(&idx, bucket, &mut mem, &commits, budget).await?, Vec::new());
-        for (c, loc) in std::mem::take(&mut commits).into_iter().zip(locs) {
+        let ids: Vec<ObjectId> = queue.iter().map(|(c, _)| *c).collect();
+        // load_commits keeps prefetched commits resident across levels (7.4)
+        let (locs, mut next) = (load_commits(&idx, bucket, &mut mem, &ids, budget).await?, Vec::new());
+        for ((c, d), loc) in std::mem::take(&mut queue).into_iter().zip(locs) {
             let data = find(&mem, &c, &mut buf)?;
-            depth.insert(c, lvl);
+            depth.insert(c, d);
             let tree = CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1).tree_id().map_err(|e| Error::Storage(e.to_string()))?;
             let parents: Vec<ObjectId> = CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1).parent_ids().collect();
-            let (is_ack, is_cs, boundary) =
-                (acks.contains(&c), cs.contains(&c), lvl.saturating_add(1) >= cap);
-            if is_ack {
-                bases.push(tree);
-            } else {
-                set.mark(&idx, &loc)?;
-                trees.push(tree);
-            }
-            if deepen.is_some() && is_cs && !boundary {
+            // Walls (unsent, unwalked): is_ack (client has it), is_not (excluded side),
+            // since_boundary (older than the cutoff). is_cs is the client's existing
+            // shallow boundary — a wall except under relative/infinite deepening, which
+            // unshallows it and descends beneath. depth_boundary IS sent then stops.
+            let is_ack = acks.contains(&c);
+            let is_cs = cs.contains(&c);
+            let is_not = nots.contains(&c);
+            let since_boundary = deepen_since
+                .map(|since| committer_ts(data).map(|t| t < since).unwrap_or(false))
+                .unwrap_or(false);
+            let depth_boundary = deepen.is_some() && d >= cap;
+            let descend_past_cs = is_cs
+                && (deepen_relative || deepen == Some(INFINITE))
+                && deepen.is_some();
+            if descend_past_cs {
+                // client already holds this boundary commit: unshallow it, then count
+                // fresh relative depth beneath it
                 set.unshallow.push(c);
-            } else if deepen.is_some() && boundary && !parents.is_empty() && !is_cs {
-                set.shallow.push(c);
+                bases.push(tree);
+                if shallow_mode {
+                    parents_of.insert(c, parents.clone());
+                }
+                for p in parents {
+                    next.push((p, 1));
+                }
+                continue;
             }
-            if (deepen.is_some() && boundary) || (deepen.is_none() && (is_ack || is_cs)) {
+            if is_ack || is_cs {
+                bases.push(tree); // provably client-side: a valid sparse-edge base
+            } else if !is_not && !since_boundary {
+                set.mark(&idx, &loc)?;
+                sent.insert(c);
+            }
+            if sent.contains(&c) {
+                trees.push(tree); // a sent commit still needs its tree expanded
+            }
+            if shallow_mode {
+                parents_of.insert(c, parents.clone());
+            }
+            let walk_past_ack = is_ack
+                && (deepen_relative || deepen == Some(INFINITE))
+                && deepen.is_some();
+            if (is_ack || is_cs || is_not || since_boundary || depth_boundary) && !walk_past_ack {
                 continue;
             }
             for p in parents {
-                if deepen.is_some() || !acks.contains(&p) {
-                    next.push(p);
+                if shallow_mode || !acks.contains(&p) {
+                    next.push((p, d.saturating_add(1)));
                 } else {
                     edge.push(p);
                 }
             }
         }
-        mem.clear();
-        commits = next;
-        lvl = lvl.saturating_add(1);
+        queue = next;
+        // no mem.clear() — prefetched commits carry later levels (7.4); MAX_MEM bounds it
+    }
+    mem.clear();
+    // The client's new bottom edge: every sent commit at the depth cap, or adjacent
+    // to a parent the client will not have (excluded side, since cut, or unseen).
+    if shallow_mode {
+        for c in &sent {
+            let Some(ps) = parents_of.get(c) else {
+                continue;
+            };
+            let capped = deepen.is_some() && depth.get(c).copied().unwrap_or(1) >= cap;
+            let cut = ps
+                .iter()
+                .any(|p| !sent.contains(p) && !acks.contains(p) && !cs.contains(p));
+            if capped || cut {
+                set.shallow.push(*c);
+            }
+        }
     }
     edge.sort_unstable();
     edge.dedup();
@@ -206,8 +325,57 @@ pub async fn send_set(
         }
         items = next;
     }
+    if include_tag {
+        // include-tag: every tag object whose peeled target the client will hold rides
+        // along — that means sent, already-had, or an existing client shallow boundary,
+        // never a walked-but-unsent wall (excluded side / pre-cutoff)
+        for r in exec_refs_tags(&sql)? {
+            let (Ok(peeled), Ok(tag)) = (
+                r.peeled.as_deref().map(|p| ObjectId::from_hex(p.as_bytes())).transpose(),
+                ObjectId::from_hex(r.target.as_bytes()),
+            ) else {
+                continue;
+            };
+            if let Some(peeled) = peeled {
+                if sent.contains(&peeled) || acks.contains(&peeled) || cs.contains(&peeled) {
+                    if let Some(l) = idx.lookup(&[tag])?.into_iter().flatten().next() {
+                        set.mark(&idx, &l)?;
+                    }
+                }
+            }
+        }
+    }
     plan_reads(&idx, &mut set, budget)?;
     Ok(set)
+}
+
+fn exec_refs_tags(sql: &worker::SqlStorage) -> Result<Vec<TagPair>, Error> {
+    sql.exec(
+        "SELECT target, peeled FROM refs WHERE name LIKE 'refs/tags/%' AND peeled IS NOT NULL",
+        None,
+    )
+    .map_err(|e| Error::Storage(e.to_string()))?
+    .to_array::<TagPair>()
+    .map_err(|e| Error::Storage(e.to_string()))
+}
+#[derive(serde::Deserialize)]
+struct TagPair {
+    target: String,
+    peeled: Option<String>,
+}
+/// `<ts>` of a commit's `committer` header: "committer N <e> <ts> <tz>".
+fn committer_ts(data: &[u8]) -> Option<i64> {
+    for line in data.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            break; // headers end at the blank line
+        }
+        if let Some(rest) = line.strip_prefix(b"committer ") {
+            let parts: Vec<&[u8]> = rest.split(|b| *b == b' ').collect();
+            let n = parts.len();
+            return std::str::from_utf8(parts.get(n.checked_sub(2)?)?).ok()?.parse().ok();
+        }
+    }
+    None
 }
 
 /// One round of the section 9 loop: sync lookup, one coalesced async read (7.2), decode into mem.
@@ -226,12 +394,67 @@ async fn load(
     for (id, entry) in bucket.read_entries(&locs, budget).await? {
         let (k, data) = codec::decode_entry(&entry)?;
         mem.insert(id, k, data);
+        if mem.bytes > MAX_MEM {
+            // bail inside the loop: a decoded round must never exceed the budget
+            return Err(Error::Limit(TOO_BIG.into()));
+        }
     }
-    if mem.bytes > MAX_MEM {
-        Err(Error::Limit(TOO_BIG.into()))
-    } else {
-        Ok(locs.into_iter().map(|(_, l)| l).collect())
+    Ok(locs.into_iter().map(|(_, l)| l).collect())
+}
+
+/// 7.4 commit-region prefetch. A commit walk otherwise pays one coalesced read per BFS
+/// level — ~1 subrequest per commit on a linear history, hitting the subrequest budget
+/// around ~9k depth. Pushed packs lay commits out near-contiguously, so each level's
+/// span is extended by PREFETCH on both sides and every commit entry inside rides the
+/// same range read; later levels then resolve from `mem` with no read at all. `mem` must
+/// NOT be cleared between levels for this to help (bounded by MAX_MEM / MAX_COMMITS).
+const PREFETCH: u64 = 2 << 20;
+
+async fn load_commits(
+    idx: &Index<'_>,
+    bucket: &Bucket,
+    mem: &mut MemFind,
+    ids: &[ObjectId],
+    budget: &mut ReqBudget,
+) -> Result<Vec<ObjLoc>, Error> {
+    let locs: Vec<(ObjectId, ObjLoc)> = ids
+        .iter()
+        .zip(idx.lookup(ids)?)
+        .map(|(id, l)| l.map(|l| (*id, l)).ok_or_else(|| Error::Internal(format!("reachable {id} is not live"))))
+        .collect::<Result<_, _>>()?;
+    let mut missing: Vec<(ObjectId, ObjLoc)> =
+        locs.iter().filter(|(id, _)| !mem.exists(id)).cloned().collect();
+    if !missing.is_empty() {
+        // extend each touched pack's needed span by PREFETCH, clipped to the pack size
+        let mut spans: HashMap<PackId, (u64, u64)> = HashMap::new();
+        for (_, l) in &missing {
+            let e = spans
+                .entry(l.pack.clone())
+                .or_insert((l.offset, l.offset.saturating_add(u64::from(l.len))));
+            e.0 = e.0.min(l.offset);
+            e.1 = e.1.max(l.offset.saturating_add(u64::from(l.len)));
+        }
+        for (pack, (lo, hi)) in spans {
+            let (_, bytes) = idx.pack_meta(&pack)?;
+            let lo = lo.saturating_sub(PREFETCH);
+            let hi = hi.saturating_add(PREFETCH).min(bytes);
+            for pair in idx.commits_in_range(&pack, lo, hi)? {
+                if !mem.exists(&pair.0) {
+                    missing.push(pair);
+                }
+            }
+        }
+        missing.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        missing.dedup_by(|a, b| a.0 == b.0);
+        for (id, entry) in bucket.read_entries(&missing, budget).await? {
+            let (k, data) = codec::decode_entry(&entry)?;
+            mem.insert(id, k, data);
+            if mem.bytes > MAX_MEM {
+                return Err(Error::Limit(TOO_BIG.into()));
+            }
+        }
     }
+    Ok(locs.into_iter().map(|(_, l)| l).collect())
 }
 
 fn find<'a>(mem: &'a MemFind, id: &ObjectId, _buf: &mut Vec<u8>) -> Result<&'a [u8], Error> {
@@ -284,6 +507,13 @@ pub fn plan_reads(idx: &Index<'_>, set: &mut SendSet, budget: &ReqBudget) -> Res
     let mut reads = Vec::new();
     for (pi, p) in set.packs.iter().enumerate() {
         let locs = idx.entries_of(&p.pack, &p.bitmap)?;
+        // a gc_sweep/abort landing between mark and plan deletes `objects` rows out
+        // from under the in-memory bitmap — without this check the PACK header count
+        // would exceed the entries emitted and the response is wire-corrupt
+        let marked: usize = p.bitmap.iter().map(|b| b.count_ones() as usize).sum();
+        if locs.len() != marked {
+            return Err(Error::Storage("pack index changed mid-fetch".into()));
+        }
         let plan = coalesce(pi, &locs, GAP);
         reads.extend(if u64::try_from(plan.len()).unwrap_or(u64::MAX) > p.bytes.div_ceil(WINDOW) {
             coalesce(pi, &locs, WINDOW)

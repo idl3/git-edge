@@ -30,6 +30,8 @@ impl RepoRoute {
     fn seg_ok(s: &str) -> bool {
         (1..=64).contains(&s.len())
             && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            && s != "."
+            && s != ".."
     }
     pub fn parse(path: &str) -> Result<(Self, String), Error> {
         let mut it = path.strip_prefix('/').ok_or(Error::NotFound)?.splitn(3, '/');

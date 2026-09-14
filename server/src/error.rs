@@ -94,12 +94,20 @@ impl Error {
         }
     }
     /// The client-safe form: Internal/Storage details (R2 keys, SQL errors) stay in the
-    /// worker log; clients get a generic string. Everything else passes through.
+    /// worker log; clients get a generic string. Everything else passes through —
+    /// sanitized: messages can carry raw client bytes, and control chars/newlines
+    /// would corrupt the pkt-line stream or the user's terminal.
     pub fn client_message(&self) -> String {
-        match self {
+        let m = match self {
             Error::Storage(_) | Error::Internal(_) => "internal error".into(),
             _ => self.message(),
-        }
+        };
+        let clean: String = m
+            .chars()
+            .take(512)
+            .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+            .collect();
+        clean
     }
 
     /// Pre-response mapping (section 10, amended by A2).

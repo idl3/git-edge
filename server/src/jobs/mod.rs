@@ -71,6 +71,17 @@ impl SliceBudget {
     }
 }
 
+/// A checkpoint span refreshes the lease: `repair` may only requeue a row whose started_at
+/// has gone stale — a progressing slice heartbeats and is never mistaken for a stranded one.
+pub fn heartbeat(sql: &SqlStorage, job_id: i64) -> Result<(), Error> {
+    sql.exec(
+        "UPDATE jobs SET started_at=? WHERE id=? AND state='running'",
+        Some(vec![V::from(platform::now_ms()), V::from(job_id)]),
+    )
+    .map_err(|e| Error::Storage(e.to_string()))?;
+    Ok(())
+}
+
 /// Sync; writes the row only (A3). Dedups against 'queued' rows: at most one queued row per kind.
 /// Deduping against 'running' too would suppress a job's own re-enqueue (edge review), so a running
 /// row does not block a new enqueue — the next dispatch simply runs the kind again, which is
@@ -112,8 +123,17 @@ pub async fn rearm(d: &RepoDo) -> Result<(), Error> {
 /// killed isolate stranded (a slice cannot legally exceed ~20 s; 60 s is generous).
 pub fn repair(sql: &SqlStorage) -> Result<(), Error> {
     let now = platform::now_ms();
+    // a stranded 'running' row is a crashed slice — it must count as an attempt or a
+    // crash-looping job retries at every boot forever, bypassing the dead threshold
     sql.exec(
-        "UPDATE jobs SET state='queued', run_at=? WHERE state='running' AND started_at < ?",
+        "UPDATE jobs SET state='dead', last_error='stranded: attempts exhausted' \
+         WHERE state='running' AND started_at < ? AND attempts >= 8",
+        Some(vec![V::from(now.saturating_sub(60_000))]),
+    )
+    .map_err(|e| Error::Storage(e.to_string()))?;
+    sql.exec(
+        "UPDATE jobs SET state='queued', run_at=?, attempts=attempts+1, last_error='stranded mid-slice' \
+         WHERE state='running' AND started_at < ? AND attempts < 8",
         Some(vec![V::from(now), V::from(now.saturating_sub(60_000))]),
     )
     .map_err(|e| Error::Storage(e.to_string()))?;
@@ -144,6 +164,31 @@ pub fn repair(sql: &SqlStorage) -> Result<(), Error> {
             .one::<N>()
             .map_err(|e| Error::Storage(e.to_string()))?;
         if n.n > 0 {
+            // keep the last failure inspectable — the rows are deleted and a fresh job
+            // has no error context otherwise
+            #[derive(serde::Deserialize)]
+            struct Dead {
+                last_error: Option<String>,
+            }
+            let err = sql
+                .exec(
+                    "SELECT last_error FROM jobs WHERE kind=? AND state='dead' AND last_error IS NOT NULL \
+                     ORDER BY id DESC LIMIT 1",
+                    Some(vec![V::from(kind.as_str())]),
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .to_array::<Dead>()
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .into_iter()
+                .next()
+                .and_then(|d| d.last_error);
+            if let Some(e) = err {
+                sql.exec(
+                    "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    Some(vec![V::from(format!("dead.{}", kind.as_str())), V::from(e)]),
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            }
             sql.exec("DELETE FROM jobs WHERE kind=? AND state='dead'", Some(vec![V::from(kind.as_str())]))
                 .map_err(|e| Error::Storage(e.to_string()))?;
             enqueue(sql, kind, now, "{}")?;

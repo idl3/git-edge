@@ -154,7 +154,7 @@ fn chunks(loads: &[(ObjectId, ObjLoc)]) -> Vec<Vec<(ObjectId, ObjLoc)>> {
 
 /// GcMark (5.1): exact reachability over live objects; one bit per (pack, idx). A frontier row is
 /// deleted only inside the span that records its expansion — a kill mid-round replays it.
-pub async fn gc_mark(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Result<SliceOutcome, Error> {
+pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<SliceOutcome, Error> {
     let sql = d.sql();
     if d.meta_opt("gc.started_at")?.is_none() {
         // first slice: refuse to overlap a chain already mid-flight
@@ -256,8 +256,16 @@ pub async fn gc_mark(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Result
                 for l in extract_links(kind, &data)? {
                     kids.push(l.to_string());
                 }
+                // a giant tree can yield hundreds of thousands of links in one chunk —
+                // flush admission early rather than OOM mid-slice (an OOM kill never
+                // increments attempts and would wedge the job forever)
+                if kids.len() > 50_000 {
+                    commit_ids(&sql, &[], &kids, &mut bits)?;
+                    kids.clear();
+                }
             }
             commit_ids(&sql, &ids, &kids, &mut bits)?; // span B: expansion commits
+            super::heartbeat(&sql, job.id)?; // a progressing slice is not a straggler
             if budget.spent_80pct() {
                 break;
             }
@@ -265,6 +273,7 @@ pub async fn gc_mark(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Result
         let rest: Vec<String> = batch.iter().filter(|s| !load_ids.contains(*s)).cloned().collect();
         if !rest.is_empty() {
             commit_ids(&sql, &rest, &[], &mut bits)?; // blobs/misses: nothing to read
+            super::heartbeat(&sql, job.id)?;
         }
     }
 }
@@ -318,7 +327,7 @@ enum Flow {
 }
 
 /// GcConsolidate (5.2): one new normalized pack holding exactly the marked entries, verbatim.
-pub async fn gc_consolidate(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Result<SliceOutcome, Error> {
+pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<SliceOutcome, Error> {
     let sql = d.sql();
     let bucket = d.bucket()?;
     loop {
@@ -349,7 +358,7 @@ pub async fn gc_consolidate(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) ->
             )
             .await?
         };
-        match build(d, &sql, &bucket, &key, out, &mut pos, budget).await? {
+        match build(d, &sql, &bucket, &key, out, &mut pos, job.id, budget).await? {
             Flow::Yield => return Ok(SliceOutcome::Continue { cursor: "{}".into() }),
             Flow::Done => return Ok(SliceOutcome::Done),
             Flow::Retry(e) => return Err(e), // 4.4 backoff; second failure -> Rebuild
@@ -368,6 +377,7 @@ async fn build(
     key: &str,
     mut out: PackWriter,
     pos: &mut Pos,
+    job_id: i64,
     budget: &mut SliceBudget,
 ) -> Result<Flow, Error> {
     let cands: Vec<String> = exec(sql, "SELECT pack_id FROM marked ORDER BY pack_id", vec![])?
@@ -431,6 +441,9 @@ async fn build(
         }
         let locs: Vec<(ObjectId, ObjLoc)> = rows.iter().map(loc).collect::<Result<_, _>>()?;
         for chunk in chunks(&locs) {
+            if budget.spent_80pct() {
+                return Ok(Flow::Yield); // the inner batch can run ~90 reads — still bounded
+            }
             for (id, entry) in bucket.read_entries(&chunk, &mut budget.req).await? {
                 let r = rows
                     .iter()
@@ -459,7 +472,7 @@ async fn build(
             Index(sql).insert_objects(&PackId(pos.pack.clone()), &staged)?;
             staged.clear();
         }
-        if let Some(f) = flush(d, sql, bucket, key, &mut out, pos, &mut staged, &mut in_part, budget).await? {
+        if let Some(f) = flush(d, sql, bucket, key, &mut out, pos, &mut staged, &mut in_part, job_id, budget).await? {
             return Ok(f);
         }
     }
@@ -477,6 +490,7 @@ async fn flush(
     pos: &mut Pos,
     staged: &mut Vec<ObjRow>,
     in_part: &mut u64,
+    job_id: i64,
     budget: &mut SliceBudget,
 ) -> Result<Option<Flow>, Error> {
     if *in_part < MIN_PART {
@@ -498,6 +512,7 @@ async fn flush(
     )?;
     pos.st = Some(st);
     put(d, "gc.pos", serde_json::to_string(pos).map_err(|e| Error::Internal(e.to_string()))?)?;
+    super::heartbeat(sql, job_id)?; // checkpoint span: refresh the repair lease
     Ok(None)
 }
 
@@ -575,6 +590,17 @@ fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
         }
         exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
         return Ok(None);
+    }
+    // a retried begin re-enters here with gc.new_pack still set — the prior build pack
+    // has push_id IS NULL, which the janitor deliberately never touches, so dead-mark
+    // it now or the row (and eventually its R2 key) is orphaned forever
+    if let Some(p) = d.meta_opt("gc.new_pack")? {
+        exec(sql, "DELETE FROM objects WHERE pack_id=?", vec![p.clone().into()])?;
+        exec(
+            sql,
+            "UPDATE packs SET state='dead', dead_at=? WHERE id=? AND state='ingesting'",
+            vec![now_ms().into(), p.into()],
+        )?;
     }
     let pack = PackId::random()?;
     exec(
