@@ -136,6 +136,8 @@ pub struct ReceiveCaps {
 pub struct ReceiveHeader {
     pub commands: Vec<RefCommand>,
     pub caps: ReceiveCaps,
+    /// Client-shallow ids sent before a push — parsed for completeness but not needed:
+    /// a thin pack's bases resolve against server-live objects either way.
     pub shallow: Vec<ObjectId>,
 }
 
@@ -374,6 +376,16 @@ fn parse_fetch(args: &[BString]) -> Result<FetchArgs, Error> {
             _ => return Err(bad("fetch", k)),
         }
     }
+    // git dies on ambiguous shallow-cut combinations ("deepen and deepen-since (or
+    // deepen-not) cannot be used together"; since+not likewise)
+    if f.deepen.is_some() && (f.deepen_since.is_some() || !f.deepen_not.is_empty()) {
+        return Err(Error::Protocol(
+            "deepen and deepen-since (or deepen-not) cannot be used together".into(),
+        ));
+    }
+    if f.deepen_since.is_some() && !f.deepen_not.is_empty() {
+        return Err(Error::Protocol("deepen-since and deepen-not cannot be used together".into()));
+    }
     if f.wants.is_empty() && f.want_refs.is_empty() {
         Err(Error::Protocol("fetch: no want lines".into()))
     } else {
@@ -525,9 +537,10 @@ pub fn write_fetch_prelude(
     unshallow: &[ObjectId],
 ) -> Result<bool, Error> {
     let ready = args.done || args.haves.is_empty() || acks.len() >= args.haves.len();
-    // acknowledgments + ready only exist when the client negotiated (sent haves) — a
-    // clone goes straight to shallow-info/packfile and rejects both outright
-    if !args.haves.is_empty() {
+    // acknowledgments + ready only exist when the client negotiated (sent haves) —
+    // a clone goes straight to shallow-info/packfile and rejects both outright. The
+    // section is omitted entirely once the client sent `done` (rule 3).
+    if !args.haves.is_empty() && !args.done {
         w.text("acknowledgments")?;
         if acks.is_empty() {
             w.text("NAK")?;

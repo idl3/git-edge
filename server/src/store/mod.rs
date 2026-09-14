@@ -370,6 +370,21 @@ impl RawWriter {
         Ok(())
     }
     pub async fn finish(mut self, budget: &mut ReqBudget) -> Result<(), Error> {
+        if let Err(e) = self.finish_inner(budget).await {
+            // a dropped MultipartUpload leaves the upload and its parts orphaned in
+            // R2 — abort on any mid-finish failure. A failed complete() consumes the
+            // handle; that residual upload expires server-side.
+            let _ = self.mpu.abort().await;
+            return Err(e);
+        }
+        budget.charge(1)?;
+        self.mpu
+            .complete(std::mem::take(&mut self.parts))
+            .await
+            .map(|_| ())
+            .map_err(Error::from)
+    }
+    async fn finish_inner(&mut self, budget: &mut ReqBudget) -> Result<(), Error> {
         if !self.part.is_empty() {
             let last = std::mem::take(&mut self.part);
             let n = u16::try_from(self.parts.len().saturating_add(1))
@@ -377,8 +392,6 @@ impl RawWriter {
             budget.charge(1)?;
             self.parts.push(self.mpu.upload_part(n, last).await?);
         }
-        budget.charge(1)?;
-        self.mpu.complete(self.parts).await?;
         Ok(())
     }
     pub async fn abort(self) {
@@ -471,24 +484,20 @@ impl PackWriter {
     }
     /// Trailer, last part, complete. When this returns the pack is durable: section 3 step 1.
     pub async fn finish(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
-        if self.count != self.expected {
-            let msg = format!("wrote {} entries, header says {}", self.count, self.expected);
-            self.abort().await;
-            return Err(Error::Internal(msg));
-        }
-        let trailer = self.sha1.clone().fin();
-        self.part.extend_from_slice(&trailer);
-        self.flush_if_full(budget).await?;
-        if !self.part.is_empty() {
-            let last = std::mem::take(&mut self.part);
-            let n = u16::try_from(self.parts.len().saturating_add(1))
-                .map_err(|_| Error::Limit("too many parts".into()))?;
-            budget.charge(1)?;
-            self.parts.push(self.mpu.upload_part(n, last).await?);
+        if let Err(e) = self.finish_inner(budget).await {
+            // a dropped MultipartUpload leaves the upload and its parts orphaned in
+            // R2 — abort on any mid-finish failure. A failed complete() consumes the
+            // handle; that residual upload expires server-side.
+            let _ = self.mpu.abort().await;
+            return Err(e);
         }
         let bytes = self.offset.saturating_add(20);
         budget.charge(1)?;
-        let obj = self.mpu.complete(self.parts).await?;
+        let obj = self
+            .mpu
+            .complete(std::mem::take(&mut self.parts))
+            .await
+            .map_err(Error::from)?;
         if obj.size() != bytes {
             return Err(Error::Storage(format!("R2 holds {} bytes, wrote {bytes}", obj.size())));
         }
@@ -501,6 +510,25 @@ impl PackWriter {
             commit_hi: self.commit_hi,
             created_at: self.created_at,
         })
+    }
+    async fn finish_inner(&mut self, budget: &mut ReqBudget) -> Result<(), Error> {
+        if self.count != self.expected {
+            return Err(Error::Internal(format!(
+                "wrote {} entries, header says {}",
+                self.count, self.expected
+            )));
+        }
+        let trailer = self.sha1.clone().fin();
+        self.part.extend_from_slice(&trailer);
+        self.flush_if_full(budget).await?;
+        if !self.part.is_empty() {
+            let last = std::mem::take(&mut self.part);
+            let n = u16::try_from(self.parts.len().saturating_add(1))
+                .map_err(|_| Error::Limit("too many parts".into()))?;
+            budget.charge(1)?;
+            self.parts.push(self.mpu.upload_part(n, last).await?);
+        }
+        Ok(())
     }
     pub async fn abort(self) {
         let _ = self.mpu.abort().await;
@@ -629,7 +657,8 @@ impl<'s> Index<'s> {
                 .exec(
                     &format!(
                         "SELECT o.sha, o.pack_id, o.idx, o.offset, o.len, o.kind, o.size FROM objects o \
-                         JOIN packs p ON p.id = o.pack_id WHERE o.sha IN ({marks}) AND p.state = 'live'"
+                         JOIN packs p ON p.id = o.pack_id WHERE o.sha IN ({marks}) AND p.state = 'live' \
+                         GROUP BY o.sha"
                     ),
                     args,
                 )?
@@ -832,7 +861,7 @@ pub mod schema {
         "CREATE TABLE IF NOT EXISTS objects (sha TEXT NOT NULL, pack_id TEXT NOT NULL, idx INTEGER NOT NULL, offset INTEGER NOT NULL, len INTEGER NOT NULL, kind INTEGER NOT NULL, size INTEGER NOT NULL, PRIMARY KEY (sha, pack_id)) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS objects_pack ON objects(pack_id, idx)",
         "CREATE INDEX IF NOT EXISTS objects_pack_off ON objects(pack_id, offset)",
-        "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, run_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, cursor TEXT, payload TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'queued', last_error TEXT, started_at INTEGER)",
+        "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, run_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, cursor TEXT, payload TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'queued', last_error TEXT, started_at INTEGER, lease TEXT)",
         "CREATE TABLE IF NOT EXISTS marked (pack_id TEXT PRIMARY KEY, bitmap BLOB NOT NULL) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_frontier (sha TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_seen (sha TEXT PRIMARY KEY) WITHOUT ROWID",
@@ -845,6 +874,7 @@ pub mod schema {
         ("pushes", "swept_at", "swept_at INTEGER"),
         ("packs", "dead_at", "dead_at INTEGER"),
         ("jobs", "started_at", "started_at INTEGER"),
+        ("jobs", "lease", "lease TEXT"),
     ];
     pub fn migrate(sql: &SqlStorage) -> Result<(), Error> {
         for q in DDL {

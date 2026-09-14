@@ -2,6 +2,7 @@
 //! Ported from proofs-v2/partial-clone-filters.md.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use bstr::BString;
 use gix_hash::ObjectId;
@@ -10,7 +11,7 @@ use gix_object::{CommitRefIter, Kind, TagRef, TreeRefIter};
 use crate::error::Error;
 use crate::repo_do::RepoDo;
 use crate::store::{codec, keys, Bucket, Index, MemFind, ObjLoc, PackId};
-use crate::wire::{Filter, Sideband};
+use crate::wire::Filter;
 use crate::ReqBudget;
 
 pub const MAX_COMMITS: usize = 200_000;
@@ -187,52 +188,69 @@ pub async fn send_set(
             .collect();
         commits.extend(known);
     }
-    // Each queue entry carries its own depth: with deepen-relative (or --unshallow)
-    // a client's shallow boundary is not a wall — the walk continues beneath it at
-    // relative depth 1. Acked commits are walls in every other mode.
+    // Each queue entry carries its own depth from the want tips. In shallow modes the
+    // walk descends THROUGH client-shallow commits and acks — the boundary computation
+    // needs the graph below them (git's deepen does the same: a cs commit inside the
+    // new boundary is unshallowed and its parents packed). cs commits are client-held:
+    // never resent, and whether `unshallow` is emitted is decided post-walk once it is
+    // known which parents landed client-side. In non-shallow fetches acks/cs are hard
+    // walls — nothing below them can be of use to the client.
     let mut depth = HashMap::<ObjectId, u32>::new();
     let mut parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-    let mut queue: Vec<(ObjectId, u32)> = commits.into_iter().map(|c| (c, 1)).collect();
+    let mut visited_cs: HashSet<ObjectId> = HashSet::new();
+    // `counted` marks entries whose depth is the boundary depth: under absolute deepen
+    // everything counts from the tips; under deepen-relative only commits BELOW a
+    // client-shallow commit count (parents of a descended cs restart at 1), because
+    // the boundary is relative to the client's shallow list — commits above it are
+    // interior no matter how far from the tip they are.
+    let mut queue: Vec<(ObjectId, u32, bool)> =
+        commits.into_iter().map(|c| (c, 1, !deepen_relative)).collect();
     while !queue.is_empty() {
-        queue.sort_unstable();
-        queue.dedup();
-        queue.dedup_by(|a, b| a.0 == b.0); // same commit twice: keep the shallower depth
-        queue.retain(|(c, _)| !depth.contains_key(c)); // first (shallowest) visit wins
+        // a commit reached both above and below a cs boundary is boundary-counted —
+        // prefer the counted visit, then the shallower depth
+        queue.sort_by_key(|(c, d, ct)| (*c, !*ct, *d));
+        queue.dedup_by(|a, b| a.0 == b.0);
+        queue.retain(|(c, _, _)| !depth.contains_key(c)); // first visit wins
         if depth.len().saturating_add(queue.len()) > MAX_COMMITS {
             return Err(Error::Limit(TOO_BIG.into()));
         }
-        let ids: Vec<ObjectId> = queue.iter().map(|(c, _)| *c).collect();
+        let ids: Vec<ObjectId> = queue.iter().map(|(c, _, _)| *c).collect();
         // load_commits keeps prefetched commits resident across levels (7.4)
         let (locs, mut next) = (load_commits(&idx, bucket, &mut mem, &ids, budget).await?, Vec::new());
-        for ((c, d), loc) in std::mem::take(&mut queue).into_iter().zip(locs) {
+        for ((c, d, counted), loc) in std::mem::take(&mut queue).into_iter().zip(locs) {
             let data = find(&mem, &c, &mut buf)?;
             depth.insert(c, d);
             let tree = CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1).tree_id().map_err(|e| Error::Storage(e.to_string()))?;
             let parents: Vec<ObjectId> = CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1).parent_ids().collect();
+            if shallow_mode {
+                parents_of.insert(c, parents.clone());
+            }
             // Walls (unsent, unwalked): is_ack (client has it), is_not (excluded side),
             // since_boundary (older than the cutoff). is_cs is the client's existing
-            // shallow boundary — a wall except under relative/infinite deepening, which
-            // unshallows it and descends beneath. depth_boundary IS sent then stops.
+            // shallow boundary — client-held, never resent; under any shallow mode the
+            // walk may descend beneath it. depth_boundary IS sent then stops.
             let is_ack = acks.contains(&c);
             let is_cs = cs.contains(&c);
             let is_not = nots.contains(&c);
             let since_boundary = deepen_since
                 .map(|since| committer_ts(data).map(|t| t < since).unwrap_or(false))
                 .unwrap_or(false);
-            let depth_boundary = deepen.is_some() && d >= cap;
+            let depth_boundary =
+                deepen.is_some() && deepen != Some(INFINITE) && counted && d >= cap;
+            // A client-shallow commit the new boundary will pass: descend below it.
+            // Under absolute deepen only interior cs descend (d < cap) — a cs at the
+            // boundary stays the boundary; since/not decide interior-ness post-walk.
             let descend_past_cs = is_cs
-                && (deepen_relative || deepen == Some(INFINITE))
-                && deepen.is_some();
+                && shallow_mode
+                && (deepen_relative || deepen == Some(INFINITE) || deepen.is_none() || d < cap);
             if descend_past_cs {
-                // client already holds this boundary commit: unshallow it, then count
-                // fresh relative depth beneath it
-                set.unshallow.push(c);
-                bases.push(tree);
-                if shallow_mode {
-                    parents_of.insert(c, parents.clone());
-                }
+                visited_cs.insert(c);
+                bases.push(tree); // client holds it: a valid sparse-edge base
+                // below a client-shallow commit relative depth restarts at 1; absolute
+                // deepen keeps counting from the tips through the held commit
+                let nd = if deepen_relative || deepen == Some(INFINITE) { 1 } else { d.saturating_add(1) };
                 for p in parents {
-                    next.push((p, 1));
+                    next.push((p, nd, true));
                 }
                 continue;
             }
@@ -245,18 +263,20 @@ pub async fn send_set(
             if sent.contains(&c) {
                 trees.push(tree); // a sent commit still needs its tree expanded
             }
-            if shallow_mode {
-                parents_of.insert(c, parents.clone());
-            }
-            let walk_past_ack = is_ack
-                && (deepen_relative || deepen == Some(INFINITE))
-                && deepen.is_some();
-            if (is_ack || is_cs || is_not || since_boundary || depth_boundary) && !walk_past_ack {
+            // walls: excluded side, time cut, depth cap, any cs not descended, and
+            // acks — except that in shallow modes the walk must pass acks to reach
+            // client-shallow commits that sit below them
+            let walled = is_not
+                || since_boundary
+                || depth_boundary
+                || is_cs
+                || (is_ack && !shallow_mode);
+            if walled {
                 continue;
             }
             for p in parents {
                 if shallow_mode || !acks.contains(&p) {
-                    next.push((p, d.saturating_add(1)));
+                    next.push((p, d.saturating_add(1), counted));
                 } else {
                     edge.push(p);
                 }
@@ -266,18 +286,34 @@ pub async fn send_set(
         // no mem.clear() — prefetched commits carry later levels (7.4); MAX_MEM bounds it
     }
     mem.clear();
-    // The client's new bottom edge: every sent commit at the depth cap, or adjacent
-    // to a parent the client will not have (excluded side, since cut, or unseen).
     if shallow_mode {
+        // unshallow: a visited cs commit is interior once every parent is sent, acked,
+        // or itself client-shallow — one pass suffices because a cs parent is present
+        // in the client's store whether or not it is unshallowed itself.
+        for c in &visited_cs {
+            let interior = parents_of
+                .get(c)
+                .map(|ps| ps.iter().all(|p| sent.contains(p) || acks.contains(p) || cs.contains(p)))
+                .unwrap_or(false);
+            if interior {
+                set.unshallow.push(*c);
+            }
+        }
+        // The client's new bottom edge: a sent commit with any parent the client will
+        // not have (excluded side, since cut, depth cap, or unseen). Acks and cs are
+        // never emitted — the client holds them with their ancestry, and re-marking
+        // them shallow would truncate its history (git's send_shallow skips them).
         for c in &sent {
+            if acks.contains(c) || cs.contains(c) {
+                continue;
+            }
             let Some(ps) = parents_of.get(c) else {
                 continue;
             };
-            let capped = deepen.is_some() && depth.get(c).copied().unwrap_or(1) >= cap;
             let cut = ps
                 .iter()
                 .any(|p| !sent.contains(p) && !acks.contains(p) && !cs.contains(p));
-            if capped || cut {
+            if cut {
                 set.shallow.push(*c);
             }
         }
@@ -299,8 +335,11 @@ pub async fn send_set(
     bases.truncate(64);
     trees.sort_unstable();
     trees.dedup();
-    let mut items: Vec<(ObjectId, Vec<ObjectId>)> =
-        trees.into_iter().map(|t| (t, bases.clone())).collect();
+    // every initial item shares the same base set — share it via Rc instead of
+    // cloning a ≤64-oid Vec per tree (200k trees × ~1.3 KiB was a real spike)
+    let bases = Rc::new(bases);
+    let mut items: Vec<(ObjectId, Rc<Vec<ObjectId>>)> =
+        trees.into_iter().map(|t| (t, Rc::clone(&bases))).collect();
     while !items.is_empty() {
         let (mut next, mut blobs) = (Vec::new(), Vec::new());
         for chunk in items.chunks(CHUNK) {
@@ -313,7 +352,7 @@ pub async fn send_set(
             }
             load(&idx, bucket, &mut mem, &bs, budget).await?;
             for (t, b) in chunk {
-                expand_tree(&mem, t, b, filter, &mut seen, &mut next, &mut blobs)?;
+                expand_tree(&mem, t, b.as_slice(), filter, &mut seen, &mut next, &mut blobs)?;
             }
             mem.clear();
         }
@@ -469,7 +508,7 @@ fn expand_tree(
     bases: &[ObjectId],
     filter: Option<&Filter>,
     seen: &mut HashSet<ObjectId>,
-    next: &mut Vec<(ObjectId, Vec<ObjectId>)>,
+    next: &mut Vec<(ObjectId, Rc<Vec<ObjectId>>)>,
     blobs: &mut Vec<ObjectId>,
 ) -> Result<(), Error> {
     let (mut had, mut by_name, mut buf) = (HashSet::new(), HashMap::<BString, ObjectId>::new(), Vec::new());
@@ -494,7 +533,7 @@ fn expand_tree(
             return Err(Error::Limit(TOO_BIG.into()));
         }
         if e.mode.is_tree() {
-            next.push((oid, by_name.get(e.filename).into_iter().copied().collect()));
+            next.push((oid, Rc::new(by_name.get(e.filename).into_iter().copied().collect())));
         } else if !matches!(filter, Some(Filter::BlobNone)) {
             blobs.push(oid);
         }
@@ -575,23 +614,4 @@ pub async fn pack_chunk(
     Ok(out)
 }
 
-/// Header, every chunk, trailer (section 9 step 6).
-pub async fn write_pack(
-    bucket: &Bucket,
-    set: &SendSet,
-    out: &mut Sideband<'_>,
-    budget: &mut ReqBudget,
-) -> Result<(), Error> {
-    let mut hdr = b"PACK".to_vec();
-    hdr.extend_from_slice(&2u32.to_be_bytes());
-    hdr.extend_from_slice(&set.count().to_be_bytes());
-    let mut h = gix_hash::hasher(gix_hash::Kind::Sha1);
-    h.update(&hdr);
-    out.data(&hdr);
-    for i in 0..set.reads.len() {
-        let chunk = pack_chunk(bucket, set, i, &mut h, budget).await?;
-        out.data(&chunk);
-    }
-    out.data(h.try_finalize().map_err(|e| Error::Internal(e.to_string()))?.as_slice());
-    Ok(())
-}
+

@@ -109,9 +109,9 @@ impl DurableObject for RepoDo {
                 // enqueued jobs in its span, so a successful fetch must rearm the alarm
                 (Method::Post, "/_do/fetch") => {
                     let r = self.fetch_v2(&body).await;
-                    if r.is_ok() {
-                        let _ = jobs::rearm(self).await;
-                    }
+                    // boot may have enqueued jobs in this span — rearm even on error;
+                    // a propagated Storage/Internal error rolls the span back anyway
+                    let _ = jobs::rearm(self).await;
                     return r;
                 }
                 _ => Err(Error::NotFound),
@@ -139,7 +139,7 @@ impl DurableObject for RepoDo {
 
     async fn alarm(&self) -> worker::Result<Response> {
         self.boot(&RepoHeaders::NONE)?; // alarm has no headers, section 8.2
-        jobs::dispatch(self).await?; // never lets an Err escape, section 4.4
+        let _ = jobs::dispatch(self).await; // never lets an Err escape, section 4.4
         Response::empty()
     }
 }
@@ -645,19 +645,21 @@ impl RepoDo {
                 wants.push(id);
             }
         }
-        // deepen-not carries ref names: resolve each to its tip; a name we don't
-        // hold excludes nothing. Clients send unqualified names ("mid"), so resolve
-        // by git's standard search order (exact, refs/, refs/tags/, refs/heads/, ...)
+        // deepen-not carries ref names: resolve each to its tip commit — peel annotated
+        // tags (`peeled` holds the target commit; NULL on pre-column rows → peel one
+        // level via the index). Clients send unqualified names ("mid"), so resolve by
+        // git's standard search order; an unresolvable name is an error, like want-ref.
         let mut deepen_not: Vec<ObjectId> = Vec::new();
         if !args.deepen_not.is_empty() {
             #[derive(serde::Deserialize)]
             struct T {
                 target: String,
+                peeled: Option<String>,
             }
             for name in &args.deepen_not {
-                let Ok(qname) = String::from_utf8(name.to_vec()) else {
-                    continue;
-                };
+                let qname = String::from_utf8(name.to_vec())
+                    .map_err(|_| Error::Protocol(format!("couldn't find remote ref {}", name.as_bstr())))?;
+                let mut found = None;
                 for cand in [
                     qname.clone(),
                     format!("refs/{qname}"),
@@ -666,16 +668,42 @@ impl RepoDo {
                     format!("refs/remotes/{qname}"),
                     format!("refs/remotes/{qname}/HEAD"),
                 ] {
-                    if let Some(target) = self
-                        .q("SELECT target FROM refs WHERE name=? LIMIT 1", vec![V::from(cand.as_str())])?
+                    if let Some(t) = self
+                        .q("SELECT target, peeled FROM refs WHERE name=? LIMIT 1", vec![V::from(cand.as_str())])?
                         .to_array::<T>()?
                         .into_iter()
                         .next()
                     {
-                        deepen_not.push(oid(&target.target)?);
+                        found = Some(t);
                         break;
                     }
                 }
+                let t = found.ok_or_else(|| {
+                    Error::Protocol(format!("couldn't find remote ref {qname}"))
+                })?;
+                let mut id = match t.peeled {
+                    Some(p) => oid(&p)?,
+                    None => oid(&t.target)?,
+                };
+                // pre-column rows can leave peeled NULL on annotated tags — if the
+                // target is itself a tag object, read it and peel one level so the
+                // exclusion walk starts at the commit
+                if let Some(l) = idx.lookup(&[id])?.into_iter().next().flatten() {
+                    if l.kind == gix_object::Kind::Tag {
+                        if let Some((_, entry)) =
+                            bucket.read_entries(&[(id, l)], &mut budget).await?.into_iter().next()
+                        {
+                            let (_, data) = crate::store::codec::decode_entry(&entry)?;
+                            if let Some(hex) =
+                                data.as_slice().lines().find_map(|l| l.strip_prefix(b"object "))
+                            {
+                                id = ObjectId::from_hex(hex)
+                                    .map_err(|_| Error::Internal("bad tag object".into()))?;
+                            }
+                        }
+                    }
+                }
+                deepen_not.push(id);
             }
         }
         // step 1: acks = known haves (unknown dropped). Wants validated inside send_set.

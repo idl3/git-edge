@@ -153,3 +153,25 @@ Parallel reviewers attacked the round-2 diff itself. Findings fixed and verified
   (`mid` -> `refs/tags/mid`); `info/refs`/`_state` errors are plain text per contract.
 - **Auth**: empty presented tokens never match; `GE_WRITE_TOKEN` unset no longer 500s
   read-only deployments.
+
+## Round 4 — load verification on merged main (workerd, local)
+
+| Workload | Result |
+|---|---|
+| Push 20k-commit linear history (60k objects) | 8.8 s |
+| Clone 20k commits | 4.3 s — `x-ge-subrequests: 5/9000` (prefetch + contiguous regions) |
+| Clone `--depth 15000` of 20k | 1.4 s, 1 shallow boundary, fsck clean |
+| Push 200 MiB / 10,207 objects (incl. 10k-file tree) | 21 s |
+| Clone same | 6.3 s, byte-identical, fsck clean |
+| 4× parallel 20k clones | 6.9 s total |
+| 5× parallel pushes, distinct refs | 0.38 s, all committed |
+| 5× parallel CAS-divergent pushes | all correctly rejected |
+| GC on 60k-object repo + concurrent clone | mark→sweep < 4 s; clone clean mid-sweep |
+| 100 MiB blob push | clean `object too large (16 MiB max)` rejection |
+| Nested forward REF_DELTA pack (delta→deferred→delta→base) | resolved, byte-exact |
+| REF_DELTA cycle | clean `unpack missing base`, no hang |
+| `Git-Protocol: version=1` | `version 1` packet emitted |
+| `deepen-not mid` (unqualified) | resolves via ref search order; cuts correctly |
+| Multi-round fetch (partial ACKs) | negotiates, correct pack |
+
+No worker errors/panics in the log across all of the above.
