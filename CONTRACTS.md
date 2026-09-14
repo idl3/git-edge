@@ -388,7 +388,7 @@ impl BodyReader {
 1. If `Content-Encoding: gzip`, `new` pipes `req.inner().body()` through `web_sys::DecompressionStream::new("gzip")` (`ReadableStream::pipe_through`) and reads the result. Converting the resulting `web_sys::ReadableStream` into a Rust `Stream` uses the `wasm-streams` crate (`ReadableStream::from_raw(..).into_stream()`); whether `worker` re-exports it is **unverified**, so it is listed as a direct dependency. No other encoding is accepted (415).
 2. `Content-Length` is never trusted or required; git sends chunked bodies above `http.postBuffer` (1 MiB). The zone body cap (100 MB Free/Pro) applies before our code and is documented, not handled.
 3. Command section split: `edge` fills the reader in 64 KiB steps and calls `wire::parse_receive_header` (or `parse_v2_command` on the whole body for upload-pack, whose bodies are small) until it returns `Some`. `PktReader::remainder()` plus the rest of the stream is the PACK. The command section is capped at 1 MiB (`Error::Protocol` beyond).
-4. The pack is written to R2 with `create_multipart_upload`, parts of exactly 8 MiB except the last, at most 10,000 parts (80 GB, never reached). Measured only on the local simulator (`research/platform-facts.md` #6): 5 MiB + 1 MiB parts completed and a range read returned the right bytes; the simulator does not enforce the 5 MiB minimum or the equal-size rule, so the first deploy re-runs that spike against real R2 before any push test. The same 8 MiB buffer is the `BufRead` window for `BytesToEntriesIter`; an entry longer than the window is handled by the iterator's own incremental read because `EntryDataMode::Ignore` skips bodies without buffering them.
+4. The pack is written to R2 with `create_multipart_upload`, parts of exactly 8 MiB except the last, at most 10,000 parts (80 GB, never reached). The equal-size rule is now *enforced* fact, not assumption: miniflare's `completeMultipartUpload` rejects non-final parts of differing sizes with `BadUpload` (10048), matching production R2 — this is what wedged `gc_consolidate` when `checkpoint()` drained a variable-size buffer (audit round 6). Every part-producing path — `flush_if_full`, `checkpoint`, `finish` — must therefore emit parts of exactly `PART` bytes except the final one. The same 8 MiB buffer is the `BufRead` window for `BytesToEntriesIter`; an entry longer than the window is handled by the iterator's own incremental read because `EntryDataMode::Ignore` skips bodies without buffering them.
 5. Memory per receive-pack request: body window 8 MiB + multipart part 8 MiB + entry vector <= 48 MiB in pass A; pass B as in section 2.4. Upload-pack: request body <= 1 MiB; response is streamed through `Response::from_stream` with at most one 8 MiB read window plus one 64 KiB sideband frame in flight.
 
 ---
@@ -719,3 +719,36 @@ produced these corrections, all verified against git 2.54:
   a missing `GE_READ_TOKEN` fails the read-token compare instead of erroring writes;
   client-derived strings in `ERR`/`unpack`/`ng` lines are sanitized (non-graphic -> `?`)
   and `x-ge-subrequests: <used+planned>/<max>` rides fetch responses (contract 406).
+
+## Amendments from the production-hardening pass (8d9017a, live on git-edge.grain.workers.dev)
+
+- **A8. Streamed blob pass-through (overrides A7 for full blobs).** A `blob`
+  entry over 16 MiB is no longer materialized: pass B copies its pending-pack
+  wire bytes (varint header + zlib body) verbatim into the normalized pack via
+  `PackWriter::raw_extend` in <= 8 MiB reads while a resumable zlib stream
+  re-inflates solely to compute the object id. Isolate memory stays flat; the
+  effective full-blob ceiling becomes the 2 GiB pending-pack bound. Delta
+  results and non-blob objects keep the 16 MiB cap (A7). A delta naming a
+  streamed blob as base still fails at the window guard, unchanged.
+- **A9. Fetch fragmentation.** `coalesce` emits reads of at most WINDOW
+  (8 MiB): entries larger than a window are split into fragments, and a merge
+  may not extend a read past the window. Output order and the trailer hash are
+  byte-identical; `pack_chunk` is unchanged.
+- **A10. GC verbatim big-entry copy.** Consolidation streams entries over
+  SPAN (8 MiB) fragment-by-fragment through `raw_extend` +
+  `PackWriter::drain_parts` instead of `read_entries`. Parts drained mid-entry
+  are recorded in `gc_parts` only inside the next checkpoint span, alongside the
+  `WriterCkpt` that accounts for their bytes — replay stays byte-identical and
+  no uploaded part exists without checkpoint state.
+- **A11. Receive-pack drain-before-error.** Post-header failures drain the
+  remainder of the request body (<= 2 GiB) before responding, so Cloudflare
+  does not reset mid-upload and the client sees `unpack`/`ng` report-status.
+- **A12. Per-repo tokens.** The DO holds a `tokens` table (id, sha1 hash,
+  level, name, created_at). Edge auth resolves global write -> global read ->
+  `/_do/auth` hash lookup, and fails closed on storage errors. Token values are
+  returned once at creation; `/_admin/tokens` routes are global-write-token
+  only — a repo token can never mint credentials.
+- **A13. Request metrics.** When `GE_METRICS` is bound, each edge request
+  emits one Analytics Engine datapoint (index=repo, blob=op,
+  doubles=status/ms/subrequests). For streamed responses the duration is
+  time-to-first-byte.
