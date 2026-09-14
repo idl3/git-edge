@@ -26,6 +26,7 @@ pub struct EntryRec {
 
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_OBJ: u64 = 16 << 20; // A7
+const MAX_PENDING: u64 = 2 << 30; // 2 GiB compressed ceiling on one pushed pack
 const WINDOW: u64 = 8 << 20;
 const CACHE: usize = 48 << 20; // 16 MiB resolved LRU + 32 MiB external bases as one cache
 const MAX_DEPTH: usize = 64; // git's default delta depth is 50
@@ -89,6 +90,9 @@ pub async fn stream_to_pending(
             }
             take(body, &mut hasher, &mut out, used, budget).await?;
             clen = clen.saturating_add(used as u64);
+            if body.total > MAX_PENDING {
+                return Err(Error::Limit("pack exceeds the 2 GiB limit".into()));
+            }
         }
         if z.total_out() != e.decompressed_size {
             return Err(unpack(format!("object at {pos}: size mismatch")));

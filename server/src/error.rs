@@ -93,6 +93,14 @@ impl Error {
             Error::Budget => "request budget exhausted".into(),
         }
     }
+    /// The client-safe form: Internal/Storage details (R2 keys, SQL errors) stay in the
+    /// worker log; clients get a generic string. Everything else passes through.
+    pub fn client_message(&self) -> String {
+        match self {
+            Error::Storage(_) | Error::Internal(_) => "internal error".into(),
+            _ => self.message(),
+        }
+    }
 
     /// Pre-response mapping (section 10, amended by A2).
     pub fn status(&self) -> u16 {
@@ -115,12 +123,15 @@ pub fn respond(r: Result<Response, Error>, git_pkt: bool) -> worker::Result<Resp
         Ok(resp) => Ok(resp),
         Err(e) => {
             let status = e.status();
+            if matches!(e, Error::Storage(_) | Error::Internal(_)) {
+                worker::console_log!("git-edge: {e}");
+            }
             let body = if git_pkt {
-                let msg = format!("ERR {}\n", e.message());
+                let msg = format!("ERR {}\n", e.client_message());
                 let len = msg.len() + 4;
                 format!("{len:04x}{msg}")
             } else {
-                format!("{}\n", e.message())
+                format!("{}\n", e.client_message())
             };
             let mut resp = Response::ok(body)?;
             if matches!(e, Error::Auth) {
