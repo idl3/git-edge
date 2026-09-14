@@ -46,7 +46,14 @@ contract the server now implements, but they are not yet endpoints.
 
 ## Known production gaps (honest list)
 
-- GC is written and wired to alarms but has not reclaimed a real pack under test yet.
+- GC is exercised end to end: a force-push orphaning a pack triggers the full
+  janitor → mark → consolidate → sweep chain on real alarms; the dead pack's rows and
+  objects are reclaimed (`objects 10 → 3`), and a post-sweep clone passes `fsck --strict`.
+  The 10-minute quiet / 1-hour grace windows are env-tunable for testing (A18).
+- Two alarm-era bugs only surfaced when the chain first fired: `set_alarm` takes an offset
+  from now, not an epoch timestamp (jobs landed ~56 years out — A16), and DO SQLite BLOBs
+  deserialize as byte arrays, so `Vec<u8>` DTO fields need `serde_bytes` (A16).
+- An all-dead candidate pack skips the repack build entirely and sweeps directly (A17).
 - Local workerd's R2 simulates multipart uploads; abandoned-MPU behaviour on real R2 still
   needs a deployment check.
 - Subrequest ceilings are guarded by `ReqBudget`, not verified against plan limits.

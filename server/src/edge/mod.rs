@@ -109,6 +109,7 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
     };
     let r = match (req.method(), rest.as_str()) {
         (Method::Get, "info/refs") => info_refs(&req, &env, &route).await,
+        (Method::Get, "_state") => state_probe(&req, &env, &route).await,
         (Method::Post, "git-upload-pack") => upload_pack(req, &env, &route).await,
         (Method::Post, "git-receive-pack") => receive_pack(req, env, route).await,
         _ => Err(Error::NotFound),
@@ -187,6 +188,24 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
         wire::write_advertisement_v0(&mut w, service, dto.head.as_deref().map(|s| bstr::ByteSlice::as_bstr(s.as_bytes())), &refs);
     }
     git_resp(w.out, ct)
+}
+
+/// GET /:owner/:repo/_state — internal observability probe (write-token gated).
+async fn state_probe(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+    auth::authenticate(req, env, Level::Write)?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let mut init = worker::RequestInit::new();
+    init.with_method(Method::Get);
+    let mut r = worker::Request::new_with_init("https://do/_do/state", &init)
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    route.apply_headers(&mut r)?;
+    budget.charge(1)?;
+    let mut resp = stub.fetch_with_request(r).await?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp).await);
+    }
+    let bytes = resp.bytes().await.map_err(|e| Error::Internal(e.to_string()))?;
+    git_resp(bytes, "application/json")
 }
 
 /// POST /:owner/:repo/git-upload-pack — v2 only; route on the command name, forward raw.

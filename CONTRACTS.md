@@ -636,3 +636,24 @@ wired; the mark/consolidate/sweep slices are written and compile but have not re
 real pack), `wrangler dev`'s local R2 differs from production R2 in MPU orphan semantics,
 and subrequest ceilings below paid-plan values are unenforced by the simulator (ReqBudget is
 the guard).
+
+**A16. Alarms are absolute timestamps, and BLOBs need `serde_bytes` (extends A14).** Two bugs
+found only by firing the alarm chain on live workerd:
+- `Storage::set_alarm` interprets `i64`/`Duration` arguments as *offsets from now*, not
+  timestamps. `jobs.run_at` is absolute epoch ms, so `rearm` must convert through
+  `worker::ScheduledTime::new(js_sys::Date::new(...))`. Passing `run_at` as a Duration
+  schedules the alarm ~56 years out — silent, and invisible until the first job never fired.
+- DO SQLite `BLOB` columns deserialize as byte arrays, not sequences: any `Vec<u8>` field
+  in a `to_array` DTO needs `#[serde(with = "serde_bytes")]`. `marked.bitmap` is the case.
+
+**A17. Empty-repack skip (amends 5.2).** When every candidate pack's bitmap is all zeros
+(nothing reachable), `begin_build` must not write an empty normalized pack; it clears the
+build state (`gc_parts`, `gc.pos`, `gc.new_pack`, `gc.fails`) and enqueues `GcSweep`
+directly. Verified live: a force-push orphaning a full pack collects it cleanly
+(`objects 10 -> 3`, `packs_live 2 -> 1`) and a subsequent clone passes `fsck --strict`.
+
+**A18. Test knobs (new).** `GE_GC_QUIET_MS` (default 600 000) and `GE_GC_GRACE_MS`
+(default 3 600 000) env vars override the GC quiet/grace windows so the chain is exercisable
+in `wrangler dev` and staging. Production deployments leave both unset. `GET
+/:owner/:repo/_state` (write-token gated) returns row counts for refs/objects/packs/jobs —
+the observability surface the GC tests use.

@@ -98,7 +98,10 @@ pub async fn rearm(d: &RepoDo) -> Result<(), Error> {
         .next();
     match next {
         Some(r) => {
-            d.state.storage().set_alarm(std::time::Duration::from_millis(r.run_at.max(0) as u64)).await?
+            // set_alarm interprets i64/Duration as an *offset from now*; jobs.run_at is an
+            // absolute epoch-ms timestamp, so it must go through a Date (ScheduledTime::new).
+            let when = js_sys::Date::new(&js_sys::Number::from(r.run_at as f64));
+            d.state.storage().set_alarm(worker::ScheduledTime::new(when)).await?
         }
         None => d.state.storage().delete_alarm().await?,
     }
@@ -198,6 +201,11 @@ async fn dispatch_inner(d: &RepoDo) -> Result<(), Error> {
     };
     let mut budget = SliceBudget::fresh();
     let out = run_slice(d, &job, &mut budget).await;
+    worker::console_log!("job {}#{} attempts={} -> {}", job.kind.as_str(), job.id, job.attempts,
+        match &out { Ok(SliceOutcome::Done) => "done".into(),
+            Ok(SliceOutcome::Continue { .. }) => "continue".into(),
+            Ok(SliceOutcome::Reschedule { .. }) => "reschedule".into(),
+            Err(e) => format!("err {e}") });
     // apply the outcome in a sync span (4.2, 4.4)
     match out {
         Ok(SliceOutcome::Done) => {
