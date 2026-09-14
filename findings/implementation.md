@@ -339,12 +339,29 @@ Verified after fixes: conformance `== PASS` on the fixed binary; fresh
 22 MiB + 18 MiB blob repo consolidated by GC (`packs_live 2 -> 1`, uniform
 8 MiB parts in miniflare's R2 state) with a byte-identical fsck-clean clone.
 
-Remaining known gaps (documented, not blocking):
+Post-fix verification, continued:
 
-- A repo whose GC build began under the pre-fix binary has stale
-  `gc_parts`/non-uniform parts; resume fails `InvalidPart`/`BadUpload`,
-  `gc.fails` reaches 2 and the Rebuild path wipes and restarts uniformly —
-  self-healing, at most a couple of backoff cycles.
+- **Wedged-repo self-heal — verified.** The repo wedged under the pre-fix
+  binary (non-uniform MPU parts, `gc_consolidate` at attempts 6) recovered
+  unattended on the fixed binary: `BadUpload` → `gc.fails`≥2 → Rebuild →
+  fresh uniform-part MPU → `complete()` → sweep. Final state: 5 dead packs
+  (2 sources + 3 failed builds), 1 live consolidated pack (7 objects,
+  17.8 MB), `git clone` + `fsck --strict` clean. Recovery took the
+  predicted couple of backoff cycles with no manual intervention.
+- **Production GC consolidation on real R2 — verified** (deployment
+  `a25913fb`). After the two test packs aged past the 1-hour
+  `GE_GC_GRACE_MS` window, a push re-armed `gc_mark` (+10 min quiet);
+  the chain ran mark (`marked=2`) → consolidate → sweep in ~60 s on real
+  R2: `packs_live 3 → 2` (consolidated pack + the grace-protected new
+  push pack), `packs_dead 0 → 2`, zero dead jobs. The uniform-part MPU
+  `complete()` that previously livelocked under `BadUpload` now succeeds
+  against real R2. Post-consolidation `git clone` is `fsck --strict`
+  clean and byte-identical to the source working tree.
+- Earlier observation: on first deploy the chain fired on schedule but
+  correctly no-op'd — packs inside the grace window are never marked, so
+  a fresh repo consolidates nothing until packs are 1 h old.
+
+Remaining known gaps (documented, not blocking):
 - `jobs` repair requeues `running` rows after the 60 s lease; two
   overlapping executions could interleave awaited writes. Heartbeats at
   every checkpoint narrow the window; lease fencing remains the guard.
