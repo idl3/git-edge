@@ -60,6 +60,8 @@ The 56 proofs were written in TypeScript. We then asked whether the server can b
 | `research/` | Engineer-level memos with source links: the Rust check, and the platform facts we measured | Engineers. |
 | `spikes/` | Small real programs run on the Cloudflare runtime to test a fact | Engineers. |
 | `CONTRACTS.md` | The one set of rules every revised proof follows: storage layout, the ref transaction, the job timer, the janitor | Engineers. |
+| `server/` | The working server: the contract compiled to a Rust/WASM Cloudflare Worker, tested with real git | Engineers. |
+| `COMPATIBILITY.md` | Every git feature the server speaks, what it does not, and the limits | Everyone. |
 | `STYLE.md` | The writing rules and glossary for the plain documents | Writers. |
 
 ## The nine problems in one breath
