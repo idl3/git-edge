@@ -15,6 +15,16 @@ pub enum Level {
 fn secret(env: &Env, name: &str) -> Result<String, Error> {
     env.secret(name).map(|s| s.to_string()).map_err(|_| Error::Internal(format!("{name} unset")))
 }
+/// Missing optional secret is not an internal error — the compare just fails.
+fn secret_opt(env: &Env, name: &str) -> Option<String> {
+    env.secret(name).ok().map(|s| s.to_string())
+}
+
+/// RFC 7235: the auth scheme is case-insensitive.
+fn scheme<'a>(hdr: &'a str, name: &str) -> Option<&'a str> {
+    let (s, rest) = hdr.split_at_checked(name.len())?;
+    (s.eq_ignore_ascii_case(name) && rest.starts_with(' ')).then(|| &rest[1..])
+}
 
 /// Returns the principal string recorded in the reflog.
 pub fn authenticate(req: &Request, env: &Env, need: Level) -> Result<String, Error> {
@@ -23,9 +33,9 @@ pub fn authenticate(req: &Request, env: &Env, need: Level) -> Result<String, Err
         .get("authorization")
         .map_err(|e| Error::Internal(e.to_string()))?
         .ok_or(Error::Auth)?;
-    let (token, principal) = if let Some(t) = hdr.strip_prefix("Bearer ") {
+    let (token, principal) = if let Some(t) = scheme(&hdr, "Bearer") {
         (t.trim().to_string(), "bearer".to_string())
-    } else if let Some(b) = hdr.strip_prefix("Basic ") {
+    } else if let Some(b) = scheme(&hdr, "Basic") {
         // git sends Basic base64(user:token); the token is the password, the user names the principal
         let decoded = b64_decode(b.trim()).ok_or(Error::Auth)?;
         let s = String::from_utf8_lossy(&decoded);
@@ -40,9 +50,10 @@ pub fn authenticate(req: &Request, env: &Env, need: Level) -> Result<String, Err
     if ct_eq(token.as_bytes(), write.as_bytes()) {
         return Ok(principal);
     }
+    let read = secret_opt(env, "GE_READ_TOKEN");
     match need {
         Level::Read => {
-            if ct_eq(token.as_bytes(), secret(env, "GE_READ_TOKEN")?.as_bytes()) {
+            if read.map(|r| ct_eq(token.as_bytes(), r.as_bytes())) == Some(true) {
                 Ok(principal)
             } else {
                 Err(Error::Auth)
@@ -50,7 +61,7 @@ pub fn authenticate(req: &Request, env: &Env, need: Level) -> Result<String, Err
         }
         Level::Write => {
             // a valid read token is forbidden, not unauthenticated: no second challenge
-            if ct_eq(token.as_bytes(), secret(env, "GE_READ_TOKEN")?.as_bytes()) {
+            if read.map(|r| ct_eq(token.as_bytes(), r.as_bytes())) == Some(true) {
                 Err(Error::Forbidden)
             } else {
                 Err(Error::Auth)

@@ -16,6 +16,10 @@ use crate::store::{schema, Bucket, Index, ObjLoc, PackId, RepoId};
 use crate::wire::{self, http::{do_error_response, json, parse, RepoHeaders}, FetchArgs, PktWriter, RefRow, V2Command};
 use crate::ReqBudget;
 
+/// A ref row is ~90 bytes in an ls-refs advertisement — a token holder could otherwise
+/// mint refs until the advertisement alone exceeds the isolate. 65k refs is already huge.
+const MAX_REFS: i64 = 65_536;
+
 #[derive(serde::Deserialize)]
 pub struct CmdDto {
     old: String,
@@ -89,6 +93,7 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/push/begin") => self.push_begin(&meta, &parse::<BeginDto>(&body)?),
                 (Method::Post, "/_do/push/lookup") => self.push_lookup(&parse(&body)?),
                 (Method::Post, "/_do/push/index") => self.push_index(&parse(&body)?),
+                (Method::Post, "/_do/push/abort") => self.push_abort(&parse(&body)?),
                 (Method::Post, "/_do/push/commit") => {
                     self.commit_push(&parse::<CommitRequest>(&body)?).and_then(|r| json(serde_json::to_value(&r)?))
                 }
@@ -100,8 +105,15 @@ impl DurableObject for RepoDo {
         let resp = match out {
             Ok(Some(r)) => Ok(r),
             Ok(None) => match (&method, path.as_str()) {
-                // the await route lives outside the sync span (1.3)
-                (Method::Post, "/_do/fetch") => return self.fetch_v2(&body).await,
+                // the await route lives outside the sync span (1.3); boot may still have
+                // enqueued jobs in its span, so a successful fetch must rearm the alarm
+                (Method::Post, "/_do/fetch") => {
+                    let r = self.fetch_v2(&body).await;
+                    if r.is_ok() {
+                        let _ = jobs::rearm(self).await;
+                    }
+                    return r;
+                }
                 _ => Err(Error::NotFound),
             },
             Err(e) => Err(e),
@@ -116,7 +128,12 @@ impl DurableObject for RepoDo {
             Err(e @ (Error::Storage(_) | Error::Internal(_))) => {
                 Err(worker::Error::RustError(e.message()))
             }
-            Err(e) => Ok(do_error_response(&e)?),
+            Err(e) => {
+                // non-fatal errors commit the span — a boot-time enqueue survives, so rearm
+                let r = do_error_response(&e)?;
+                let _ = jobs::rearm(self).await;
+                Ok(r)
+            }
         }
     }
 
@@ -171,6 +188,9 @@ impl RepoDo {
     }
     pub fn meta_i64(&self, key: &str) -> Result<i64, Error> {
         self.meta(key)?.parse().map_err(|_| Error::Internal(format!("meta.{key}")))
+    }
+    fn ref_count(&self) -> Result<i64, Error> {
+        Ok(self.q("SELECT COUNT(*) AS n FROM refs", vec![])?.one::<N>()?.n)
     }
     pub fn bucket(&self) -> Result<Bucket, Error> {
         Ok(Bucket::new(self.env.get_binding("BUCKET")?, self.repo_id()?))
@@ -355,6 +375,17 @@ impl RepoDo {
         }))
     }
 
+    /// POST /_do/push/abort — a post-begin failure closes the row immediately instead
+    /// of leaving it `open` for the janitor's 1h timeout (64 leaked rows = push DoS).
+    fn push_abort(&self, b: &serde_json::Value) -> Result<Response, Error> {
+        let id = b.get("push_id").and_then(|v| v.as_str()).ok_or_else(|| Error::Protocol("push_id".into()))?;
+        self.q(
+            "UPDATE pushes SET state='dead' WHERE id=? AND state='open'",
+            vec![V::from(id)],
+        )?;
+        json(serde_json::json!({ "ok": true }))
+    }
+
     /// POST /_do/push/lookup (sync). `pack` = the caller's own ingesting pack counts (2.5).
     fn push_lookup(&self, b: &LookupDto) -> Result<Response, Error> {
         if b.ids.len() > 1_000 {
@@ -505,6 +536,11 @@ impl RepoDo {
             if loc.is_none() {
                 return Ok(Some("missing necessary objects"));
             }
+            // a ref create costs the writer ~90 bytes of header but a reader the whole
+            // table — bound it or ls-refs becomes an unbounded advertisement
+            if c.old.is_null() && self.ref_count()? >= MAX_REFS {
+                return Ok(Some("too many refs"));
+            }
         }
         let (o, n, name) = (c.old.to_string(), c.new.to_string(), c.name.as_str());
         let peeled = c.peeled.clone().map_or(V::Null, |p| V::from(p));
@@ -580,6 +616,55 @@ impl RepoDo {
         let bucket = self.bucket()?;
         let sql = self.sql();
         let idx = Index(&sql);
+        // step 0: want-ref names resolve against the refs table (HEAD follows meta.head);
+        // the resolved pairs ride back in the wanted-refs section
+        let mut wants = args.wants.clone();
+        let mut wanted_refs: Vec<(ObjectId, BString)> = Vec::new();
+        if !args.want_refs.is_empty() {
+            #[derive(serde::Deserialize)]
+            struct T {
+                target: String,
+            }
+            let head = self.meta("head")?;
+            for name in &args.want_refs {
+                let qname = if name.as_slice() == b"HEAD" {
+                    head.clone()
+                } else {
+                    String::from_utf8(name.to_vec()).map_err(|_| Error::Protocol("bad want-ref".into()))?
+                };
+                let target = self
+                    .q("SELECT target FROM refs WHERE name=?", vec![V::from(qname.as_str())])?
+                    .to_array::<T>()?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Error::Protocol(format!("couldn't find remote ref {qname}")))?;
+                let id = oid(&target.target)?;
+                wanted_refs.push((id, name.clone()));
+                wants.push(id);
+            }
+        }
+        // deepen-not carries ref names: resolve each to its tip; a name we don't
+        // hold excludes nothing
+        let mut deepen_not: Vec<ObjectId> = Vec::new();
+        if !args.deepen_not.is_empty() {
+            #[derive(serde::Deserialize)]
+            struct T {
+                target: String,
+            }
+            for name in &args.deepen_not {
+                let Ok(qname) = String::from_utf8(name.to_vec()) else {
+                    continue;
+                };
+                if let Some(target) = self
+                    .q("SELECT target FROM refs WHERE name=? LIMIT 1", vec![V::from(qname.as_str())])?
+                    .to_array::<T>()?
+                    .into_iter()
+                    .next()
+                {
+                    deepen_not.push(oid(&target.target)?);
+                }
+            }
+        }
         // step 1: acks = known haves (unknown dropped). Wants validated inside send_set.
         let acks: Vec<ObjectId> = args
             .haves
@@ -587,42 +672,60 @@ impl RepoDo {
             .zip(idx.lookup(&args.haves)?)
             .filter_map(|(h, l)| l.map(|_| *h))
             .collect();
-        // step 2: readiness (stateless-RPC)
-        let ready = args.done || args.haves.is_empty() || !acks.is_empty();
+        // step 2: readiness (stateless-RPC) — partial acks without `done` keep the
+        // negotiation open; answering early would ship a pack built on an incomplete
+        // have-set
+        let ready = args.done || args.haves.is_empty() || acks.len() == args.haves.len();
         let mut w = PktWriter::default();
         if !ready {
-            wire::write_fetch_prelude(&mut w, &args, &acks, &[], &[])?;
+            wire::write_fetch_prelude(&mut w, &args, &acks, &[], &[], &[])?;
             return Response::from_bytes(w.out).map_err(|e| Error::Internal(e.to_string()));
         }
         // steps 3-5: the send set
         let set = generate::send_set(
             self,
             &bucket,
-            &args.wants,
+            &wants,
             &args.haves,
             args.filter.as_ref(),
             args.deepen,
+            args.deepen_since,
+            &deepen_not,
+            args.deepen_relative,
+            args.include_tag,
             &args.shallow,
             &mut budget,
         )
         .await?;
         // step 6: stream header + chunks + trailer + flush as band-1 sideband frames
-        wire::write_fetch_prelude(&mut w, &args, &acks, &set.shallow, &set.unshallow)?;
+        wire::write_fetch_prelude(&mut w, &args, &acks, &wanted_refs, &set.shallow, &set.unshallow)?;
         let prelude = w.out;
+        // contract 406: the harness asserts on the ReqBudget counters — report projected
+        // spend (used so far + every planned pack read) before the stream starts
+        let projected = budget
+            .used
+            .saturating_add(u32::try_from(set.reads.len()).unwrap_or(u32::MAX));
+        let max_sub = budget.max_subrequests;
         let st = FetchStream { budget, bucket, set, next: 0, hasher: gix_hash::hasher(gix_hash::Kind::Sha1), prelude: Some(prelude), _args: args };
         let s = stream::unfold(st, |mut st| async move {
             match st.step().await {
                 Ok(Some(chunk)) => Some((Ok::<Vec<u8>, Error>(chunk), st)),
                 Ok(None) => None,
                 Err(e) => {
-                    // mid-stream: one band-3 ERR frame, then the stream ends (section 10)
+                    // mid-stream: one band-3 ERR frame, then the stream ends (section 10).
+                    // `next` must advance past the end or the same step would retry forever
+                    st.next = usize::MAX;
                     let mut w = PktWriter::default();
                     wire::Sideband::new(&mut w).error(&format!("ERR {}", e.client_message()));
                     Some((Ok(w.out), st))
                 }
             }
         });
-        Response::from_stream(s).map_err(Error::from)
+        let resp = Response::from_stream(s).map_err(Error::from)?;
+        resp.headers()
+            .set("x-ge-subrequests", &format!("{projected}/{max_sub}"))
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        Ok(resp)
     }
 }
 

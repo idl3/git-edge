@@ -24,12 +24,15 @@ pub struct EntryRec {
     pub compressed_len: u32,
 }
 
-const MAX_ENTRIES: usize = 2_000_000;
+// EntryRec is ~40 B (offset + Header enum + two lengths): the record vec alone must
+// leave room for Cache (48 MiB) + window + part buffer inside a 128 MiB isolate
+const MAX_ENTRIES: usize = 1_000_000;
 const MAX_OBJ: u64 = 16 << 20; // A7
 const MAX_PENDING: u64 = 2 << 30; // 2 GiB compressed ceiling on one pushed pack
 const WINDOW: u64 = 8 << 20;
 const CACHE: usize = 48 << 20; // 16 MiB resolved LRU + 32 MiB external bases as one cache
 const MAX_DEPTH: usize = 64; // git's default delta depth is 50
+const MAX_CHAIN_BYTES: u64 = 64 << 20; // chain holds raw compressed delta bodies
 
 fn unpack(m: impl Into<String>) -> Error {
     Error::Unpack(m.into())
@@ -280,7 +283,7 @@ async fn resolve_at(
     start: u64,
     budget: &mut ReqBudget,
 ) -> Result<Obj, Error> {
-    let (mut off, mut chain) = (start, Vec::new());
+    let (mut off, mut chain, mut chain_bytes) = (start, Vec::new(), 0u64);
     let (kind, mut data) = loop {
         if let Some(hit) = cx.cache.get(&Key::Off(off)) {
             break hit;
@@ -293,6 +296,12 @@ async fn resolve_at(
             .map_err(|_| unpack("delta base is not an entry"))?;
         let rec = entries.get(i).ok_or_else(|| internal("idx"))?;
         let raw = cx.win.entry(rec, budget).await?;
+        // the chain holds each delta's compressed bytes: 64 × ~16 MiB worst case is a
+        // GiB-scale allocation — bound the bytes, not just the depth
+        chain_bytes = chain_bytes.saturating_add(raw.len() as u64);
+        if chain_bytes > MAX_CHAIN_BYTES {
+            return Err(unpack("delta chain too large"));
+        }
         match rec.kind_or_delta {
             Header::OfsDelta { base_distance } => {
                 chain.push((off, raw));
@@ -356,58 +365,107 @@ pub async fn resolve_and_normalize(
     }
     let need_ids = entries.iter().any(|r| matches!(r.kind_or_delta, Header::RefDelta { .. }));
     let mut rows = Vec::new();
-    for (i, rec) in entries.iter().enumerate() {
-        let raw = cx.win.entry(rec, budget).await?;
-        let base = match rec.kind_or_delta {
-            Header::OfsDelta { base_distance } => Some(
-                resolve_at(
-                    &mut cx,
-                    entries,
-                    Header::verified_base_pack_offset(rec.offset, base_distance)
-                        .ok_or_else(|| unpack("bad ofs-delta"))?,
-                    budget,
-                )
-                .await?,
-            ),
-            Header::RefDelta { base_id } => Some(match cx.by_id.get(&base_id).copied() {
-                Some(j) => {
-                    resolve_at(&mut cx, entries, entries.get(j).ok_or_else(|| internal("idx"))?.offset, budget)
-                        .await?
-                }
-                None => external(&mut cx, base_id, budget).await?,
-            }),
-            _ => None,
-        };
-        let (kind, data) =
-            decode_mini(&mut cx.z, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw)?;
-        let id = gix_object::compute_hash(H::Sha1, kind, &data).map_err(|_| unpack("sha1 collision"))?;
-        let links = extract_links(kind, &data)?;
-        if kind == Kind::Tag {
-            if let Some(&t) = links.first() {
-                sink.tags.insert(id, t);
+    // A REF_DELTA may name a base that appears LATER in the same pack (forward ref):
+    // defer it and resolve in a fixpoint pass once more ids are known (index-pack parity).
+    let mut pending: Vec<usize> = Vec::new();
+    for i in 0..entries.len() {
+        if let Some(&Header::RefDelta { base_id }) = entries.get(i).map(|r| &r.kind_or_delta) {
+            if !cx.by_id.contains_key(&base_id) && !external_bases.contains_key(&base_id) {
+                pending.push(i);
+                continue;
             }
         }
-        sink.links.extend(links);
-        let (offset, len) = out.append_entry(kind, &data)?;
-        out.flush_if_full(budget).await?;
-        rows.push(ObjRow {
-            sha: id,
-            idx: u32::try_from(i).map_err(|_| unpack("too many objects"))?,
-            offset,
-            len,
-            kind,
-            size: data.len() as u64,
-        });
-        if need_ids {
-            cx.by_id.insert(id, i);
+        one_entry(&mut cx, entries, i, need_ids, out, sink, &mut rows, budget).await?;
+    }
+    while !pending.is_empty() {
+        let mut still = Vec::with_capacity(pending.len());
+        let mut progressed = false;
+        for i in pending.drain(..) {
+            let base_id = match entries.get(i).map(|r| &r.kind_or_delta) {
+                Some(&Header::RefDelta { base_id }) => base_id,
+                _ => continue,
+            };
+            if cx.by_id.contains_key(&base_id) || external_bases.contains_key(&base_id) {
+                one_entry(&mut cx, entries, i, need_ids, out, sink, &mut rows, budget).await?;
+                progressed = true;
+            } else {
+                still.push(i);
+            }
         }
-        cx.cache.put(Key::Off(rec.offset), kind, Rc::new(data));
-        if rows.len() >= 10_000 {
-            sink.post(&rows, budget).await?;
-            rows.clear();
+        if !progressed {
+            let bid = still.first().and_then(|&i| match entries.get(i).map(|r| &r.kind_or_delta) {
+                Some(&Header::RefDelta { base_id }) => Some(base_id),
+                _ => None,
+            });
+            return Err(unpack(format!("missing base {}", bid.map(|b| b.to_string()).unwrap_or_default())));
         }
+        pending = still;
     }
     Ok(rows)
+}
+
+/// Resolve + normalize one pack entry: base resolution, decode, hash, links, append, index row.
+#[allow(clippy::too_many_arguments)]
+async fn one_entry(
+    cx: &mut Cx<'_>,
+    entries: &[EntryRec],
+    i: usize,
+    need_ids: bool,
+    out: &mut PackWriter,
+    sink: &mut IndexSink<'_>,
+    rows: &mut Vec<ObjRow>,
+    budget: &mut ReqBudget,
+) -> Result<(), Error> {
+    let rec = entries.get(i).ok_or_else(|| internal("idx"))?;
+    let raw = cx.win.entry(rec, budget).await?;
+    let base = match rec.kind_or_delta {
+        Header::OfsDelta { base_distance } => Some(
+            resolve_at(
+                cx,
+                entries,
+                Header::verified_base_pack_offset(rec.offset, base_distance)
+                    .ok_or_else(|| unpack("bad ofs-delta"))?,
+                budget,
+            )
+            .await?,
+        ),
+        Header::RefDelta { base_id } => Some(match cx.by_id.get(&base_id).copied() {
+            Some(j) => {
+                resolve_at(cx, entries, entries.get(j).ok_or_else(|| internal("idx"))?.offset, budget).await?
+            }
+            None => external(cx, base_id, budget).await?,
+        }),
+        _ => None,
+    };
+    let (kind, data) =
+        decode_mini(&mut cx.z, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw)?;
+    let id = gix_object::compute_hash(H::Sha1, kind, &data).map_err(|_| unpack("sha1 collision"))?;
+    let links = extract_links(kind, &data)?;
+    if kind == Kind::Tag {
+        if let Some(&t) = links.first() {
+            sink.tags.insert(id, t);
+        }
+    }
+    sink.links.extend(links);
+    let (offset, len) = out.append_entry(kind, &data)?;
+    out.flush_if_full(budget).await?;
+    rows.push(ObjRow {
+        sha: id,
+        idx: u32::try_from(i).map_err(|_| unpack("too many objects"))?,
+        offset,
+        len,
+        kind,
+        size: data.len() as u64,
+    });
+    if need_ids {
+        cx.by_id.insert(id, i);
+    }
+    cx.cache.put(Key::Off(rec.offset), kind, Rc::new(data));
+    if rows.len() >= 10_000 {
+        sink.post(rows, budget).await?;
+        rows.clear();
+    }
+    Ok(())
 }
 
 /// Object references for the 2.5 connectivity check (1.4): commit -> tree + parents,
@@ -417,9 +475,9 @@ pub fn extract_links(kind: Kind, data: &[u8]) -> Result<Vec<ObjectId>, Error> {
     match kind {
         Kind::Commit => {
             let mut it = gix_object::CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1);
-            if let Ok(t) = it.tree_id() {
-                out.push(t);
-            }
+            // strict: a commit whose tree header doesn't parse is not a valid commit —
+            // storing it would hard-fail every later fetch that walks it
+            out.push(it.tree_id().map_err(|e| Error::Unpack(e.to_string()))?);
             out.extend(it.parent_ids());
         }
         Kind::Tree => {
@@ -431,9 +489,9 @@ pub fn extract_links(kind: Kind, data: &[u8]) -> Result<Vec<ObjectId>, Error> {
             }
         }
         Kind::Tag => {
-            if let Ok(t) = gix_object::TagRef::from_bytes(data, gix_hash::Kind::Sha1) {
-                out.push(t.target());
-            }
+            let t = gix_object::TagRef::from_bytes(data, gix_hash::Kind::Sha1)
+                .map_err(|e| Error::Unpack(e.to_string()))?;
+            out.push(t.target());
         }
         Kind::Blob => {}
     }

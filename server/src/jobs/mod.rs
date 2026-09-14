@@ -71,6 +71,17 @@ impl SliceBudget {
     }
 }
 
+/// A checkpoint span refreshes the lease: `repair` may only requeue a row whose started_at
+/// has gone stale — a progressing slice heartbeats and is never mistaken for a stranded one.
+pub fn heartbeat(sql: &SqlStorage, job_id: i64) -> Result<(), Error> {
+    sql.exec(
+        "UPDATE jobs SET started_at=? WHERE id=? AND state='running'",
+        Some(vec![V::from(platform::now_ms()), V::from(job_id)]),
+    )
+    .map_err(|e| Error::Storage(e.to_string()))?;
+    Ok(())
+}
+
 /// Sync; writes the row only (A3). Dedups against 'queued' rows: at most one queued row per kind.
 /// Deduping against 'running' too would suppress a job's own re-enqueue (edge review), so a running
 /// row does not block a new enqueue — the next dispatch simply runs the kind again, which is

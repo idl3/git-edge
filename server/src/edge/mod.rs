@@ -226,11 +226,12 @@ async fn state_probe(req: &Request, env: &Env, route: &RepoRoute) -> Result<Resp
 async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
     auth::authenticate(&req, env, Level::Read)?;
     if !v2_requested(&req)? {
-        // contract 1.1: v0 upload-pack POST is refused, protocol v2 required
+        // contract 1.1 rule 7: v0 upload-pack POST -> HTTP 400 with the ERR pkt-line
         let mut w = PktWriter::default();
         let _ = w.data(b"ERR protocol v2 required\n");
         w.flush();
-        return git_resp(w.out, "application/x-git-upload-pack-result");
+        return git_resp(w.out, "application/x-git-upload-pack-result")
+            .map(|r| r.with_status(400));
     }
     // bound the read: a declared Content-Length is rejected before any byte is buffered,
     // and a chunked body is still capped at CMD_CAP while streaming in
@@ -280,9 +281,14 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Re
 
     // ---- pre-header: parse errors are still normal HTTP errors (A2 arm not yet active) ----
     let mut pr = PktReader::default();
-    let hdr = loop {
-        match wire::parse_receive_header(&mut pr)? {
-            Some(h) => break h,
+    // parse_receive_header builds fresh accumulators per call, so an Incomplete
+    // result must not lose consumed lines — re-parse the whole accumulated buffer
+    // each round (bounded by CMD_CAP) instead of resuming mid-stream
+    let (hdr, leftover) = loop {
+        let mut fresh = PktReader::default();
+        fresh.push(&pr.buf);
+        match wire::parse_receive_header(&mut fresh)? {
+            Some(h) => break (h, fresh.remainder()),
             None => {
                 body.fill(FILL_STEP).await?;
                 if body.buffered().is_empty() {
@@ -296,8 +302,14 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Re
             }
         }
     };
-    let leftover = pr.remainder();
     body.unread(leftover);
+
+    // flush-only request: "everything up-to-date" — no pack follows, no report needed
+    if hdr.commands.is_empty() {
+        let mut w = PktWriter::default();
+        w.flush();
+        return git_resp(w.out, "application/x-git-receive-pack-result");
+    }
 
     // ---- post-header (A2): everything from here reports HTTP 200 + report-status ----
     match receive_inner(&mut body, &env, &route, &hdr, &principal).await {
@@ -329,7 +341,21 @@ async fn receive_inner(
     .await?;
     let bucket = Bucket::new(env.bucket("BUCKET")?, RepoId(begin.repo_id));
 
-    let (pack, tags) = pack::run::run(body, &bucket, &stub, route, &push, &mut budget).await?;
+    // a post-begin failure must close the open push row now — leaving it for the
+    // janitor's 1h expiry lets 64 failures DoS all pushes
+    let run = pack::run::run(body, &bucket, &stub, route, &push, &mut budget).await;
+    if run.is_err() {
+        let _: serde_json::Value = stub_json(
+            &stub,
+            route,
+            "/_do/push/abort",
+            &serde_json::json!({ "push_id": push.0 }),
+            &mut budget,
+        )
+        .await
+        .unwrap_or_default();
+    }
+    let (pack, tags) = run?;
     let commands: Vec<serde_json::Value> = hdr
         .commands
         .iter()
@@ -385,6 +411,11 @@ fn report_status_200(
     unpack: Result<(), String>,
     results: &[RefResult],
 ) -> Result<Response, Error> {
+    // report-status is a negotiated capability — a client that didn't ask for it gets
+    // a bare 200, not a report body it isn't demuxing
+    if !hdr.caps.report_status && !hdr.caps.report_status_v2 {
+        return git_resp(Vec::new(), "application/x-git-receive-pack-result");
+    }
     let mut w = PktWriter::default();
     let results_buf;
     let results = if results.is_empty() && unpack.is_err() {

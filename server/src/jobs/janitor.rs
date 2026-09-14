@@ -63,10 +63,11 @@ pub async fn run_slice(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Resu
         )?;
     }
     // a pack 'ingesting' with no open push pointing at it is abandoned (crash between pack finish
-    // and commit): dead after PUSH_TIMEOUT so step 3 reclaims it.
+    // and commit): dead after PUSH_TIMEOUT so step 3 reclaims it. push_id IS NULL marks the GC
+    // consolidation build pack — its lifetime is owned by the gc_consolidate job, not the janitor.
     let orphaned: Vec<I> = d
         .q(
-            "SELECT id FROM packs WHERE state='ingesting' AND created_at < ? \
+            "SELECT id FROM packs WHERE state='ingesting' AND created_at < ? AND push_id IS NOT NULL \
              AND NOT EXISTS(SELECT 1 FROM pushes u WHERE u.pack_id = packs.id AND u.state='open') LIMIT ?",
             vec![V::from(now.saturating_sub(PUSH_TIMEOUT_MS)), V::from(BATCH)],
         )?
@@ -97,7 +98,8 @@ pub async fn run_slice(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Resu
         }
         let key = keys::pending(&d.repo_id()?, &PushId(p.id.clone()));
         budget.req.charge(1)?;
-        let _ = d.bucket()?.inner.delete(key.as_str()).await; // missing key is fine
+        // missing key is fine, but a real failure must retry next run — never mark swept
+        d.bucket()?.inner.delete(key.as_str()).await?;
         d.q("UPDATE pushes SET swept_at=? WHERE id=?", vec![V::from(now), V::from(p.id.as_str())])?;
     }
     let dead: Vec<I> = d
@@ -115,7 +117,7 @@ pub async fn run_slice(d: &RepoDo, _job: &Job, budget: &mut SliceBudget) -> Resu
         }
         let key = keys::pack(&d.repo_id()?, &PackId(p.id.clone()));
         budget.req.charge(1)?;
-        let _ = d.bucket()?.inner.delete(key.as_str()).await;
+        d.bucket()?.inner.delete(key.as_str()).await?;
         d.q("DELETE FROM packs WHERE id=?", vec![V::from(p.id.as_str())])?;
     }
 
