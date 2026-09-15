@@ -1,56 +1,56 @@
-# git-edge handoff — 2026-09-15 (C2 shipped)
+# git-edge handoff — 2026-09-15 (C2+C1 shipped)
 
 Serverless Git smart-HTTP host: Rust/WASM Cloudflare Worker + per-repo SQLite
 Durable Object + R2 packfiles. Repo: `idl3/git-edge`. Main is at `257184b`,
-clean tree, all work merged (PRs #7–#15).
+clean tree, all work merged (PRs #7–#16).
 
 ## Where things stand
 
 All P0/P1 roadmap items are done except server-side import (#4b — deliberately
-deferred). **C2 (verbatim consolidated-pack fast path, ROADMAP #23) is done**:
-a plain-clone-shaped fetch whose wants resolve into the repo's single live
-pack streams that pack verbatim — one R2 GET, `x-ge-subrequests: 1` —
-gated on empty haves and no filter/shallow/deepen args so a superset pack
-can't violate those contracts. See `repo_do/mod.rs` `consolidated_pack` +
-`VerbatimStream`; CONTRACTS A29.
+deferred). **C2 (A29) and C1 (A30) are done** — see PR #17:
+
+- **C2 verbatim consolidated-pack fast path** (`consolidated_pack` +
+  `VerbatimStream` in `repo_do/mod.rs`): plain-clone-shaped fetch + exactly
+  one live pack covering all wants → stream that R2 object verbatim, one
+  `bucket.get`, `x-ge-subrequests: 1`.
+- **C1 `packfile-uris`** (`pack_uri_response` + `sign.rs` + edge `pack_get`):
+  opted-in clients (`fetch.uriprotocols`, git >= 2.40) instead get a signed
+  `/_packs/<id>.pack?e=&r=&s=` URL — HMAC-SHA256 over `v1\nrepo_id\npack\nexp`
+  keyed by `GE_URL_SIGNING_KEY`, 1h TTL. Inline `packfile` section is a legal
+  empty pack; the `<hash>` token is the pack's real trailer SHA-1 (client
+  verifies). Bandwidth fully bypasses the Worker.
 
 **Latent bug C2 exposed and fixed**: `PackWriter::append_stored` hashed each
-entry eagerly AND again at part upload (flush/checkpoint/finish are the only
-feeders by design), so every GC-consolidated pack stored a wrong trailer.
-Walking-path fetches never saw it (they rebuild the trailer); the verbatim
-path made it visible — `git fsck` caught it as an SHA1 mismatch. One-line
-fix in `store/mod.rs`; `GE_CONFORMANCE_GC=1` is the regression check
-(post-GC clone + fsck through C2).
+entry eagerly AND again at part upload, so every GC-consolidated pack stored
+a wrong trailer. Walking-path fetches rebuild trailers and never noticed;
+verbatim streaming made it visible (`index-pack`: SHA1 mismatch). One-line
+fix in `store/mod.rs`; `GE_CONFORMANCE_GC=1` is the regression check.
 
-Verified live: full suite + `GE_CONFORMANCE_GC=1` PASS — post-GC repo at
-`packs_live:1` clones at 1 subrequest and passes `fsck --strict`.
+Verified live: base suite + `GE_CONFORMANCE_GC=1 GE_CONFORMANCE_URIS=1` PASS
+on wrangler dev — including a real git 2.55 clone over the signed URI.
 
 ## The two measured ceilings (next work)
 
 | Wall | Evidence | Fix order |
 |---|---|---|
-| **Clone** dies at `Error::Budget`→413 between 110k–263k objects (vite ✓ / react ✗ / rails ✗). `blob:none` doesn't help — spend is R2 entry reads, sqlite is free | benchmark round 10 | ~~C2~~ **C1 next** |
-| **Import** can't stage a single commit with >ingest-budget objects (TypeScript: one commit = 222k objects) | `git-edge-import.sh` unsplittable-slice error | **I1** (I2 as interim) |
+| **Clone** dies at `Error::Budget`→413 between 110k–263k objects (vite ✓ / react ✗ / rails ✗). `blob:none` doesn't help — spend is R2 entry reads, sqlite is free | benchmark round 10 | ~~C2~~ ~~C1~~ — **re-bench** |
+| **Import** can't stage a single commit with >ingest-budget objects (TypeScript: one commit = 222k objects) | `git-edge-import.sh` unsplittable-slice error | **I1 next** (I2 as interim) |
 
-**Design doc: `findings/scale-ceilings.md`** — read first. Next
-implementation is **C1 (packfile-uris)** with signed `/packs/<key>` URLs:
-offloads the pack bytes off the Worker's subrequest/wall-clock budget
-entirely for clients that advertise the capability (git >= 2.41ish,
-off by default — most clients still take the C2 path). Then **I1**
-server-side import jobs.
+**Design doc: `findings/scale-ceilings.md`**. Next implementation is **I1
+server-side import jobs**. Before that, re-bench react/rails post-C2: a
+consolidated repo should now clone in tens of subrequests — confirm the wall
+actually moved, and measure what pre-GC/multi-pack clones still cost (that's
+the residual case neither C1 nor C2 covers).
 
-### C1 pointers
+### I1 pointers
 
-- C2's `consolidated_pack` gate + pack lookup is the same coverage test C1
-  wants — a `packfile-uris` capable request advertises the URI instead of
-  streaming.
-- Response shape: `wire::write_fetch_prelude` + a `packfile-uris` section
-  before `packfile` (protocol v2 fetch section ordering — check git docs).
-- Signing: see design doc for the `/packs/<key>` URL scheme; tokens stay
-  out of URLs, sign server-side.
-- Re-bench react/rails post-C2 first — C2 may already clear the measured
-  wall for consolidated repos; C1's remaining value is pre-GC and
-  multi-pack cases.
+- `POST /_admin/import {r2_key}` + resumable `import_pack` job on the
+  alarm/jobs model (`jobs/mod.rs`, `purge_repo` is the proven shape); each
+  alarm slice gets a fresh request budget.
+- Client side: `tools/git-edge-import.sh` chunked `/_admin/import-part`
+  uploads under the 100 MB cap (or S3 multipart to R2 staging).
+- Reuse `pack/ingest.rs` resolve+normalize pipeline across slices —
+  checkpointed like `gc_consolidate`'s `WriterCkpt`/`Pos` machinery.
 
 ## Environment / workflow
 
@@ -59,8 +59,10 @@ server-side import jobs.
 - Dev server: `cd server && wrangler dev --port 8794` (wrangler `--var` uses
   `KEY:VALUE` colon syntax, not `=`).
 - Conformance: `tests/conformance/run.sh` against a running dev server; flags
-  `GE_CONFORMANCE_GC=1 GE_CONFORMANCE_PURGE=1 GE_CONFORMANCE_LIMITS=1`,
-  `GE_REPO` for owner prefix, `EDGE_BASE`, `EDGE_TOKEN`.
+  `GE_CONFORMANCE_GC=1 GE_CONFORMANCE_PURGE=1 GE_CONFORMANCE_LIMITS=1
+  GE_CONFORMANCE_URIS=1`, `GE_REPO` for owner prefix, `EDGE_BASE`,
+  `EDGE_TOKEN`. URIS needs `GE_URL_SIGNING_KEY` in `.dev.vars` and git >= 2.40
+  as `GE_GITBIN` (Apple git 2.39 lacks packfile-uris; Homebrew git works).
 - **Workflow rules**: commit/push/PR via `/atlas-engineering:commit-push-pr`;
   no PR template → fallback Summary/Changes/Testing format. Do NOT run
   `cargo fmt` globally — repo is not rustfmt-clean, it creates noise. Never

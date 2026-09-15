@@ -189,7 +189,7 @@ impl DurableObject for RepoDo {
                 // the await route lives outside the sync span (1.3); boot may still have
                 // enqueued jobs in its span, so a successful fetch must rearm the alarm
                 (Method::Post, "/_do/fetch") => {
-                    let r = self.fetch_v2(&body).await;
+                    let r = self.fetch_v2(&body, &hdr).await;
                     // boot may have enqueued jobs in this span — rearm even on error;
                     // a propagated Storage/Internal error rolls the span back anyway
                     let _ = jobs::rearm(self).await;
@@ -1128,11 +1128,11 @@ impl RepoDo {
     }
 
     /// POST /_do/fetch (section 9): the only DO route that awaits (R2 reads).
-    async fn fetch_v2(&self, body: &[u8]) -> worker::Result<Response> {
+    async fn fetch_v2(&self, body: &[u8], hdr: &RepoHeaders) -> worker::Result<Response> {
         // the budget lives in the inner fn/stream; the tally outlives both so the
         // error response can still report what the request spent (audit P3)
         let spend: Spend = Rc::new(Cell::new(0));
-        match self.fetch_v2_inner(body, &spend).await {
+        match self.fetch_v2_inner(body, &spend, hdr).await {
             Ok(r) => Ok(r),
             Err(e @ (Error::Storage(_) | Error::Internal(_))) => Err(worker::Error::RustError(e.message())),
             Err(e) => {
@@ -1142,7 +1142,7 @@ impl RepoDo {
         }
     }
 
-    async fn fetch_v2_inner(&self, body: &[u8], spend: &Spend) -> Result<Response, Error> {
+    async fn fetch_v2_inner(&self, body: &[u8], spend: &Spend, hdr: &RepoHeaders) -> Result<Response, Error> {
         let args = match wire::parse_v2_command(body)? {
             V2Command::Fetch(a) => a,
             _ => return Err(Error::Protocol("not fetch".into())),
@@ -1252,7 +1252,7 @@ impl RepoDo {
         let ready = args.done || args.haves.is_empty() || acks.len() == args.haves.len();
         let mut w = PktWriter::default();
         if !ready {
-            wire::write_fetch_prelude(&mut w, &args, &acks, &[], &[], &[])?;
+            wire::write_fetch_prelude(&mut w, &args, &acks, &[], &[], &[], &[])?;
             return Response::from_bytes(w.out).map_err(|e| Error::Internal(e.to_string()));
         }
         // C2 (ROADMAP #23): a plain-clone-shaped fetch whose wants all live in the
@@ -1271,7 +1271,17 @@ impl RepoDo {
             && !args.deepen_relative
             && args.filter.is_none();
         if plain_clone {
-            if let Some(pack) = self.consolidated_pack(&idx, &wants)? {
+            if let Some((pack, pack_bytes)) = self.consolidated_pack(&idx, &wants)? {
+                // C1 (ROADMAP #24): an opted-in client gets a signed URI for the
+                // same pack instead of the bytes — bandwidth leaves the Worker
+                // entirely. Any gap (no key configured, no public base, scheme
+                // not in the client's list) falls through to the C2 stream.
+                if let Some(resp) = self
+                    .pack_uri_response(&args, &pack, pack_bytes, hdr, &bucket, &mut budget, &mut w, &acks, &wanted_refs)
+                    .await?
+                {
+                    return Ok(resp);
+                }
                 let key = keys::pack(&bucket.repo, &pack);
                 budget.charge(1)?; // one GET streams the whole pack (7.1)
                 let obj = bucket
@@ -1284,7 +1294,7 @@ impl RepoDo {
                     .body()
                     .ok_or_else(|| Error::Storage(format!("no body for {key}")))?;
                 let pack_stream = body.stream().map_err(Error::from)?;
-                wire::write_fetch_prelude(&mut w, &args, &acks, &wanted_refs, &[], &[])?;
+                wire::write_fetch_prelude(&mut w, &args, &acks, &wanted_refs, &[], &[], &[])?;
                 // the charge above is the whole projected spend — the body stream
                 // charges nothing further per chunk
                 let projected = budget.used;
@@ -1332,7 +1342,7 @@ impl RepoDo {
         )
         .await?;
         // step 6: stream header + chunks + trailer + flush as band-1 sideband frames
-        wire::write_fetch_prelude(&mut w, &args, &acks, &wanted_refs, &set.shallow, &set.unshallow)?;
+        wire::write_fetch_prelude(&mut w, &args, &acks, &wanted_refs, &set.shallow, &set.unshallow, &[])?;
         let prelude = w.out;
         // contract 406: the harness asserts on the ReqBudget counters — report projected
         // spend (used so far + every planned pack read) before the stream starts
@@ -1365,13 +1375,16 @@ impl RepoDo {
     /// The C2 gate's server half: exactly one live pack, and every resolved want
     /// has its objects row in it. A want the walk would reject ("not our ref") or
     /// one living in another pack returns None so the walking path answers.
-    fn consolidated_pack(&self, idx: &Index<'_>, wants: &[ObjectId]) -> Result<Option<PackId>, Error> {
+    /// Returns the pack id and its stored byte length (C1 needs it for the
+    /// trailer read that mints the URI's hash token).
+    fn consolidated_pack(&self, idx: &Index<'_>, wants: &[ObjectId]) -> Result<Option<(PackId, u64)>, Error> {
         #[derive(serde::Deserialize)]
         struct P {
             id: String,
+            bytes: i64,
         }
         let live = self
-            .q("SELECT id FROM packs WHERE state='live'", vec![])?
+            .q("SELECT id, bytes FROM packs WHERE state='live'", vec![])?
             .to_array::<P>()?;
         let [p] = live.as_slice() else {
             return Ok(None);
@@ -1383,7 +1396,76 @@ impl RepoDo {
                 _ => return Ok(None),
             }
         }
-        Ok(Some(pack))
+        // a corrupt row must not 500 every clone shape — degrade to the walk
+        let Ok(bytes) = u64::try_from(p.bytes) else {
+            return Ok(None);
+        };
+        Ok(Some((pack, bytes)))
+    }
+
+    /// C1 (A30): when the client sent `packfile-uris` naming our public scheme,
+    /// a signing key is configured, and the edge forwarded the request origin,
+    /// answer with a `packfile-uris` section — `<trailer-hash> <signed URL>` —
+    /// and a valid empty pack as the inline `packfile` section (the client still
+    /// index-packs it; an empty pack is legal). The hash token is the pack's
+    /// real trailer SHA-1: `git http-fetch --packfile` compares it against the
+    /// downloaded pack's checksum and dies on mismatch.
+    async fn pack_uri_response(
+        &self,
+        args: &FetchArgs,
+        pack: &PackId,
+        pack_bytes: u64,
+        hdr: &RepoHeaders,
+        bucket: &Bucket,
+        budget: &mut ReqBudget,
+        w: &mut PktWriter,
+        acks: &[ObjectId],
+        wanted_refs: &[(ObjectId, BString)],
+    ) -> Result<Option<Response>, Error> {
+        let (Some(base), Some(owner), Some(repo), true) =
+            (hdr.base.as_deref(), hdr.owner.as_deref(), hdr.repo.as_deref(), pack_bytes >= 32)
+        else {
+            return Ok(None);
+        };
+        let proto: &[u8] = if base.starts_with("https://") { b"https" } else { b"http" };
+        let uris = args.packfile_uris.as_deref().unwrap_or(&[]);
+        if !uris.iter().any(|p| p.as_slice() == proto) {
+            return Ok(None);
+        }
+        let Some(signing) = crate::sign::signing_key(&self.env) else {
+            return Ok(None);
+        };
+        // must not exceed the janitor's dead-pack grace (jobs/janitor.rs
+        // GRACE_MS), else a signed URL could outlive its R2 object
+        const TTL: i64 = 3600;
+        let exp = platform::now_ms() / 1000 + TTL;
+        // the signature binds the opaque repo_id (carried as r=) — stronger than
+        // the route name: a deleted+recreated repo gets a fresh id, so old sigs die
+        let repo_id = bucket.repo.0.clone();
+        // a transient trailer-read failure degrades to the A29 verbatim stream
+        // rather than failing a fetch that could still be served
+        let Ok(trailer) = bucket
+            .read_range(&keys::pack(&bucket.repo, pack), pack_bytes - 20, 20, budget)
+            .await
+        else {
+            return Ok(None);
+        };
+        let hash = trailer.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let sig = crate::sign::pack_sig(&signing, &repo_id, &pack.0, exp)?;
+        let uri =
+            format!("{base}/{owner}/{repo}/_packs/{}.pack?e={exp}&r={repo_id}&s={sig}", pack.0);
+        // plain-clone shape ⇒ ready ⇒ the prelude always emits the packfile
+        // header; Ok(false) is unreachable and would produce a malformed body
+        if !wire::write_fetch_prelude(w, args, acks, wanted_refs, &[], &[], &[format!("{hash} {uri}")])? {
+            return Err(Error::Internal("packfile-uris prelude".into()));
+        }
+        wire::Sideband::new(w).data(&empty_pack()?);
+        w.flush();
+        let resp = Response::from_bytes(std::mem::take(&mut w.out)).map_err(Error::from)?;
+        resp.headers()
+            .set("x-ge-subrequests", &format!("{}/{}", budget.used, budget.max_subrequests))
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        Ok(Some(resp))
     }
 
     /// POST /_do/export — a git bundle (v3, no prerequisites) of every live ref.
@@ -1516,6 +1598,20 @@ impl FetchStream {
             _ => Ok(None),
         }
     }
+}
+
+/// A legal zero-object pack (PACK header + trailer). C1's inline `packfile`
+/// section when every object moved to a URI — the client index-packs it anyway.
+fn empty_pack() -> Result<Vec<u8>, Error> {
+    let head = gix_pack::data::header::encode(gix_pack::data::Version::V2, 0).to_vec();
+    let mut h = gix_hash::hasher(gix_hash::Kind::Sha1);
+    h.update(&head);
+    let trailer = h
+        .try_finalize()
+        .map_err(|_| Error::Internal("empty-pack trailer".into()))?;
+    let mut p = head;
+    p.extend_from_slice(trailer.as_bytes());
+    Ok(p)
 }
 
 /// C2's stream: the verbatim R2 pack body re-framed as band-1 sideband data.

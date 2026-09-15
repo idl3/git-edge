@@ -86,7 +86,7 @@ Exact wire rules, all enforced inside `wire` and tested against real `git` (sect
 3. v2 `fetch` response: `acknowledgments` section is **omitted entirely** when the client sent `done`. Otherwise it is `acknowledgments\n`, then `NAK\n` or one `ACK <oid>\n` per known have, then `ready\n` if a pack follows. If no pack follows, the response ends with flush after the section. If a pack follows: delim, optional `shallow-info` section, delim, `packfile\n`, sideband frames, flush. `response-end` is never written over smart HTTP.
 4. `report-status` and `report-status-v2` bodies are written in band 1 when `caps.side_band_64k` is true, else as raw pkt-lines. Both end with a flush. Under sideband the final flush is written after the last band-1 frame, outside the band.
 5. v0 receive-pack advertisement: `# service=git-receive-pack\n`, flush, then `<oid> <ref>\0<caps>\n` for the first ref, `<oid> <ref>\n` for the rest, flush. Empty repo: `<40 zeros> capabilities^{}\0<caps>\n`. Advertised receive caps, exactly: `report-status report-status-v2 delete-refs side-band-64k quiet ofs-delta object-format=sha1 agent=git-edge/0.1`. Not advertised: `atomic`, `push-options`.
-6. v2 capability advertisement, exactly: `version 2`, `agent=git-edge/0.1`, `ls-refs=unborn`, `fetch=shallow filter`, `object-format=sha1`, flush. Not advertised: `wait-for-done`, `ref-in-want`, `sideband-all`, `packfile-uris`, `server-option`.
+6. v2 capability advertisement, exactly: `version 2`, `agent=git-edge/0.1`, `ls-refs=unborn`, `fetch=shallow filter packfile-uris`, `object-format=sha1`, flush. Not advertised: `wait-for-done`, `ref-in-want`, `sideband-all`, `server-option`.
 7. Upload-pack is v2 only. A `GET info/refs?service=git-upload-pack` without `Git-Protocol: version=2` gets the v0 advertisement with capabilities `object-format=sha1 agent=git-edge/0.1` only. A v0 `POST git-upload-pack` gets HTTP 400 with body `ERR protocol v2 required (git >= 2.26)\n` as one pkt-line.
 8. `Git-Protocol: version=1` is answered as v0 with a leading `version 1\n` pkt (upload-pack) or ignored (receive-pack).
 
@@ -945,3 +945,40 @@ Continuing the audit-fix numbering (last: A16).
   reject — falls back to `send_set`, which produces the proper response.
   Mid-stream failures degrade exactly like step 6's: one band-3 `ERR` frame,
   then the stream ends.
+- **A30. `packfile-uris` offload (amends section 9 step 6, sits atop A29).**
+  The v2 advertisement lists `packfile-uris` among `fetch`'s features; an
+  opted-in client (git >= 2.40 with `fetch.uriprotocols` set) then sends one
+  `packfile-uris <csv>` argument naming acceptable URI schemes. When the A29
+  gate holds AND the client's list admits the request's own scheme AND
+  `GE_URL_SIGNING_KEY` is configured at >= 32 bytes (a shorter value
+  silently disables the feature; set it with `wrangler secret put`, not
+  `[vars]`) AND the edge forwarded the public origin (`x-ge-base`), the
+  DO answers with a `packfile-uris` section —
+  `<trailer-sha1> <uri>` per the spec's `40-HEXDIGIT SP uri` line — followed
+  by a `packfile` section containing a valid zero-object pack, which the
+  client index-packs regardless. The URI is
+  `GET /<owner>/<repo>/_packs/<id>.pack?e=<exp>&r=<repo_id>&s=<sig>`: the
+  signature is HMAC-SHA256 over `v1\n<repo_id>\n<pack>\n<exp>` keyed by
+  `GE_URL_SIGNING_KEY`, TTL one hour. URI fetches carry no auth headers by
+  protocol design, so `s` is the credential — a bearer capability: anyone
+  holding the URL reads that pack until `e`, independent of later token
+  revocation. Minting is delegation: a read-token holder may hand the URL
+  to a third party for the TTL, and (like A29) the pack is the verbatim
+  superset, so objects unreachable from current refs ride along. Binding
+  to the opaque `repo_id` (not the route name) means a deleted+recreated
+  repo invalidates its old sigs. `e`, `r`, and `s` are validated before
+  any R2 read; failures are 403 (bad/expired sig) or 404 (feature off,
+  bad name, missing object). The route enforces time, not pack state — a
+  sig minted just before consolidation can serve the dead pack until `e`
+  or the janitor's R2 delete, whichever comes first. Responses carry
+  `Cache-Control: private, no-store`; the URL is a credential. The pack
+  body streams via `response_body` — one subrequest, no CPU burn on the
+  edge. Any missing precondition falls through to the A29 verbatim
+  stream, and so does a failed trailer read — degrading beats failing a
+  fetch that could still be served. Hash tokens are the packs' real
+  trailer SHA-1s (last 20 bytes — one range read): `git http-fetch
+  --packfile` dies on a checksum mismatch, so a corrupt or stale pack
+  surfaces loudly rather than silently. Rotating `GE_URL_SIGNING_KEY`
+  invalidates outstanding URLs instantly — expected, but worth knowing:
+  a clone mid-URI-fetch dies and retries cleanly. Clients that never opt
+  in see no behavioral change; the feature degrades to A29.

@@ -29,7 +29,7 @@ corruption.
 version 2
 agent=git-edge/0.1
 ls-refs=unborn
-fetch=shallow filter
+fetch=shallow filter packfile-uris
 object-format=sha1
 ```
 
@@ -56,7 +56,7 @@ object-format=sha1`
 | `thin-pack` arg | ✅ | accepted | packs sent are self-contained — deltas never appear on the wire |
 | `include-tag` | ✅ | ✅ | peeled tags of wanted commits only |
 | `sideband-all` | ✅ | — | not advertised; plain side-band-64k semantics |
-| `packfile-uris` (CDN offload) | ✅ | — | not advertised |
+| `packfile-uris` (CDN offload) | ✅ | ✅ | advertised; opted-in plain clones get a signed `/_packs` URL (A30) |
 | `wait-for-done` | ✅ | — | not advertised |
 | `no-done` | ✅ | tolerated, not advertised | parsed; we answer before `done` anyway |
 | `object-info`, `bundle-uri`, `server-option` commands | ✅ | — | unknown command → protocol error |
@@ -150,9 +150,9 @@ truncation, or corrupted ref state.
    client are parsed and ignored; the server does not remember that a pushed
    history was truncated. Consequence is benign (objects are stored; the
    connectivity rule still requires referenced bases to exist).
-6. **v0/v1 fetch, `tree:`/`sparse:`/`combine:` filters, `packfile-uris`,
-   `sideband-all`, `object-info`, `bundle-uri`, sha256** — deliberately
-   unadvertised; clients get a protocol error, never silent misbehavior.
+6. **v0/v1 fetch, `tree:`/`sparse:`/`combine:` filters, `sideband-all`,
+   `object-info`, `bundle-uri`, sha256** — deliberately unadvertised;
+   clients get a protocol error, never silent misbehavior.
 7. **Auth is static tokens, but now per-repo too.** `GE_READ_TOKEN`/
    `GE_WRITE_TOKEN` remain the deployment-wide admin credentials (HTTP Basic or
    Bearer). Per-repo tokens are minted via `POST /:owner/:repo/_admin/tokens`
@@ -203,8 +203,8 @@ truncation, or corrupted ref state.
 | Import sinatra/sinatra (4,684 commits, 22.6k objects, 8 MiB pack) | 1 push, 11 s; clone 2 s, fsck clean |
 | Import expressjs/express (6,169 commits, 32.5k objects, 11 MiB pack) | 2 staged pushes, 15 s; clone 8 s, fsck clean |
 | Import vitejs/vite (9,678 commits, 110k objects, 75 MiB pack) | 4 staged pushes, 337 s; clone 133 s, fsck clean |
-| Import facebook/react (21,698 commits, 263k objects, 1,078 MiB pack) | 25 staged pushes, 337 s; **clone fails** — `Error::Budget` → HTTP 413 mid-walk (per-request subrequest budget). *Pre-A29: once GC consolidates to `packs_live=1` the clone takes the verbatim path (~1 subrequest)* |
-| Import rails/rails (99,661 commits, 787k objects, 308 MiB pack) | 39 staged pushes, 644 s; **clone fails** — same budget wall; `blob:none` doesn't help (budget is index reads, not blob bytes). *Pre-A29: verbatim path applies once consolidated to one live pack* |
+| Import facebook/react (21,698 commits, 263k objects, 1,078 MiB pack) | 25 staged pushes, 337 s; **clone fails** — `Error::Budget` → HTTP 413 mid-walk (per-request subrequest budget). *Post-A29/A30: once GC consolidates to `packs_live=1`, plain clones take the verbatim path (~1 subrequest); `fetch.uriprotocols` clients get a signed pack URL instead — bandwidth off the Worker* |
+| Import rails/rails (99,661 commits, 787k objects, 308 MiB pack) | 39 staged pushes, 644 s; **clone fails** — same budget wall; `blob:none` doesn't help (budget is index reads, not blob bytes). *Post-A29/A30: verbatim path (or signed-URI offload for opted-in clients) applies once consolidated to one live pack* |
 | Import microsoft/TypeScript (39,366 commits, 945k objects, 2.8 GiB pack) | **import infeasible** — one commit alone adds ~222k objects; staging can't split below a commit |
 
 ## Interoperability test matrix (git 2.54, live)
