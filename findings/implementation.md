@@ -473,3 +473,48 @@ Four features, all verified against local workerd (git 2.54,
   `HEAD` line when `meta.head` resolves, blank line, then the send_set pack
   verbatim (no pkt framing). Verified: `bundle verify` + clone-from-bundle +
   fsck.
+
+## Round 10 — OSS repo benchmarks + artifact-fs e2e (main, post-#12)
+
+Public-repo spread replacing the private-repo numbers (atlas-core/grain-core,
+kept above as history). Harness: `tests/bench/oss-bench.sh` — bare clone,
+staged first-parent pushes sliced under 60 MiB **and** 30k objects, clone back,
+tip + `fsck --strict` output must match the source byte-for-byte.
+
+| repo | commits | objects | pack | pushes | import | clone | fsck |
+|---|---|---|---|---|---|---|---|
+| sinatra/sinatra | 4,684 | 22,637 | 8 MiB | 1 | 11 s | 2 s | clean (3 pre-existing) |
+| expressjs/express | 6,169 | 32,487 | 11 MiB | 2 | 15 s | 8 s | clean |
+| vitejs/vite | 9,678 | 110,199 | 75 MiB | 4 | 337 s | 133 s | clean |
+| facebook/react | 21,698 | 263,233 | 1,078 MiB | 25 | 337 s | **413 Budget** | — |
+| rails/rails | 99,661 | 787,392 | 308 MiB | 39 | 644 s | **413 Budget** | — |
+| microsoft/TypeScript | 39,366 | 945,303 | 2,805 MiB | stopped | — | — | import infeasible |
+
+**TypeScript: the import-side ceiling.** 70 planned slices never got going —
+commit `6d44e05` alone introduces ~222k objects / 68 MiB, and staged pushes
+cannot split below one-commit granularity. First seen in the wild: real OSS
+histories can contain single commits bigger than the whole ingest budget. Only
+fixes: server-side import (ROADMAP #4 option b) or accepting the giant push
+(which would die on the 240 s wall clock regardless).
+
+**New ceiling found — the read path, not the write path.** Imports scale far
+past the profile (787k objects / 39 packs landed fine; GC mark/consolidate
+churned through them between pushes). But a *full clone* of react or rails dies
+on `Error::Budget` → HTTP 413 ~26–34 s in: the per-request subrequest budget
+(9,000 / 240 s) is exhausted by object-index reads during commit walk + tree
+expansion across dozens of packs. `clone --filter=blob:none` fails identically
+— the spend is index reads, not blob bytes. Bisected ceiling: **110k objects
+passes (vite), 263k fails (react)**. For the target profile (small agent apps,
+typically <50k objects) there is comfortable headroom; above ~150k objects a
+full clone needs either a bigger budget model or a resumeable/chunked fetch —
+not planned (non-goal: monorepo scale), but now measured instead of assumed.
+
+**artifact-fs e2e (client-side proof).** Ran cloudflare/artifact-fs's real FUSE
+suite in a Linux container (`golang:1.26-bookworm` + fuse3, `--device /dev/fuse`)
+against `wrangler dev`: **23 PASS / 0 FAIL / 3 SKIP** — blobless clone, lazy
+hydration, `git status/diff/commit`, `push`/`pull --ff-only` through the mount,
+`--require-commit` verified acquisition, async prepare gates. Zero non-200s in
+the worker log — no protocol gaps. `git-edge mount` works today; recipe +
+Dockerfile in `findings/afs-e2e.md`. Upstream bug found: their e2e fsmonitor
+hook exec's `os.Executable()` (the test binary under `go test`) → fork-bombs;
+worked around with a 4-line `AFS_FSMONITOR_EXE` override, worth upstreaming.
