@@ -34,25 +34,25 @@ The benchmark also flushed out two real bugs (both fixed in this branch):
 |---|---|---|---|
 | 1 | ~~Fetch read-batch splitting~~ | done — was a hard clone failure at 70k+ objects | S |
 | 2 | ~~HEAD adoption on first push~~ | done — every scaffolded repo pushes `master` | XS |
-| 3 | **Repo delete** | "disposable" is literal — there is currently *no* way to delete a repo, its DO storage, or its R2 packs. `POST /:o/:r/_admin/delete` → mark refs gone, enqueue janitor sweep of packs + objects + tokens | M |
+| 3 | ~~**Repo delete**~~ | done — `POST /_admin/delete` tombstones (410), `purge_repo` wipes R2+DO, name reusable after | M |
 | 4 | **Bulk import path** | staged `git push` works but is a client-side workaround. Options: (a) `git-edge-import` CLI that auto-slices a local repo into <80 MB pushes — zero server work; (b) `POST /_admin/import` accepting an R2-uploaded bundle/pack — eliminates the body cap entirely | S–M |
-| 5 | **Anonymous/public read** | agents share read-only links constantly; today every clone needs a token. Per-repo `public` flag on the tokens API, read-side only | S |
-| 6 | **Dead-job / GC alerting** | `jobs_dead>0` in `_state` is the wedge signal; emit it to Analytics Engine (or poll from a cron Worker) so a livelocked repo pages instead of festering | S |
-| 7 | **Job-lifecycle metrics** | artifact-fs's NDJSON schema (phase/state/attempt/duration/retryable) is the model: emit mark/consolidate/sweep outcome datapoints, not just request-level — makes a wedged GC visible without `_state` polling | S |
+| 5 | ~~**Anonymous/public read**~~ | done — `meta.public` flag via `POST /_admin/public`; anonymous reads only when no credential presented | S |
+| 6 | ~~**Dead-job / GC alerting**~~ | done — `blob3=dead` job datapoints + `jobs_dead` gauge per alarm pass; alert wiring documented (A18) | S |
+| 7 | ~~**Job-lifecycle metrics**~~ | done — `job_event` datapoints: kind/event/outcome/error-class/attempt/duration (A17) | S |
 | 8 | **Agent skill** | ship `.devin/skills/git-edge` (or AGENTS.md section): clone/push URLs, `_admin/tokens` minting, staged-push recipe for >80 MiB, credential-helper config (never tokens in URLs — process-listing leak), `_state` introspection | S |
 
 ## Priority 1 — production hardening
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| 9 | ~~Repo quota + abuse limits~~ | done — `GE_QUOTA_MAX_REPOS_PER_OWNER` (50) via `owner!<o>` registry DO, `GE_QUOTA_MAX_OBJECTS` (2M)/`GE_QUOTA_MAX_BYTES` (4 GiB) at `commit_push` (A17) | M |
-| 10 | ~~Rate limiting~~ | done — sliding-window `rate` table check in `push_begin`, `GE_RATE_PUSHES_PER_MIN` (30), 429 + `Retry-After` (A18); zone rules remain the heavy hammer | S |
-| 11 | **Export endpoint** | `GET /:o/:r/_admin/export` → streams a `git bundle` of live refs. Disposability = easy in *and* easy out; also the backup story | M |
+| 9 | ~~Repo quota + abuse limits~~ | done — `GE_QUOTA_MAX_REPOS_PER_OWNER` (50) via `owner!<o>` registry DO, `GE_QUOTA_MAX_OBJECTS` (2M)/`GE_QUOTA_MAX_BYTES` (4 GiB) at `commit_push` (A26) | M |
+| 10 | ~~Rate limiting~~ | done — sliding-window `rate` table check in `push_begin`, `GE_RATE_PUSHES_PER_MIN` (30), 429 + `Retry-After` (A27); zone rules remain the heavy hammer | S |
+| 11 | ~~**Export endpoint**~~ | done — `GET /_admin/export` streams a real v3 `git bundle`; verify + clone-from-bundle pass (A25) | M |
 | 12 | **`x-ge-subrequests` on error responses** | audit P3 — errors currently drop the accounting header | XS |
-| 13 | **Lease-overlap hardening** | audit P3 — a `running` job requeued after 60 s can overlap its original slice; heartbeats narrow it, fencing is the guard. Tighten or document | S |
-| 14 | **`coalesce` `unwrap_or(u32::MAX)`** | audit P3 — a value bounded by WINDOW should fail loudly, not saturate | XS |
-| 15 | ~~ls-refs caching~~ | done — DO memoizes the refs snapshot + `/_do/refs`/`/_do/ls-refs` bytes on `refs_version` (A19); `_state` reports hits/misses | S |
-| 16 | **Ref pinning** | `POST /_admin/pin {ref, sha}` — frozen refs that reject updates; the server-side analog of artifact-fs's `--require-commit` verified acquisition, for deploy-snapshot workflows | S |
+| 13 | ~~**Lease-overlap hardening**~~ | done — heartbeat is a lease CAS; stale slices bail as `stale` without consuming attempts (A19) | S |
+| 14 | ~~**`coalesce` `unwrap_or(u32::MAX)`**~~ | done — loud `Error::Limit` → 413 (A21) | XS |
+| 15 | ~~ls-refs caching~~ | done — DO memoizes the refs snapshot + `/_do/refs`/`/_do/ls-refs` bytes on `refs_version` (A28); `_state` reports hits/misses | S |
+| 16 | ~~**Ref pinning**~~ | done — `pins` table + `/_admin/pin|unpin`; push to a pinned ref gets `ng "ref is pinned"` (A24) | S |
 
 ## Priority 2 — worthwhile, not blocking
 
