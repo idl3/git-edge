@@ -55,6 +55,23 @@ impl From<serde_json::Error> for Error {
 }
 
 impl Error {
+    /// Variant name for metrics and dead-job alerting — deliberately not the
+    /// message, which is unbounded and would blow the datapoint's cardinality.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Error::Protocol(_) => "protocol",
+            Error::Auth => "auth",
+            Error::Forbidden => "forbidden",
+            Error::NotFound => "notfound",
+            Error::Conflict(_) => "conflict",
+            Error::Unpack(_) => "unpack",
+            Error::Budget => "budget",
+            Error::Limit(_) => "limit",
+            Error::Storage(_) => "storage",
+            Error::Internal(_) => "internal",
+        }
+    }
+
     /// Rebuild the DO's Error from its JSON error body (wire::http::do_error_response).
     pub async fn from_do_response(mut resp: worker::Response) -> Error {
         #[derive(serde::Deserialize)]

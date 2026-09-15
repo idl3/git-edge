@@ -106,4 +106,32 @@ if [ "${GE_CONFORMANCE_GC:-0}" = "1" ]; then
   note "GC swept (objects before: $OBJ0)"
 fi
 
+# purge_repo job: POST _admin/delete enqueues it; the repo converges to empty
+# (the DO re-boots a fresh repo on next read — objects/refs/jobs all zero).
+# Runs only with GE_CONFORMANCE_PURGE=1 and a build that has the admin route.
+if [ "${GE_CONFORMANCE_PURGE:-0}" = "1" ]; then
+  note "purge: _admin/delete -> purge_repo wipes the repo"
+  PREPO="$REPO-purge"
+  mkdir "$WORK/purge" && cd "$WORK/purge"
+  git init -q && git config user.email t@t && git config user.name t
+  echo purge > p && git add p && git commit -qm p && git branch -M main
+  git push -q "$URL/$PREPO" main || fail "purge seed push"
+  git ls-remote "$URL/$PREPO" | grep -q main || fail "pre-purge ls-remote empty"
+  code=$(curl -s -o "$WORK/purge-resp" -w '%{http_code}' -X POST "$URL/$PREPO/_admin/delete")
+  if [ "$code" = "404" ]; then
+    note "purge: _admin/delete not deployed on this build — skipped"
+  else
+    [ "$code" -lt 300 ] || fail "_admin/delete -> $code: $(cat "$WORK/purge-resp")"
+    deadline=$((SECONDS + 60))
+    while :; do
+      refs=$(git ls-remote "$URL/$PREPO" 2>/dev/null | wc -l | tr -d ' ')
+      objs=$(curl -sf "$URL/$PREPO/_state" | python3 -c 'import sys,json;print(json.load(sys.stdin)["objects"])' || echo -1)
+      [ "$refs" = "0" ] && [ "$objs" = "0" ] && break
+      [ $SECONDS -lt $deadline ] || fail "purge did not converge in 60s (refs=$refs objects=$objs)"
+      sleep 2
+    done
+    note "purged: repo reads back empty"
+  fi
+fi
+
 note "PASS"

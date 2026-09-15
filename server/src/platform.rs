@@ -24,3 +24,54 @@ pub fn hex16() -> Result<String, Error> {
 pub fn do_id_name(state: &worker::State) -> Option<String> {
     state.id().name()
 }
+
+/// Job-lifecycle datapoint (CONTRACTS.md A17), emitted by `jobs::dispatch` for every
+/// job event while `GE_METRICS` is bound. Unbound costs one binding lookup and
+/// returns; a failed write is dropped on the floor like `edge::metric` — metrics
+/// must never fail a job.
+///
+/// Positional layout (query as index1/blobN/doubleN):
+///   index1  = repo — "owner/repo" from `ctx.id.name`, which survives a meta wipe
+///   blob1   = "job" — discriminator: request datapoints carry op here, gauges "gauge"
+///   blob2   = kind — janitor | gc_mark | gc_consolidate | gc_sweep | purge_repo
+///   blob3   = event — start | done | continue | reschedule | retry | dead | stale
+///   blob4   = outcome — ok | retry | dead | stale
+///   blob5   = error_class — `Error::class()`, "" when none (bounded cardinality)
+///   double1 = attempt — 1-based attempt number of this slice
+///   double2 = duration_ms — slice wall time (0 on start)
+///   double3 = will_retry — 1.0 when the job runs again (continue/reschedule/retry)
+pub fn job_event(
+    env: &worker::Env,
+    repo: &str,
+    kind: &str,
+    event: &str,
+    outcome: &str,
+    attempt: u32,
+    duration_ms: i64,
+    will_retry: bool,
+    error_class: &str,
+) {
+    let Ok(ds) = env.analytics_engine("GE_METRICS") else {
+        return;
+    };
+    let _ = worker::AnalyticsEngineDataPointBuilder::new()
+        .indexes([repo])
+        .blobs(["job", kind, event, outcome, error_class])
+        .doubles([f64::from(attempt), duration_ms as f64, if will_retry { 1.0 } else { 0.0 }])
+        .write_to(&ds);
+}
+
+/// `jobs_dead` gauge (CONTRACTS.md A18): emitted once per alarm pass while dead
+/// rows exist — blob1 "gauge" / blob2 "jobs_dead", double1 the count. Combined
+/// with the `dead` job_event it gives an external alarm both the trigger and
+/// the per-kind detail.
+pub fn jobs_dead_gauge(env: &worker::Env, repo: &str, dead: i64) {
+    let Ok(ds) = env.analytics_engine("GE_METRICS") else {
+        return;
+    };
+    let _ = worker::AnalyticsEngineDataPointBuilder::new()
+        .indexes([repo])
+        .blobs(["gauge", "jobs_dead"])
+        .doubles([dead as f64])
+        .write_to(&ds);
+}

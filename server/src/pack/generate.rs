@@ -555,9 +555,9 @@ pub fn plan_reads(idx: &Index<'_>, set: &mut SendSet, budget: &ReqBudget) -> Res
         if locs.len() != marked {
             return Err(Error::Storage("pack index changed mid-fetch".into()));
         }
-        let plan = coalesce(pi, &locs, GAP);
+        let plan = coalesce(pi, &locs, GAP)?;
         reads.extend(if u64::try_from(plan.len()).unwrap_or(u64::MAX) > p.bytes.div_ceil(WINDOW) {
-            coalesce(pi, &locs, WINDOW)
+            coalesce(pi, &locs, WINDOW)?
         } else {
             plan
         });
@@ -570,7 +570,7 @@ pub fn plan_reads(idx: &Index<'_>, set: &mut SendSet, budget: &ReqBudget) -> Res
     Ok(())
 }
 
-fn coalesce(pack: usize, locs: &[ObjLoc], gap: u64) -> Vec<Read> {
+fn coalesce(pack: usize, locs: &[ObjLoc], gap: u64) -> Result<Vec<Read>, Error> {
     let mut out: Vec<Read> = Vec::new();
     for l in locs {
         let end = l.offset.saturating_add(u64::from(l.len));
@@ -596,16 +596,21 @@ fn coalesce(pack: usize, locs: &[ObjLoc], gap: u64) -> Vec<Read> {
                         pack,
                         off: pos,
                         len: n,
-                        // n <= WINDOW = 8 MiB — the cast cannot fail; panic if that
-                        // ever changes rather than silently truncating the copy span
-                        ents: vec![(pos, u32::try_from(n).expect("fragment <= WINDOW"))],
+                        // n <= WINDOW = 8 MiB — the cast cannot fail today, but a
+                        // saturating/panicking fallback would hide a broken
+                        // invariant: surface Error::Limit (HTTP 413) instead (A21)
+                        ents: vec![(
+                            pos,
+                            u32::try_from(n)
+                                .map_err(|_| Error::Limit("read fragment exceeds window".into()))?,
+                        )],
                     });
                     pos = pos.saturating_add(n);
                 }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// One step of the response stream: one range read, marked entries copied verbatim (2.1).

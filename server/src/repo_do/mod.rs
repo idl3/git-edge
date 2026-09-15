@@ -177,6 +177,11 @@ impl RepoDo {
     pub fn sql(&self) -> SqlStorage {
         self.state.storage().sql()
     }
+    /// `purge_repo` may drop the schema under a live `booted` flag; the next
+    /// request must re-run `schema::migrate` or every query hits missing tables.
+    pub(crate) fn unboot(&self) {
+        *self.booted.borrow_mut() = false;
+    }
     pub fn q(&self, s: &str, args: Vec<V>) -> Result<SqlCursor, Error> {
         self.sql().exec(s, Some(args)).map_err(|e| Error::Storage(e.to_string()))
     }

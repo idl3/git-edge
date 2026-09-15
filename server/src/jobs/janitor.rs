@@ -112,7 +112,10 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
                 worker::console_log!("janitor: pending delete {} failed: {e}", p.id);
             }
         }
-        super::heartbeat(&d.sql(), job.id)?;
+        // CAS heartbeat (A19): a stale slice stops before its next delete
+        if !super::heartbeat(&d.sql(), job)? {
+            return Err(super::stale_lease());
+        }
     }
     let dead: Vec<I> = d
         .q(
@@ -139,7 +142,10 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
                 worker::console_log!("janitor: pack delete {} failed: {e}", p.id);
             }
         }
-        super::heartbeat(&d.sql(), job.id)?;
+        // CAS heartbeat (A19): a stale slice stops before its next delete
+        if !super::heartbeat(&d.sql(), job)? {
+            return Err(super::stale_lease());
+        }
     }
 
     // 4. reflog expiry: 90 days, keyed by row id.

@@ -775,3 +775,67 @@ produced these corrections, all verified against git 2.54:
   alphabetically-first existing `refs/heads/*`. `refs/heads/main` remains
   only the boot-time default; a `master`-first repo now clones with a
   working checkout.
+
+## Amendments from the jobs-observability pass (feat/jobs-observability)
+
+Continuing the audit-fix numbering (last: A16).
+
+- **A17. Job-lifecycle metrics (extends A13).** When `GE_METRICS` is bound,
+  `jobs::dispatch` emits one Analytics Engine datapoint per job event, in
+  addition to the request datapoints. Positional layout, queried as
+  `index1`/`blobN`/`doubleN`: `index1` = repo (`owner/repo`, from
+  `ctx.id.name` so the label survives a `purge_repo` meta wipe); `blob1` =
+  `"job"` (discriminator — request datapoints carry the op here, gauges
+  `"gauge"`); `blob2` = kind (`janitor` | `gc_mark` | `gc_consolidate` |
+  `gc_sweep` | `purge_repo`); `blob3` = event (`start` | `done` |
+  `continue` | `reschedule` | `retry` | `dead` | `stale`); `blob4` =
+  outcome (`ok` | `retry` | `dead` | `stale`); `blob5` = error class
+  (`Error::class()` — the variant name, never the message, to stay
+  cardinality-safe; `""` when none); `double1` = 1-based attempt;
+  `double2` = slice wall-clock ms (0 on `start`); `double3` = 1.0 when the
+  job will run again (`continue`/`reschedule`/`retry`), else 0.0. Writes
+  are fire-and-forget: an unbound dataset or a failed write never fails a
+  job.
+- **A18. Dead-job alerting (extends A17).** A job reaching `dead` emits a
+  `dead`-event datapoint (`blob3=dead`, `blob4=dead`, `blob5` the error
+  class, `double1` the attempts consumed) — distinct and
+  cardinality-safe, so an alert can key on `blob1='job' AND blob3='dead'`.
+  Additionally, every alarm pass emits a `jobs_dead` gauge datapoint while
+  dead rows exist (`blob1='gauge'`, `blob2='jobs_dead'`, `double1` =
+  count). An operator wires the alarm either as a Workers Analytics/alert
+  query over the dataset (`SELECT blob2, double1 WHERE blob1='gauge' AND
+  blob2='jobs_dead' AND double1 > 0`) or as an external cron poller of
+  `GET /:o/:r/_state` watching `jobs_dead`.
+- **A19. Lease-fenced heartbeats (amends 4.4, hardens the A12/A20 60 s
+  straggler window).** `heartbeat` is a CAS:
+  `UPDATE jobs SET started_at=? WHERE id=? AND state='running' AND lease=?`.
+  A slice whose row was `repair`-requeued and reclaimed under a new lease
+  gets `false` and must return `stale_lease()` immediately — every write it
+  still had queued belongs to the new lease-holder, and an unconditional
+  `started_at` bump would mask a genuinely stalled new owner from `repair`.
+  `repair` now clears `lease` on requeue. Dispatch reports a fenced outcome
+  write that lands zero rows as event `stale` — never a retry, and
+  `attempts` is not consumed by the loser. Residual risk: between
+  heartbeats a stale slice can still issue R2 reads/writes — safe because
+  `gc_mark` OR-merges bitmaps, `gc_consolidate` replays deterministically
+  from `gc.pos`, janitor/purge deletes are idempotent, and `purge_repo`'s
+  R2 prefix is the dead `repo_id`.
+- **A20. `purge_repo` job kind (new).** `POST /:o/:r/_admin/delete`
+  enqueues `purge_repo` (no payload). Slice A pages `list` over the
+  `r/<repo_id>/` R2 prefix (cursor persisted in `jobs.cursor` as
+  `r2:<cursor>`) and deletes each page via `delete_multiple`; slice B is a
+  bounded span — CAS-heartbeat fence, `schema::migrate` (a crashed prior
+  attempt may have dropped the schema), `DELETE FROM` every table but the
+  job's own row, `DELETE FROM jobs WHERE id <> self`, `delete_alarm`, then
+  `storage().delete_all()` and `unboot()` so the next request re-migrates.
+  Idempotent and resumable at every await; a re-`POST` after completion
+  enqueues a fresh job that wipes a fresh repo — a no-op. Known residual:
+  a push committing between the row wipe and `delete_all` could leave a
+  stray row in a re-created repo; the window is microseconds inside one
+  slice. In-flight multipart uploads leave no listed objects and expire
+  server-side (~7 d); R2 keys written after the listing cursor may be
+  orphaned as unreferenced bytes under the dead `repo_id` prefix.
+- **A21. `coalesce` loud-fail (amends 7.2/A9-fetch-fragmentation).** The
+  fragment-length cast is `Error::Limit("read fragment exceeds window")`
+  propagated through a `Result` — HTTP 413 — never a saturating
+  `u32::MAX` and never a panic inside the DO.

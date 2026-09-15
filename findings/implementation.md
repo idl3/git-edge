@@ -393,3 +393,48 @@ The benchmark surfaced two production bugs, both fixed:
   dangling (GitHub-style first-push adoption).
 
 Prioritized backlog lives in `ROADMAP.md`.
+
+## Round 8 — jobs observability, lease-fence hardening, purge_repo (feat/jobs-observability)
+
+Roadmap items 6, 7, 13 (jobs alerting/metrics, lease-overlap hardening) plus the
+audit P3 `coalesce` loud-fail and roadmap item 3's `purge_repo` job kind.
+
+- **Job-lifecycle metrics (A17).** `platform::job_event` writes one Analytics
+  Engine datapoint per dispatch event when `GE_METRICS` is bound; unbound is a
+  single failed binding lookup, never fatal. Schema (positional):
+  `index1=repo` (ctx.id.name — survives `purge_repo`'s meta wipe),
+  `blob1="job"`, `blob2=kind`, `blob3=event`
+  (start|done|continue|reschedule|retry|dead|stale), `blob4=outcome`
+  (ok|retry|dead|stale), `blob5=error_class` (`Error::class()`, bounded);
+  `double1=attempt` (1-based), `double2=duration_ms`, `double3=will_retry`.
+- **Dead-job alerting (A18).** `blob3='dead'` datapoints carry kind + repo +
+  attempts + error class — enough for `SELECT ... WHERE blob1='job' AND
+  blob3='dead'` alarm queries — and every alarm pass emits a `jobs_dead`
+  gauge datapoint (`blob1='gauge'`, `blob2='jobs_dead'`, `double1=count`)
+  while dead rows exist. Operator wiring: a Workers Analytics Engine query
+  alert on either shape, or an external cron Worker / uptime poller hitting
+  `GET /:o/:r/_state` and paging on `jobs_dead > 0`. The gauge path needs no
+  new infrastructure — `_state` already exposes the count.
+- **Lease-overlap hardening (A19).** The pre-existing design already fenced the
+  *outcome* span on the lease token; the residual gap was mid-slice: a stale
+  slice heartbeated unconditionally (refreshing the new owner's `started_at`
+  and masking a real stall) and kept issuing writes until it finished.
+  `heartbeat` is now a CAS on `id + state='running' + lease`, returns the
+  landed bit, and every call site bails with `stale_lease()` on `false` — the
+  fenced outcome no-ops, `attempts` is not consumed, dispatch records the
+  event as `stale`. `repair` clears `lease` on requeue. Residual: between
+  heartbeats a stale slice can still issue R2/SQL writes — safe by
+  construction (mark OR-merges, consolidate is deterministic replay, deletes
+  are idempotent, purge's R2 prefix is the dead repo_id).
+- **`coalesce` loud-fail (A21).** The fragment-length cast is now
+  `Error::Limit` propagated via `Result` — HTTP 413 through the existing
+  mapping — replacing both the audited `unwrap_or(u32::MAX)` and the interim
+  `expect` (a panic inside a DO aborts the isolate mid-stream).
+- **`purge_repo` job (A20).** Enqueued by `POST /:o/:r/_admin/delete` (edge
+  route lands separately). Phase A pages `list(prefix=r/<repo_id>/)` +
+  `delete_multiple`, cursor persisted as `r2:<cursor>` in `jobs.cursor`;
+  phase B CAS-fences, re-migrates the schema (covers a crashed
+  `delete_all`), deletes every table's rows and every other job row, clears
+  the alarm, `delete_all()`, `unboot()`. Verified live on workerd: push ->
+  enqueue -> repo reads back empty (fresh repo_id, zero objects/refs), R2
+  keys gone, janitor re-seeded by the next boot.
