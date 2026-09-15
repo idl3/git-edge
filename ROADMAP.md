@@ -35,7 +35,7 @@ The benchmark also flushed out two real bugs (both fixed in this branch):
 | 1 | ~~Fetch read-batch splitting~~ | done — was a hard clone failure at 70k+ objects | S |
 | 2 | ~~HEAD adoption on first push~~ | done — every scaffolded repo pushes `master` | XS |
 | 3 | ~~**Repo delete**~~ | done — `POST /_admin/delete` tombstones (410), `purge_repo` wipes R2+DO, name reusable after | M |
-| 4 | **Bulk import path** | staged `git push` works but is a client-side workaround. Options: (a) `git-edge-import` CLI that auto-slices a local repo into <80 MB pushes — zero server work; (b) `POST /_admin/import` accepting an R2-uploaded bundle/pack — eliminates the body cap entirely | S–M |
+| 4 | ~~**Bulk import path**~~ | done via option (a) — `tools/git-edge-import.sh` auto-slices a repo into <SLICE_MIB pushes with resume, `--all-branches`, `--dry-run`; option (b) `POST /_admin/import` (R2 bundle/pack) remains the structural fix | S–M |
 | 5 | ~~**Anonymous/public read**~~ | done — `meta.public` flag via `POST /_admin/public`; anonymous reads only when no credential presented | S |
 | 6 | ~~**Dead-job / GC alerting**~~ | done — `blob3=dead` job datapoints + `jobs_dead` gauge per alarm pass; alert wiring documented (A18) | S |
 | 7 | ~~**Job-lifecycle metrics**~~ | done — `job_event` datapoints: kind/event/outcome/error-class/attempt/duration (A17) | S |
