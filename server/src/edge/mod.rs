@@ -2,7 +2,9 @@
 //! The receive-pack flow honours A2: once the command header parses, every later failure
 //! returns HTTP 200 carrying `unpack <err>` + `ng <ref>` for each command.
 
+use std::cell::Cell;
 use std::pin::Pin;
+use std::rc::Rc;
 
 use futures_util::{Stream, StreamExt};
 use gix_hash::ObjectId;
@@ -18,7 +20,7 @@ use crate::wire::{
     http::{stub_json, stub_raw, RepoRoute},
     PktReader, PktWriter, RefResult, Service,
 };
-use crate::ReqBudget;
+use crate::{ReqBudget, Spend};
 
 const CMD_CAP: usize = 1 << 20; // section 6.3: command section cap
 const FILL_STEP: usize = 64 << 10; // 6.3: fill in 64 KiB steps
@@ -123,13 +125,18 @@ impl BodyReader {
 /// The one public entry point (lib.rs #[event(fetch)]).
 pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
     let started = platform::now_ms();
+    // Request-wide subrequest tally: every ReqBudget the request creates reports
+    // into it, so respond() stamps x-ge-subrequests even on error paths where the
+    // charging budget was already dropped. Failures before the first stub/R2 call
+    // (route parse, rejected credentials) report 0.
+    let spend: Spend = Rc::new(Cell::new(0));
     let path = req.path();
     if path == "/healthz" {
         return Response::ok("ok");
     }
     let (route, rest) = match RepoRoute::parse(&path) {
         Ok(x) => x,
-        Err(e) => return respond(Err(e), false),
+        Err(e) => return respond(Err(e), false, spend.get()),
     };
     // section 10: git-protocol POSTs get a pkt-line ERR; info/refs and _state get plain text
     let git_pkt = matches!((&req.method(), rest.as_str()), (Method::Post, "git-upload-pack" | "git-receive-pack"));
@@ -137,23 +144,23 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
     // resolved before the handlers move `env` — absent in local dev, never fatal
     let ds = env.analytics_engine("GE_METRICS").ok();
     let r = match (req.method(), rest.as_str()) {
-        (Method::Get, "info/refs") => info_refs(&req, &env, &route).await,
-        (Method::Get, "_state") => state_probe(&req, &env, &route).await,
-        (Method::Post, "git-upload-pack") => upload_pack(req, &env, &route).await,
-        (Method::Post, "git-receive-pack") => receive_pack(req, env, route).await,
-        (Method::Post, "_admin/tokens") => token_create(req, &env, &route).await,
-        (Method::Get, "_admin/tokens") => token_list(&req, &env, &route).await,
+        (Method::Get, "info/refs") => info_refs(&req, &env, &route, &spend).await,
+        (Method::Get, "_state") => state_probe(&req, &env, &route, &spend).await,
+        (Method::Post, "git-upload-pack") => upload_pack(req, &env, &route, &spend).await,
+        (Method::Post, "git-receive-pack") => receive_pack(req, env, route, &spend).await,
+        (Method::Post, "_admin/tokens") => token_create(req, &env, &route, &spend).await,
+        (Method::Get, "_admin/tokens") => token_list(&req, &env, &route, &spend).await,
         (Method::Delete, p) if p.starts_with("_admin/tokens/") => {
-            token_revoke(&req, &env, &route, &p["_admin/tokens/".len()..]).await
+            token_revoke(&req, &env, &route, &p["_admin/tokens/".len()..], &spend).await
         }
-        (Method::Post, "_admin/delete") => repo_delete(&req, &env, &route).await,
-        (Method::Post, "_admin/public") => repo_public(req, &env, &route).await,
-        (Method::Post, "_admin/pin") => pin_ref(req, &env, &route, "/_do/pin").await,
-        (Method::Post, "_admin/unpin") => pin_ref(req, &env, &route, "/_do/unpin").await,
-        (Method::Get, "_admin/export") => export_bundle(&req, &env, &route).await,
+        (Method::Post, "_admin/delete") => repo_delete(&req, &env, &route, &spend).await,
+        (Method::Post, "_admin/public") => repo_public(req, &env, &route, &spend).await,
+        (Method::Post, "_admin/pin") => pin_ref(req, &env, &route, "/_do/pin", &spend).await,
+        (Method::Post, "_admin/unpin") => pin_ref(req, &env, &route, "/_do/unpin", &spend).await,
+        (Method::Get, "_admin/export") => export_bundle(&req, &env, &route, &spend).await,
         _ => Err(Error::NotFound),
     };
-    let resp = respond(r, git_pkt);
+    let resp = respond(r, git_pkt, spend.get());
     metric(ds.as_ref(), &repo, op, started, resp.as_ref().ok());
     resp
 }
@@ -228,7 +235,7 @@ fn protocol_version(req: &Request) -> Result<Option<u8>, Error> {
 }
 
 /// GET /:owner/:repo/info/refs?service=... — v2 advertisement, else v0/v1 (1.1 rules 5, 7).
-async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+async fn info_refs(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     let url = req.url().map_err(|e| Error::Internal(e.to_string()))?;
     let service = url.query_pairs().find(|(k, _)| k == "service").map(|(_, v)| v.into_owned());
     let (service, level, ct) = match service.as_deref() {
@@ -236,13 +243,13 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
         Some("git-receive-pack") => (Service::ReceivePack, Level::Write, "application/x-git-receive-pack-advertisement"),
         _ => return Err(Error::Protocol("service must be git-upload-pack or git-receive-pack".into())),
     };
-    auth::authenticate(req, env, level, route).await?; // before the DO wakes (8.1)
+    auth::authenticate(req, env, level, route, spend).await?; // before the DO wakes (8.1)
     let mut refs_version = None;
     let mut w = PktWriter::default();
     if protocol_version(req)? == Some(2) && matches!(service, Service::UploadPack { .. }) {
         wire::write_capability_advertisement_v2(&mut w);
     } else {
-        let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+        let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
         #[derive(serde::Deserialize)]
         struct RefDto {
             name: String,
@@ -262,7 +269,7 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
         budget.charge(1)?;
         let mut resp = stub.fetch_with_request(r).await?;
         if resp.status_code() != 200 {
-            return Err(Error::from_do_response(resp).await);
+            return Err(Error::from_do_response(resp, &budget).await);
         }
         refs_version = resp.headers().get("x-ge-refs-version").ok().flatten();
         let dto: RefsDto = resp.json().await.map_err(|e| Error::Internal(e.to_string()))?;
@@ -293,9 +300,9 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
 }
 
 /// GET /:owner/:repo/_state — internal observability probe (write-token gated).
-async fn state_probe(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
-    auth::authenticate(req, env, Level::Write, route).await?;
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+async fn state_probe(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    auth::authenticate(req, env, Level::Write, route, spend).await?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let mut init = worker::RequestInit::new();
     init.with_method(Method::Get);
     let mut r = worker::Request::new_with_init("https://do/_do/state", &init)
@@ -304,15 +311,15 @@ async fn state_probe(req: &Request, env: &Env, route: &RepoRoute) -> Result<Resp
     budget.charge(1)?;
     let mut resp = stub.fetch_with_request(r).await?;
     if resp.status_code() != 200 {
-        return Err(Error::from_do_response(resp).await);
+        return Err(Error::from_do_response(resp, &budget).await);
     }
     let bytes = resp.bytes().await.map_err(|e| Error::Internal(e.to_string()))?;
     git_resp(bytes, "application/json")
 }
 
 /// POST /:owner/:repo/git-upload-pack — v2 only; route on the command name, forward raw.
-async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
-    auth::authenticate(&req, env, Level::Read, route).await?;
+async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    auth::authenticate(&req, env, Level::Read, route, spend).await?;
     if protocol_version(&req)? != Some(2) {
         // contract 1.1 rule 7: v0 upload-pack POST -> HTTP 400 with the ERR pkt-line
         let mut w = PktWriter::default();
@@ -351,10 +358,10 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<R
         wire::V2Command::LsRefs(_) => "/_do/ls-refs",
         wire::V2Command::Fetch(_) => "/_do/fetch",
     };
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let mut resp = stub_raw(&stub, route, path, body, &mut budget).await?;
     if resp.status_code() != 200 {
-        return Err(Error::from_do_response(resp).await);
+        return Err(Error::from_do_response(resp, &budget).await);
     }
     // fetch responses carry immutable headers; rebuild around the same stream so the
     // pack flows through the edge instead of being buffered whole in memory — and
@@ -373,7 +380,7 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute) -> Result<R
 /// POST /:owner/:repo/_admin/tokens {name, level} — mint a per-repo credential.
 /// Global-write-token only (authenticate_admin): a repo-level token must not mint
 /// more credentials. The token value is returned once and only its hash is stored.
-async fn token_create(mut req: Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+async fn token_create(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate_admin(&req, env)?;
     // {name, level} needs a few hundred bytes; cap before buffering the body whole
     let too_big = req
@@ -394,15 +401,15 @@ async fn token_create(mut req: Request, env: &Env, route: &RepoRoute) -> Result<
     }
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("token create body: {e}")))?;
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let out: serde_json::Value = stub_json(&stub, route, "/_do/tokens", &v, &mut budget).await?;
     git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
 }
 
 /// GET /:owner/:repo/_admin/tokens — list per-repo credentials (never the secrets).
-async fn token_list(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+async fn token_list(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate_admin(req, env)?;
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let mut init = worker::RequestInit::new();
     init.with_method(Method::Get);
     let mut r = worker::Request::new_with_init("https://do/_do/tokens", &init)
@@ -411,19 +418,19 @@ async fn token_list(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respo
     budget.charge(1)?;
     let mut resp = stub.fetch_with_request(r).await?;
     if resp.status_code() != 200 {
-        return Err(Error::from_do_response(resp).await);
+        return Err(Error::from_do_response(resp, &budget).await);
     }
     let bytes = resp.bytes().await.map_err(|e| Error::Internal(e.to_string()))?;
     git_resp(bytes, "application/json")
 }
 
 /// DELETE /:owner/:repo/_admin/tokens/<id> — revoke a per-repo credential.
-async fn token_revoke(req: &Request, env: &Env, route: &RepoRoute, id: &str) -> Result<Response, Error> {
+async fn token_revoke(req: &Request, env: &Env, route: &RepoRoute, id: &str, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate_admin(req, env)?;
     if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return Err(Error::Protocol("bad token id".into()));
     }
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let out: serde_json::Value = stub_json(
         &stub,
         route,
@@ -457,9 +464,9 @@ async fn json_body(req: &mut Request) -> Result<serde_json::Value, Error> {
 
 /// POST /:owner/:repo/_admin/delete — tombstone the repo and enqueue purge_repo.
 /// Every repo route answers 410 from the moment this returns. Idempotent.
-async fn repo_delete(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+async fn repo_delete(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate_admin(req, env)?;
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let out: serde_json::Value =
         stub_json(&stub, route, "/_do/delete", &serde_json::json!({}), &mut budget).await?;
     owner_release(env, route).await; // free the A26 quota slot; best-effort — tombstone already landed
@@ -468,19 +475,19 @@ async fn repo_delete(req: &Request, env: &Env, route: &RepoRoute) -> Result<Resp
 
 /// POST /:owner/:repo/_admin/public {enabled: bool} — anonymous read flag.
 /// Write paths (receive-pack, token minting) stay token-gated regardless.
-async fn repo_public(mut req: Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+async fn repo_public(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate_admin(&req, env)?;
     let v = json_body(&mut req).await?;
     if v.get("enabled").and_then(|b| b.as_bool()).is_none() {
         return Err(Error::Protocol("body must be {\"enabled\": bool}".into()));
     }
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let out: serde_json::Value = stub_json(&stub, route, "/_do/public", &v, &mut budget).await?;
     git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
 }
 
 /// POST /:owner/:repo/_admin/pin {ref, sha} / _admin/unpin {ref} — ref pinning.
-async fn pin_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str) -> Result<Response, Error> {
+async fn pin_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate_admin(&req, env)?;
     let v = json_body(&mut req).await?;
     if v.get("ref").and_then(|r| r.as_str()).is_none()
@@ -488,7 +495,7 @@ async fn pin_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str) -> 
     {
         return Err(Error::Protocol("body must be {\"ref\": ..., \"sha\": ...}".into()));
     }
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let out: serde_json::Value = stub_json(&stub, route, path, &v, &mut budget).await?;
     git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
 }
@@ -496,12 +503,12 @@ async fn pin_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str) -> 
 /// GET /:owner/:repo/_admin/export — stream a v3 git bundle of every live ref.
 /// Read-level auth suffices (anonymous on a public repo); the DO builds the pack
 /// with the same send_set machinery as fetch, framed by the bundle header.
-async fn export_bundle(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
-    auth::authenticate(req, env, Level::Read, route).await?;
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+async fn export_bundle(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    auth::authenticate(req, env, Level::Read, route, spend).await?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let mut resp = stub_raw(&stub, route, "/_do/export", Vec::new(), &mut budget).await?;
     if resp.status_code() != 200 {
-        return Err(Error::from_do_response(resp).await);
+        return Err(Error::from_do_response(resp, &budget).await);
     }
     let subreqs = resp.headers().get("x-ge-subrequests").ok().flatten();
     let stream = resp.stream().map_err(|e| Error::Internal(e.to_string()))?;
@@ -515,8 +522,8 @@ async fn export_bundle(req: &Request, env: &Env, route: &RepoRoute) -> Result<Re
 }
 
 /// POST /:owner/:repo/git-receive-pack — two-phase push (2.4, 3) with the A2 error arm.
-async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Response, Error> {
-    let principal = auth::authenticate(&req, &env, Level::Write, &route).await?;
+async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    let principal = auth::authenticate(&req, &env, Level::Write, &route, spend).await?;
     // A27: sha1 of the presented token is the rate-limit bucket key — the raw
     // credential never crosses the stub boundary (8.1)
     let rate_key = auth::presented_hash(&req)?;
@@ -542,7 +549,7 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Re
     }
 
     // ---- post-header (A2): everything from here reports HTTP 200 + report-status ----
-    match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key).await {
+    match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key, spend).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             // A27: a throttled push answers a real HTTP 429 + Retry-After, not an
@@ -589,8 +596,9 @@ async fn receive_inner(
     hdr: &wire::ReceiveHeader,
     principal: &str,
     rate_key: &str,
+    spend: &Spend,
 ) -> Result<Response, Error> {
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let push = PushId::random()?;
     #[derive(serde::Deserialize)]
     struct Begin {
@@ -767,7 +775,7 @@ async fn owner_claim(env: &Env, route: &RepoRoute, budget: &mut ReqBudget) -> Re
     budget.charge(1)?;
     let resp = stub.fetch_with_request(r).await?;
     if resp.status_code() != 200 {
-        return Err(Error::from_do_response(resp).await);
+        return Err(Error::from_do_response(resp, budget).await);
     }
     Ok(())
 }

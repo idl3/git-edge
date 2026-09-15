@@ -70,7 +70,7 @@ impl SliceBudget {
     pub fn fresh() -> Self {
         Self {
             started_ms: js_sys::Date::now(),
-            req: ReqBudget { max_subrequests: 400, used: 0, started_ms: js_sys::Date::now(), max_ms: 20_000.0 },
+            req: ReqBudget { max_subrequests: 400, used: 0, started_ms: js_sys::Date::now(), max_ms: 20_000.0, sink: None },
         }
     }
     pub fn spent_80pct(&self) -> bool {

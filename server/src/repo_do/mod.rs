@@ -15,7 +15,7 @@ use crate::pack::generate;
 use crate::platform;
 use crate::store::{schema, Bucket, Index, ObjLoc, PackId, RepoId};
 use crate::wire::{self, http::{do_error_response, json, parse, RepoHeaders}, FetchArgs, PktWriter, RefRow, V2Command};
-use crate::ReqBudget;
+use crate::{ReqBudget, Spend};
 
 /// A ref row is ~90 bytes in an ls-refs advertisement — a token holder could otherwise
 /// mint refs until the advertisement alone exceeds the isolate. 65k refs is already huge.
@@ -215,8 +215,10 @@ impl DurableObject for RepoDo {
                 Err(worker::Error::RustError(e.message()))
             }
             Err(e) => {
-                // non-fatal errors commit the span — a boot-time enqueue survives, so rearm
-                let r = do_error_response(&e)?;
+                // non-fatal errors commit the span — a boot-time enqueue survives, so rearm.
+                // Spend is 0: every sync-span route above is pure SQLite; the only
+                // R2-charging routes (fetch/export) are awaited outside the span.
+                let r = do_error_response(&e, 0)?;
                 let _ = jobs::rearm(self).await;
                 Ok(r)
             }
@@ -1127,22 +1129,25 @@ impl RepoDo {
 
     /// POST /_do/fetch (section 9): the only DO route that awaits (R2 reads).
     async fn fetch_v2(&self, body: &[u8]) -> worker::Result<Response> {
-        match self.fetch_v2_inner(body).await {
+        // the budget lives in the inner fn/stream; the tally outlives both so the
+        // error response can still report what the request spent (audit P3)
+        let spend: Spend = Rc::new(Cell::new(0));
+        match self.fetch_v2_inner(body, &spend).await {
             Ok(r) => Ok(r),
             Err(e @ (Error::Storage(_) | Error::Internal(_))) => Err(worker::Error::RustError(e.message())),
             Err(e) => {
                 worker::console_log!("fetch_v2: {e}");
-                do_error_response(&e).map_err(worker::Error::from)
+                do_error_response(&e, spend.get()).map_err(worker::Error::from)
             }
         }
     }
 
-    async fn fetch_v2_inner(&self, body: &[u8]) -> Result<Response, Error> {
+    async fn fetch_v2_inner(&self, body: &[u8], spend: &Spend) -> Result<Response, Error> {
         let args = match wire::parse_v2_command(body)? {
             V2Command::Fetch(a) => a,
             _ => return Err(Error::Protocol("not fetch".into())),
         };
-        let mut budget = ReqBudget::paid();
+        let mut budget = ReqBudget::paid().reporting(spend);
         let bucket = self.bucket()?;
         let sql = self.sql();
         let idx = Index(&sql);
@@ -1300,22 +1305,23 @@ impl RepoDo {
     /// POST /_do/export — a git bundle (v3, no prerequisites) of every live ref.
     /// Same awaits-as-fetch route arm: send_set + verbatim pack chunks, no pkt framing.
     async fn export_bundle(&self) -> worker::Result<Response> {
-        match self.export_inner().await {
+        let spend: Spend = Rc::new(Cell::new(0));
+        match self.export_inner(&spend).await {
             Ok(r) => Ok(r),
             Err(e @ (Error::Storage(_) | Error::Internal(_))) => Err(worker::Error::RustError(e.message())),
             Err(e) => {
                 worker::console_log!("export: {e}");
-                do_error_response(&e).map_err(worker::Error::from)
+                do_error_response(&e, spend.get()).map_err(worker::Error::from)
             }
         }
     }
 
-    async fn export_inner(&self) -> Result<Response, Error> {
+    async fn export_inner(&self, spend: &Spend) -> Result<Response, Error> {
         let (head, refs) = self.list_refs()?;
         let mut wants: Vec<ObjectId> = refs.iter().map(|r| r.target).collect();
         wants.sort_unstable();
         wants.dedup();
-        let mut budget = ReqBudget::paid();
+        let mut budget = ReqBudget::paid().reporting(spend);
         let bucket = self.bucket()?;
         // a full bundle = every object reachable from every ref tip: the fetch
         // machinery with no haves, no shallow/filter modes, include-tag off (tag

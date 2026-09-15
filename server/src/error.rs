@@ -1,5 +1,7 @@
 use worker::Response;
 
+use crate::ReqBudget;
+
 /// The single error enum (CONTRACTS.md section 10).
 #[derive(Debug)]
 pub enum Error {
@@ -80,7 +82,15 @@ impl Error {
     }
 
     /// Rebuild the DO's Error from its JSON error body (wire::http::do_error_response).
-    pub async fn from_do_response(mut resp: worker::Response) -> Error {
+    /// The DO stamps its own R2 spend in x-ge-subrequests; it is folded into the
+    /// request tally (not charged — the edge budget already paid for this call)
+    /// so the edge's error response reports the true request total.
+    pub async fn from_do_response(mut resp: worker::Response, budget: &ReqBudget) -> Error {
+        if let Some(v) = resp.headers().get("x-ge-subrequests").ok().flatten() {
+            if let Some(n) = v.split('/').next().and_then(|s| s.parse::<u32>().ok()) {
+                budget.report(n);
+            }
+        }
         #[derive(serde::Deserialize)]
         struct E {
             error: Option<String>,
@@ -155,11 +165,29 @@ impl Error {
     }
 }
 
+/// The x-ge-subrequests stamp: `<spent>/<max>` where `spent` is the request-wide
+/// tally — every ReqBudget the request created reported into it. Error paths are
+/// exactly where the accounting matters (413/429/500), so it goes on every
+/// response; paths that failed before the first stub/R2 call report 0.
+fn stamp_subrequests(resp: &mut Response, subreqs: u32) {
+    resp.headers_mut()
+        .set("x-ge-subrequests", &format!("{subreqs}/{}", ReqBudget::PAID_SUBREQUESTS))
+        .ok();
+}
+
 /// Map a Result into a worker Response with the section-10 statuses.
 /// `git_pkt` wraps the message as one pkt-line `ERR <msg>\n` for git-protocol POSTs.
-pub fn respond(r: Result<Response, Error>, git_pkt: bool) -> worker::Result<Response> {
+/// `subreqs` is the request-wide tally for the x-ge-subrequests header.
+pub fn respond(r: Result<Response, Error>, git_pkt: bool, subreqs: u32) -> worker::Result<Response> {
     match r {
-        Ok(resp) => Ok(resp),
+        Ok(mut resp) => {
+            // streamed fetch/export responses already carry the DO's projected
+            // spend — don't overwrite it with the edge's smaller tally
+            if resp.headers().get("x-ge-subrequests").ok().flatten().is_none() {
+                stamp_subrequests(&mut resp, subreqs);
+            }
+            Ok(resp)
+        }
         Err(e) => {
             let status = e.status();
             if matches!(e, Error::Storage(_) | Error::Internal(_)) {
@@ -179,6 +207,7 @@ pub fn respond(r: Result<Response, Error>, git_pkt: bool) -> worker::Result<Resp
             if let Error::RateLimit(secs) = e {
                 resp.headers_mut().set("Retry-After", &secs.max(1).to_string()).ok();
             }
+            stamp_subrequests(&mut resp, subreqs);
             Ok(resp.with_status(status))
         }
     }
