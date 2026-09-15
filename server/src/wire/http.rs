@@ -93,9 +93,13 @@ pub fn do_error_response(e: &Error) -> Result<Response, Error> {
         Error::Unpack(_) => "unpack",
         Error::Budget => "budget",
         Error::Limit(_) => "limit",
+        Error::RateLimit(_) => "ratelimit",
         Error::Storage(_) | Error::Internal(_) => "internal",
     };
-    let body = serde_json::json!({ "error": kind, "message": e.message() });
+    let mut body = serde_json::json!({ "error": kind, "message": e.message() });
+    if let Error::RateLimit(secs) = e {
+        body["retry_after"] = (*secs).into();
+    }
     let resp = Response::from_json(&body).map_err(|e| Error::Internal(e.to_string()))?;
     Ok(resp.with_status(e.status()))
 }

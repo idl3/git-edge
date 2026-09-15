@@ -128,6 +128,13 @@ pub async fn authenticate(req: &Request, env: &Env, need: Level, route: &RepoRou
     }
 }
 
+/// sha1 of the presented token — the rate-limit key (A18). The raw token never
+/// crosses the stub boundary; the hash is stable per credential.
+pub fn presented_hash(req: &Request) -> Result<String, Error> {
+    let (token, _) = credentials(req)?;
+    token_hash(&token)
+}
+
 /// `ge_` + 64 lowercase hex — the shape token_create mints.
 fn is_repo_token(token: &str) -> bool {
     token.len() == 67

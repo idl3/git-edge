@@ -78,6 +78,47 @@ out=$(curl -s --compressed -X POST "$URL/$REPO/git-receive-pack" \
 echo "$out" | grep -q "unpack " || fail "no unpack line in A2 response: $out"
 echo "$out" | grep -q "ng refs/heads/main" || fail "no ng line in A2 response: $out"
 
+# Quota + push rate-limit checks (A17/A18): only runs with GE_CONFORMANCE_LIMITS=1
+# and the dev server started with small caps, e.g. .dev.vars:
+#   GE_QUOTA_MAX_OBJECTS=25 GE_QUOTA_MAX_REPOS_PER_OWNER=3 GE_RATE_PUSHES_PER_MIN=12
+# (25 stays above the main suite's ~12 objects/repo; 12 stays above its 9 pushes.)
+if [ "${GE_CONFORMANCE_LIMITS:-0}" = "1" ]; then
+  O="quota-$SECONDS-$$"
+  post() { # one canned receive-pack POST (bad pack body is fine — it reaches begin)
+    curl -s -X POST "$URL/$1/git-receive-pack" \
+      -H 'Content-Type: application/x-git-receive-pack-request' --data-binary @"$WORK/badpkt.bin"
+  }
+
+  note "object quota: push over GE_QUOTA_MAX_OBJECTS rejects naming the cap"
+  mkdir "$WORK/q" && cd "$WORK/q"
+  git init -q && git config user.email t@t && git config user.name t
+  for i in $(seq 1 12); do echo "$i" > "f$i"; git add "f$i"; git commit -qm "c$i"; done
+  git branch -M main
+  if git push "$URL/$O/obj" main >"$WORK/qerr" 2>&1; then
+    fail "expected object-quota rejection (is GE_QUOTA_MAX_OBJECTS <= ~36?)"
+  fi
+  grep -qi "quota" "$WORK/qerr" || fail "no quota reason in push output: $(cat "$WORK/qerr")"
+
+  note "repo quota: claims past GE_QUOTA_MAX_REPOS_PER_OWNER are rejected"
+  # $O/obj already claimed slot 1; fill the remaining two, then the next must fail
+  post "$O/b" >/dev/null
+  post "$O/c" >/dev/null
+  out=$(post "$O/d")
+  echo "$out" | grep -q "GE_QUOTA_MAX_REPOS_PER_OWNER" \
+    || fail "repo-cap rejection missing GE_QUOTA_MAX_REPOS_PER_OWNER: $out"
+
+  note "rate limit: pushes past GE_RATE_PUSHES_PER_MIN get HTTP 429 + Retry-After"
+  code=""
+  for i in $(seq 1 16); do
+    code=$(curl -s -o "$WORK/rl" -D "$WORK/rlh" -w '%{http_code}' -X POST \
+      "$URL/$O/rl/git-receive-pack" \
+      -H 'Content-Type: application/x-git-receive-pack-request' --data-binary @"$WORK/badpkt.bin")
+    [ "$code" = "429" ] && break
+  done
+  [ "$code" = "429" ] || fail "no 429 after 16 pushes (last=$code; is GE_RATE_PUSHES_PER_MIN < 16?)"
+  grep -qi '^retry-after:' "$WORK/rlh" || fail "429 without Retry-After header"
+fi
+
 # GC chain: only runs when the server was started with shortened windows
 # (GE_GC_QUIET_MS / GE_GC_GRACE_MS in .dev.vars) and GE_CONFORMANCE_GC=1.
 # Polls /_state until the orphan pack is swept or the deadline passes.

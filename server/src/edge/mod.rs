@@ -232,6 +232,7 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
         _ => return Err(Error::Protocol("service must be git-upload-pack or git-receive-pack".into())),
     };
     auth::authenticate(req, env, level, route).await?; // before the DO wakes (8.1)
+    let mut refs_version = None;
     let mut w = PktWriter::default();
     if protocol_version(req)? == Some(2) && matches!(service, Service::UploadPack { .. }) {
         wire::write_capability_advertisement_v2(&mut w);
@@ -258,6 +259,7 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
         if resp.status_code() != 200 {
             return Err(Error::from_do_response(resp).await);
         }
+        refs_version = resp.headers().get("x-ge-refs-version").ok().flatten();
         let dto: RefsDto = resp.json().await.map_err(|e| Error::Internal(e.to_string()))?;
         let refs: Vec<wire::RefRow> = dto
             .refs
@@ -276,7 +278,13 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
             .collect::<Result<_, Error>>()?;
         wire::write_advertisement_v0(&mut w, service, dto.head.as_deref().map(|s| bstr::ByteSlice::as_bstr(s.as_bytes())), &refs);
     }
-    git_resp(w.out, ct)
+    let mut out = git_resp(w.out, ct)?;
+    if let Some(v) = refs_version {
+        out.headers_mut()
+            .set("x-ge-refs-version", &v)
+            .map_err(|e| Error::Internal(e.to_string()))?;
+    }
+    Ok(out)
 }
 
 /// GET /:owner/:repo/_state — internal observability probe (write-token gated).
@@ -425,6 +433,9 @@ async fn token_revoke(req: &Request, env: &Env, route: &RepoRoute, id: &str) -> 
 /// POST /:owner/:repo/git-receive-pack — two-phase push (2.4, 3) with the A2 error arm.
 async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Response, Error> {
     let principal = auth::authenticate(&req, &env, Level::Write, &route).await?;
+    // A18: sha1 of the presented token is the rate-limit bucket key — the raw
+    // credential never crosses the stub boundary (8.1)
+    let rate_key = auth::presented_hash(&req)?;
     let mut body = BodyReader::new(&mut req)?;
 
     // ---- pre-header: parse errors are still normal HTTP errors (A2 arm not yet active) ----
@@ -447,9 +458,15 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Re
     }
 
     // ---- post-header (A2): everything from here reports HTTP 200 + report-status ----
-    match receive_inner(&mut body, &env, &route, &hdr, &principal).await {
+    match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
+            // A18: a throttled push answers a real HTTP 429 + Retry-After, not an
+            // in-band unpack error — and skips the drain, since shedding load is the
+            // point (a client still mid-upload may see a reset instead of the 429).
+            if matches!(e, Error::RateLimit(_)) {
+                return Err(e);
+            }
             body.drain().await; // finish the client's upload before answering (see drain)
             report_status_200(&hdr, Err(e.client_message()), &[])
         }
@@ -487,21 +504,42 @@ async fn receive_inner(
     route: &RepoRoute,
     hdr: &wire::ReceiveHeader,
     principal: &str,
+    rate_key: &str,
 ) -> Result<Response, Error> {
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
     let push = PushId::random()?;
     #[derive(serde::Deserialize)]
     struct Begin {
         repo_id: String,
+        #[serde(default)]
+        claimed: bool,
     }
     let begin: Begin = stub_json(
         &stub,
         route,
         "/_do/push/begin",
-        &serde_json::json!({ "push_id": push.0, "principal": principal }),
+        &serde_json::json!({ "push_id": push.0, "principal": principal, "key": rate_key }),
         &mut budget,
     )
     .await?;
+    // A17: a repo that has never committed a pack must claim one of the owner's
+    // GE_QUOTA_MAX_REPOS_PER_OWNER slots in the `owner!<owner>` registry DO before
+    // ingest burns bandwidth. Failure here aborts the open push like any post-begin
+    // error; the Limit message reaches the client in `unpack`.
+    if !begin.claimed {
+        if let Err(e) = owner_claim(env, route, &mut budget).await {
+            let _: serde_json::Value = stub_json(
+                &stub,
+                route,
+                "/_do/push/abort",
+                &serde_json::json!({ "push_id": push.0 }),
+                &mut budget,
+            )
+            .await
+            .unwrap_or_default();
+            return Err(e);
+        }
+    }
     let bucket = Bucket::new(env.bucket("BUCKET")?, RepoId(begin.repo_id));
 
     // a post-begin failure must close the open push row now — leaving it for the
@@ -610,4 +648,41 @@ fn report_status_200(
     };
     wire::write_report_status(&mut w, unpack.as_ref().map(|_|()).map_err(String::as_str), results, &hdr.caps)?;
     git_resp(w.out, "application/x-git-receive-pack-result")
+}
+
+/// Integer env knob, edge side — mirrors RepoDo::env_i64.
+fn env_i64(env: &Env, name: &str, default: i64) -> i64 {
+    env.var(name)
+        .ok()
+        .and_then(|v| v.to_string().parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+/// A17: claim one of the owner's GE_QUOTA_MAX_REPOS_PER_OWNER slots in the
+/// `owner!<owner>` registry DO — the same RepoDo class under a name no repo route
+/// can produce (`!` fails seg_ok), so no extra migration or binding is needed.
+/// `<= 0` disables the cap entirely (no registry hop). Over-cap -> Error::Limit,
+/// which lands in the client's `unpack` line via the A2 arm.
+async fn owner_claim(env: &Env, route: &RepoRoute, budget: &mut ReqBudget) -> Result<(), Error> {
+    if env_i64(env, "GE_QUOTA_MAX_REPOS_PER_OWNER", 50) <= 0 {
+        return Ok(());
+    }
+    let stub = env
+        .durable_object("REPO")
+        .map_err(|e| Error::Internal(e.to_string()))?
+        .id_from_name(&format!("owner!{}", route.owner))
+        .map_err(|e| Error::Internal(e.to_string()))?
+        .get_stub()
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    let mut init = worker::RequestInit::new();
+    init.with_method(Method::Post);
+    let mut r = worker::Request::new_with_init("https://do/_owner/claim", &init)
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    route.apply_headers(&mut r)?;
+    budget.charge(1)?;
+    let resp = stub.fetch_with_request(r).await?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp).await);
+    }
+    Ok(())
 }
