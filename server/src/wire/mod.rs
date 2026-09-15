@@ -247,6 +247,11 @@ pub struct FetchArgs {
     pub deepen_relative: bool,
     pub shallow: Vec<ObjectId>,
     pub filter: Option<Filter>,
+    /// `packfile-uris <csv>` — the URI protocols the client accepts (A30). Empty
+    /// when the arg wasn't sent; the server then never emits a URIs section.
+    /// `None` = arg absent; `Some([])` = client opted in but named no protocols
+    /// (real git accepts an empty csv — it just means "never mint me a URI").
+    pub packfile_uris: Option<Vec<BString>>,
 }
 pub enum V2Command {
     LsRefs(LsRefsArgs),
@@ -333,6 +338,7 @@ fn parse_fetch(args: &[BString]) -> Result<FetchArgs, Error> {
         deepen_relative: false,
         shallow: vec![],
         filter: None,
+        packfile_uris: None,
     };
     for l in args {
         let (k, v) = l.split_once_str(" ").unwrap_or((l.as_slice(), b""));
@@ -367,6 +373,19 @@ fn parse_fetch(args: &[BString]) -> Result<FetchArgs, Error> {
             }
             b"deepen-relative" => f.deepen_relative = true,
             b"no-done" => {} // informational: we answer before `done` anyway
+            b"packfile-uris" => {
+                // spec: at most one such line; the value is a csv of protocols
+                // (possibly empty — real git accepts it, we just never mint)
+                if f.packfile_uris.is_some() {
+                    return Err(bad("packfile-uris", v));
+                }
+                f.packfile_uris = Some(
+                    v.split(|b| *b == b',')
+                        .filter(|s| !s.is_empty())
+                        .map(BString::from)
+                        .collect(),
+                );
+            }
             b"filter" if v == b"blob:none" => f.filter = Some(Filter::BlobNone),
             b"filter" => {
                 f.filter = Some(Filter::BlobLimit(
@@ -401,7 +420,13 @@ pub struct RefRow {
 
 /// Rule 6, byte-exact and static.
 pub fn write_capability_advertisement_v2(w: &mut PktWriter) {
-    for l in ["version 2", AGENT, "ls-refs=unborn", "fetch=shallow filter", "object-format=sha1"] {
+    for l in [
+        "version 2",
+        AGENT,
+        "ls-refs=unborn",
+        "fetch=shallow filter packfile-uris",
+        "object-format=sha1",
+    ] {
         line(w, format!("{l}\n").as_bytes());
     }
     w.flush();
@@ -527,7 +552,8 @@ pub fn write_report_status(
 }
 
 /// Rule 3 and section 9 step 6. Ok(false): response ends here (no pack). Otherwise the caller
-/// streams Sideband::data frames, then flush.
+/// streams Sideband::data frames, then flush. `uris` is the packfile-uris section payload —
+/// each entry a full "<hash> <uri>" line (A30) — emitted between wanted-refs and packfile.
 pub fn write_fetch_prelude(
     w: &mut PktWriter,
     args: &FetchArgs,
@@ -535,6 +561,7 @@ pub fn write_fetch_prelude(
     wanted_refs: &[(ObjectId, BString)],
     shallow: &[ObjectId],
     unshallow: &[ObjectId],
+    uris: &[String],
 ) -> Result<bool, Error> {
     let ready = args.done || args.haves.is_empty() || acks.len() >= args.haves.len();
     // acknowledgments + ready only exist when the client negotiated (sent haves) —
@@ -570,6 +597,13 @@ pub fn write_fetch_prelude(
         w.text("wanted-refs")?;
         for (id, name) in wanted_refs {
             w.text(&format!("{id} {}", name.as_bstr()))?;
+        }
+        w.delim();
+    }
+    if !uris.is_empty() {
+        w.text("packfile-uris")?;
+        for u in uris {
+            w.text(u)?;
         }
         w.delim();
     }

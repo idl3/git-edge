@@ -14,7 +14,7 @@ use crate::auth::{self, Level};
 use crate::error::{respond, Error};
 use crate::pack;
 use crate::platform;
-use crate::store::{Bucket, PushId, RepoId};
+use crate::store::{Bucket, PackId, PushId, RepoId};
 use crate::wire::{
     self,
     http::{stub_json, stub_raw, RepoRoute},
@@ -147,6 +147,9 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         (Method::Get, "info/refs") => info_refs(&req, &env, &route, &spend).await,
         (Method::Get, "_state") => state_probe(&req, &env, &route, &spend).await,
         (Method::Post, "git-upload-pack") => upload_pack(req, &env, &route, &spend).await,
+        (Method::Get, p) if p.starts_with("_packs/") => {
+            pack_get(&req, &env, &route, &p["_packs/".len()..], &spend).await
+        }
         (Method::Post, "git-receive-pack") => receive_pack(req, env, route, &spend).await,
         (Method::Post, "_admin/tokens") => token_create(req, &env, &route, &spend).await,
         (Method::Get, "_admin/tokens") => token_list(&req, &env, &route, &spend).await,
@@ -171,6 +174,7 @@ fn op_name(method: &Method, rest: &str) -> &'static str {
         (Method::Get, "_state") => "state",
         (Method::Post, "git-upload-pack") => "fetch",
         (Method::Post, "git-receive-pack") => "push",
+        (Method::Get, p) if p.starts_with("_packs/") => "pack-uri",
         (_, p) if p.starts_with("_admin/") => "admin",
         _ => "other",
     }
@@ -358,8 +362,11 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spe
         wire::V2Command::LsRefs(_) => "/_do/ls-refs",
         wire::V2Command::Fetch(_) => "/_do/fetch",
     };
+    // the fetch may answer with packfile-uris URLs (A30) — the DO composes them
+    // from the public origin, forwarded on the internal request as x-ge-base
+    let base = req.url().ok().map(|u| u.origin().ascii_serialization());
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
-    let mut resp = stub_raw(&stub, route, path, body, &mut budget).await?;
+    let mut resp = stub_raw(&stub, route, path, body, &mut budget, base.as_deref()).await?;
     if resp.status_code() != 200 {
         return Err(Error::from_do_response(resp, &budget).await);
     }
@@ -375,6 +382,54 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spe
             .map_err(|e| Error::Internal(e.to_string()))?;
     }
     Ok(out)
+}
+
+/// GET /:owner/:repo/_packs/<id>.pack?e=<exp>&s=<sig> — signed pack download (A30).
+/// URI fetches carry no auth headers (packfile-uris sends the client through
+/// `git http-fetch` bare), so the HMAC in `s` is the credential: it binds
+/// repo+pack+expiry. No token check here by design — the DO only mints these
+/// for fetches that already passed read auth.
+async fn pack_get(req: &Request, env: &Env, _route: &RepoRoute, name: &str, spend: &Spend) -> Result<Response, Error> {
+    let signing = crate::sign::signing_key(env).ok_or(Error::NotFound)?; // feature off: never minted, never served
+    let pack = name
+        .strip_suffix(".pack")
+        .filter(|p| RepoRoute::seg_ok(p))
+        .ok_or(Error::NotFound)?;
+    let url = req.url().map_err(|e| Error::Internal(e.to_string()))?;
+    let qp = |k: &str| {
+        url.query_pairs()
+            .find(|(q, _)| q == k)
+            .map(|(_, v)| v.into_owned())
+    };
+    let exp: i64 = qp("e").and_then(|v| v.parse().ok()).ok_or(Error::Forbidden)?;
+    if exp < platform::now_ms() / 1000 {
+        return Err(Error::Forbidden);
+    }
+    // r= is the opaque repo_id the DO signed (the R2 namespace); the path's
+    // owner/repo is routing sugar only — the sig is the authority
+    let repo_id = qp("r").filter(|r| RepoRoute::seg_ok(r)).ok_or(Error::Forbidden)?;
+    let sig = qp("s").ok_or(Error::Forbidden)?;
+    if !crate::sign::pack_sig_ok(&signing, &repo_id, pack, exp, &sig) {
+        return Err(Error::Forbidden);
+    }
+    let mut budget = ReqBudget::paid().reporting(spend);
+    let key = crate::store::keys::pack(&RepoId(repo_id), &PackId(pack.into()));
+    budget.charge(1)?;
+    let obj = env
+        .bucket("BUCKET")?
+        .get(&key)
+        .execute()
+        .await?
+        .ok_or(Error::NotFound)?;
+    let body = obj.body().ok_or_else(|| Error::Storage(format!("no body for {key}")))?;
+    let mut resp = Response::from_body(body.response_body()?).map_err(Error::from)?;
+    let h = resp.headers_mut();
+    h.set("Content-Type", "application/octet-stream")
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    // the URL is a bearer credential — never let a cache serve it past expiry
+    h.set("Cache-Control", "private, no-store")
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    Ok(resp)
 }
 
 /// POST /:owner/:repo/_admin/tokens {name, level} — mint a per-repo credential.
@@ -506,7 +561,7 @@ async fn pin_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str, spe
 async fn export_bundle(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate(req, env, Level::Read, route, spend).await?;
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
-    let mut resp = stub_raw(&stub, route, "/_do/export", Vec::new(), &mut budget).await?;
+    let mut resp = stub_raw(&stub, route, "/_do/export", Vec::new(), &mut budget, None).await?;
     if resp.status_code() != 200 {
         return Err(Error::from_do_response(resp, &budget).await);
     }

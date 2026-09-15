@@ -51,6 +51,137 @@ git clone -q "$URL/$REPO" "$WORK/clone1" || fail "single-pack clone"
 [ "$(git -C "$WORK/clone1" rev-parse main)" = "$TIP1" ] || fail "single-pack clone tip"
 git -C "$WORK/clone1" fsck --strict || fail "single-pack clone fsck"
 
+# packfile-uris (C1/A30): only runs with GE_CONFORMANCE_URIS=1, a dev server
+# started with GE_URL_SIGNING_KEY in .dev.vars, and git >= 2.40 as GE_GITBIN
+# (stock PATH git is fine on >= 2.40). packs_live=1 still holds here.
+if [ "${GE_CONFORMANCE_URIS:-0}" = "1" ]; then
+  note "packfile-uris: opted-in fetch gets a signed URI, inline pack is empty"
+  GITC="${GE_GITBIN:-git}"
+  python3 - "$TIP1" > "$WORK/fetchuri.bin" <<'PY'
+import sys
+tip = sys.argv[1]
+def pkt(b):
+    return f"{len(b)+4:04x}".encode() + b
+out = pkt(b"command=fetch\n") + pkt(b"object-format=sha1\n") + b"0001"
+out += pkt(f"want {tip}\n".encode()) + pkt(b"packfile-uris http,https\n") + pkt(b"done\n") + b"0000"
+sys.stdout.buffer.write(out)
+PY
+  curl -s -D "$WORK/uh" -o "$WORK/uresp.bin" -X POST "$URL/$REPO/git-upload-pack" \
+    -H 'Git-Protocol: version=2' -H 'Content-Type: application/x-git-upload-pack-request' \
+    --data-binary @"$WORK/fetchuri.bin"
+  python3 - "$WORK/uresp.bin" > "$WORK/uri.txt" <<'PY'
+import sys
+d = open(sys.argv[1],'rb').read()
+i = 0
+uri = None
+packdata = 0
+while i < len(d):
+    n = int(d[i:i+4], 16)
+    if n == 0:
+        break
+    if n < 4:          # delim/response-end pkts carry no payload
+        i += 4
+        continue
+    line = d[i+4:i+n]
+    if line.startswith(b"packfile-uris"):
+        pass
+    elif line[:1] == b"\x01":
+        packdata += len(line) - 1
+    elif b" http" in line and len(line) > 42 and line[:40].decode().strip("0123456789abcdef") == "":
+        uri = line[41:].strip().decode()
+    i += n
+if not uri:
+    sys.exit("no <hash> <uri> line in packfile-uris section")
+if packdata != 32:
+    sys.exit(f"inline pack should be the 32-byte empty pack, got {packdata}")
+print(uri)
+PY
+  URI=$(cat "$WORK/uri.txt")
+  HASH=$(python3 - "$WORK/uresp.bin" <<'PY'
+import sys,re
+d=open(sys.argv[1],'rb').read()
+m=re.search(rb'\n?([0-9a-f]{40}) http', d) or re.search(rb'([0-9a-f]{40}) http', d)
+print(m.group(1).decode())
+PY
+  )
+  # the signed URI self-authenticates: bare curl, no token
+  curl -sf "$URI" -o "$WORK/via-uri.pack" || fail "signed URI fetch"
+  [ "$(python3 -c 'import hashlib,sys;print(hashlib.sha1(open(sys.argv[1],"rb").read()[:-20]).hexdigest())' "$WORK/via-uri.pack")" = "$HASH" ] \
+    || fail "URI pack checksum != advertised hash"
+  head -c 4 "$WORK/via-uri.pack" | grep -q PACK || fail "URI body is not a pack"
+  # tampered signature must be refused, and so must an expired or missing one
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${URI%s=*}s=deadbeef")
+  [ "$code" = "403" ] || fail "bad-sig pack fetch -> $code, want 403"
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${URI/e=*/e=1}")
+  [ "$code" = "403" ] || fail "expired-sig pack fetch -> $code, want 403"
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${URI/%s=*/}")
+  [ "$code" = "403" ] || fail "sig-less pack fetch -> $code, want 403"
+  # scheme gate: a client naming only https on an http origin gets the A29
+  # inline pack instead of a URI; an empty value and a duplicate line likewise
+  python3 - "$TIP1" > "$WORK/fetchhttps.bin" <<'PY'
+import sys
+tip = sys.argv[1]
+def pkt(b):
+    return f"{len(b)+4:04x}".encode() + b
+out = pkt(b"command=fetch\n") + pkt(b"object-format=sha1\n") + b"0001"
+out += pkt(f"want {tip}\n".encode()) + pkt(b"packfile-uris https\n") + pkt(b"done\n") + b"0000"
+sys.stdout.buffer.write(out)
+PY
+  curl -s -o "$WORK/hresp.bin" -X POST "$URL/$REPO/git-upload-pack" \
+    -H 'Git-Protocol: version=2' -H 'Content-Type: application/x-git-upload-pack-request' \
+    --data-binary @"$WORK/fetchhttps.bin"
+  python3 - "$WORK/hresp.bin" <<'PY'
+import sys
+d = open(sys.argv[1],'rb').read()
+if b"packfile-uris" in d:
+    sys.exit("https-only request must not mint an http URI")
+i = 0; packdata = 0
+while i < len(d):
+    n = int(d[i:i+4], 16)
+    if n == 0: break
+    if n < 4:
+        i += 4; continue
+    if d[i+4:i+5] == b"\x01":
+        packdata += n - 5
+    i += n
+if packdata <= 32:
+    sys.exit(f"expected the real inline pack via A29, got {packdata} bytes")
+PY
+  python3 - "$TIP1" > "$WORK/fetchdup.bin" <<'PY'
+import sys
+tip = sys.argv[1]
+def pkt(b):
+    return f"{len(b)+4:04x}".encode() + b
+out = pkt(b"command=fetch\n") + pkt(b"object-format=sha1\n") + b"0001"
+out += pkt(f"want {tip}\n".encode()) + pkt(b"packfile-uris http\n") + pkt(b"packfile-uris https\n") + pkt(b"done\n") + b"0000"
+sys.stdout.buffer.write(out)
+PY
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$REPO/git-upload-pack" \
+    -H 'Git-Protocol: version=2' -H 'Content-Type: application/x-git-upload-pack-request' \
+    --data-binary @"$WORK/fetchdup.bin")
+  [ "$code" = "400" ] || fail "duplicate packfile-uris -> $code, want 400"
+  # bare/empty value is legal per real git — fetch succeeds via the A29 path
+  python3 - "$TIP1" > "$WORK/fetchempty.bin" <<'PY'
+import sys
+tip = sys.argv[1]
+def pkt(b):
+    return f"{len(b)+4:04x}".encode() + b
+out = pkt(b"command=fetch\n") + pkt(b"object-format=sha1\n") + b"0001"
+out += pkt(f"want {tip}\n".encode()) + pkt(b"packfile-uris \n") + pkt(b"done\n") + b"0000"
+sys.stdout.buffer.write(out)
+PY
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$REPO/git-upload-pack" \
+    -H 'Git-Protocol: version=2' -H 'Content-Type: application/x-git-upload-pack-request' \
+    --data-binary @"$WORK/fetchempty.bin")
+  [ "$code" = "200" ] || fail "empty packfile-uris value -> $code, want 200"
+  # real client: clone downloads the pack over the signed URL (git >= 2.40)
+  "$GITC" -c fetch.uriprotocols=http,https clone -q "$URL/$REPO" "$WORK/clone-uri" || fail "packfile-uris clone (git too old?)"
+  [ "$(git -C "$WORK/clone-uri" rev-parse main)" = "$TIP1" ] || fail "packfile-uris clone tip"
+  git -C "$WORK/clone-uri" fsck --strict || fail "packfile-uris clone fsck"
+  n=$(tr -d '\r' < "$WORK/uh" | sed -nE 's/^x-ge-subrequests: ([0-9]+).*/\1/ip' | tail -1)
+  [ -n "$n" ] && [ "$n" -le 8 ] || fail "C1 fetch spend $n, want <= 8"
+fi
+
 note "incremental push (thin pack with deltas)"
 dd if=/dev/urandom of=big.bin bs=1m count=6 2>/dev/null
 git add big.bin && git commit -qm big
