@@ -83,7 +83,10 @@ pub fn json(v: serde_json::Value) -> Result<Response, Error> {
 
 /// Turn a DO-side Error into a JSON response the edge can reconstruct. Storage and Internal
 /// never reach this: they propagate out of `fetch` so the platform rolls back the span (A2).
-pub fn do_error_response(e: &Error) -> Result<Response, Error> {
+/// `subreqs` is the DO's own R2 spend — stamped as x-ge-subrequests so the edge
+/// can fold it into the request tally on its error response (audit P3); sync-span
+/// routes never reach R2 and pass 0.
+pub fn do_error_response(e: &Error, subreqs: u32) -> Result<Response, Error> {
     let kind = match e {
         Error::Protocol(_) => "protocol",
         Error::Auth => "auth",
@@ -101,7 +104,10 @@ pub fn do_error_response(e: &Error) -> Result<Response, Error> {
     if let Error::RateLimit(secs) = e {
         body["retry_after"] = (*secs).into();
     }
-    let resp = Response::from_json(&body).map_err(|e| Error::Internal(e.to_string()))?;
+    let mut resp = Response::from_json(&body).map_err(|e| Error::Internal(e.to_string()))?;
+    resp.headers_mut()
+        .set("x-ge-subrequests", &format!("{subreqs}/{}", ReqBudget::PAID_SUBREQUESTS))
+        .ok();
     Ok(resp.with_status(e.status()))
 }
 
@@ -119,7 +125,7 @@ pub async fn stub_json<T: serde::de::DeserializeOwned>(
     let req = repo.internal_request(path, text.into_bytes())?;
     let mut resp = stub.fetch_with_request(req).await?;
     if resp.status_code() != 200 {
-        return Err(Error::from_do_response(resp).await);
+        return Err(Error::from_do_response(resp, budget).await);
     }
     resp.json::<T>().await.map_err(|e| Error::Internal(format!("do response: {e}")))
 }

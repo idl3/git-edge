@@ -7,7 +7,7 @@ use worker::{Env, Request};
 
 use crate::error::Error;
 use crate::wire::http::{stub_json, RepoRoute};
-use crate::ReqBudget;
+use crate::{ReqBudget, Spend};
 
 #[derive(Clone, Copy)]
 pub enum Level {
@@ -79,14 +79,15 @@ pub fn authenticate_admin(req: &Request, env: &Env) -> Result<String, Error> {
 }
 
 /// Returns the principal string recorded in the reflog — for a repo token, its
-/// admin-assigned name, so pushes attribute to a meaningful identity.
-pub async fn authenticate(req: &Request, env: &Env, need: Level, route: &RepoRoute) -> Result<String, Error> {
+/// admin-assigned name, so pushes attribute to a meaningful identity. `spend`
+/// tallies the stub call so a 401/403 still reports x-ge-subrequests.
+pub async fn authenticate(req: &Request, env: &Env, need: Level, route: &RepoRoute, spend: &Spend) -> Result<String, Error> {
     let (token, principal) = match credentials(req) {
         Ok(c) => c,
         // no usable credential on a read route: a public repo answers anonymously.
         // (A presented-but-invalid credential still gets the challenge — anonymous
         // fallback is only for requests that never offered one.)
-        Err(Error::Auth) if matches!(need, Level::Read) => return anonymous(env, route).await,
+        Err(Error::Auth) if matches!(need, Level::Read) => return anonymous(env, route, spend).await,
         Err(e) => return Err(e),
     };
     // optional for read-only deployments: an unset write secret just never matches,
@@ -117,7 +118,7 @@ pub async fn authenticate(req: &Request, env: &Env, need: Level, route: &RepoRou
         name: String,
     }
     let stub = route.stub(env)?;
-    let mut budget = ReqBudget::paid();
+    let mut budget = ReqBudget::paid().reporting(spend);
     let row: Result<AuthRow, Error> = stub_json(
         &stub,
         route,
@@ -138,13 +139,13 @@ pub async fn authenticate(req: &Request, env: &Env, need: Level, route: &RepoRou
 /// No credential presented on a read route: one `/_do/public` probe decides
 /// whether the repo serves anonymous reads. Non-Auth DO errors propagate — a
 /// tombstoned repo answers 410, not a fresh 401 challenge.
-async fn anonymous(env: &Env, route: &RepoRoute) -> Result<String, Error> {
+async fn anonymous(env: &Env, route: &RepoRoute, spend: &Spend) -> Result<String, Error> {
     #[derive(serde::Deserialize)]
     struct P {
         public: bool,
     }
     let stub = route.stub(env)?;
-    let mut budget = ReqBudget::paid();
+    let mut budget = ReqBudget::paid().reporting(spend);
     let p: P = stub_json(&stub, route, "/_do/public", &serde_json::json!({}), &mut budget).await?;
     if p.public {
         Ok("anonymous".into())
