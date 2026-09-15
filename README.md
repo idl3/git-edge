@@ -61,10 +61,44 @@ The 56 proofs were written in TypeScript. We then asked whether the server can b
 | `spikes/` | Small real programs run on the Cloudflare runtime to test a fact | Engineers. |
 | `CONTRACTS.md` | The one set of rules every revised proof follows: storage layout, the ref transaction, the job timer, the janitor | Engineers. |
 | `server/` | The working server: the contract compiled to a Rust/WASM Cloudflare Worker, tested with real git | Engineers. |
+| `tools/` | `git-edge-import.sh`: staged-push importer for repos too big for one request | Operators. |
 | `COMPATIBILITY.md` | Every git feature the server speaks, what it does not, and the limits | Everyone. |
 | `PRODUCTION-UAT.md` | The runnable deploy-and-verify checklist: gates, live battery, limits sign-off, rollback | Operators. |
 | `ROADMAP.md` | Prioritized backlog scoped to the agent-built small/disposable-app profile, plus the atlas-core/grain-core fit benchmark | Everyone. |
 | `STYLE.md` | The writing rules and glossary for the plain documents | Writers. |
+
+## Importing an existing repository
+
+The Cloudflare zone caps each request body at ~100 MB, so a repo whose history
+is bigger than that cannot land in a single `git push`. `tools/git-edge-import.sh`
+stages the import for you: it slices the branch's first-parent chain into
+pushes that each stay under the cap, pushes them oldest to newest (every one a
+clean fast-forward), and resumes from the remote tip if it dies half-way.
+
+```bash
+export GE_TOKEN=ge_...            # write token — used via a credential
+                                  # helper, never embedded in the URL
+tools/git-edge-import.sh ./myrepo https://<host>/<owner>/<repo>
+tools/git-edge-import.sh https://github.com/pallets/flask \
+  https://<host>/pallets/flask --all-branches --tags
+```
+
+- `--branch <name>` picks one branch (default: the source's HEAD branch);
+  `--all-branches` imports every `refs/heads/*`, HEAD branch first so it
+  becomes the remote default; `--tags` pushes all tags at the end.
+- `--dry-run` prints the slice plan — boundary commits, estimated MiB and
+  object count per slice — and pushes nothing.
+- `SLICE_MIB` (default 60) and `SLICE_OBJS` (default 30000) bound each push.
+  The byte cap tracks the ~100 MB body limit; the object cap tracks the ingest
+  subrequest budget, which dies around ~50k objects in one push.
+- Re-running the same command is safe and cheap: a remote tip on the
+  first-parent chain resumes mid-import. A remote tip that is not an ancestor
+  of the source tip is refused — the tool never force-pushes. If one commit
+  alone exceeds the caps it fails with remediation (`git gc --aggressive`,
+  raising the tunables, or a future server-side import).
+
+Verify afterwards with a clone and `git fsck --strict`; compare the output
+against fsck of the source, since old repos can carry pre-existing findings.
 
 ## The nine problems in one breath
 
