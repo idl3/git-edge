@@ -393,3 +393,39 @@ The benchmark surfaced two production bugs, both fixed:
   dangling (GitHub-style first-push adoption).
 
 Prioritized backlog lives in `ROADMAP.md`.
+
+## Round 8 — repo-admin surface (ROADMAP P0 #3/#5, P1 #11/#16)
+
+Four features, all verified against local workerd (git 2.54,
+`tests/conformance/run.sh` covers each):
+
+- **Repo delete** — `POST /:o/:r/_admin/delete` sets `meta.deleted` and enqueues
+  `purge_repo` in the same span; every repo route answers 410 from that moment
+  (new `Error::Gone`). `boot` on a tombstoned DO skips `jobs::repair` and keeps
+  exactly one `purge_repo` row alive (requeueing a stranded 'running' one) so
+  the wipe is the only work that can run. The purge stub in `jobs/mod.rs`
+  drains `r/<repo_id>/` via list+delete_multiple and drops every table except
+  the meta tombstone keys `boot` needs (`repo_id`, `owner`, `repo`, `head`,
+  `refs_version`, `gc_epoch`, `deleted`, `created_at`, `schema_version`) — a
+  fully-wiped meta would re-initialize the repo on the next request. First
+  pass dropped `refs_version`/`gc_epoch` and tombstoned DOs 500'd until the
+  whitelist was widened — caught by the conformance 410 probe.
+- **Public read** — `meta.public` presence flag via
+  `POST /_admin/public {enabled}`. Edge auth falls through to a `/_do/public`
+  probe only when the request carries *no* usable credential; a presented token
+  is still authenticated (no silent downgrade). Verified: anonymous
+  ls-remote/clone on a public repo, anonymous push still 401, private again
+  after `enabled:false`.
+- **Ref pinning** — `pins` table + `/_admin/pin {ref,sha}` /
+  `/_admin/unpin {ref}`. Pin requires the ref to already resolve to `sha`
+  (assertion, not a move; 409 otherwise). `commit_push` rejects update and
+  delete of a pinned ref with `ng "ref is pinned"` before CAS checks. Listed
+  in `_state`. Verified: update and delete both rejected, push succeeds after
+  unpin.
+- **Export** — `GET /_admin/export` (read-level; anonymous on public repos)
+  streams a real v3 `git bundle`: `# v3 git bundle` signature (the v3 literal
+  *includes* "git" — a bare `# v3 bundle` is rejected by `git bundle verify`),
+  no capability lines, no prerequisites, one `<sha> <ref>` per live ref plus a
+  `HEAD` line when `meta.head` resolves, blank line, then the send_set pack
+  verbatim (no pkt framing). Verified: `bundle verify` + clone-from-bundle +
+  fsck.

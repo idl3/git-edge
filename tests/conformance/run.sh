@@ -78,6 +78,69 @@ out=$(curl -s --compressed -X POST "$URL/$REPO/git-receive-pack" \
 echo "$out" | grep -q "unpack " || fail "no unpack line in A2 response: $out"
 echo "$out" | grep -q "ng refs/heads/main" || fail "no ng line in A2 response: $out"
 
+# Admin surface: pin, public read, export, delete — on its own repo so the
+# destructive tail does not disturb the earlier cases.
+note "admin repo: seed"
+ADMINREPO="$REPO-admin"
+mkdir "$WORK/admin" && cd "$WORK/admin"
+git init -q && git config user.email t@t && git config user.name t
+echo p > p && git add p && git commit -qm p && git branch -M main
+git push -q "$URL/$ADMINREPO" main || fail "admin seed push"
+PTIP=$(git rev-parse HEAD)
+
+note "ref pinning: pin rejects update/delete, unpin restores"
+curl -sf -X POST "$URL/$ADMINREPO/_admin/pin" \
+  -d "{\"ref\":\"refs/heads/main\",\"sha\":\"$PTIP\"}" | grep -q pinned || fail "pin"
+git commit -qm ontop --allow-empty
+if git push "$URL/$ADMINREPO" HEAD:main 2>"$WORK/pinerr"; then
+  fail "push to pinned ref succeeded"
+fi
+grep -q "ref is pinned" "$WORK/pinerr" || fail "no pin reason in ng: $(cat "$WORK/pinerr")"
+if git push "$URL/$ADMINREPO" --delete main 2>/dev/null; then
+  fail "delete of pinned ref succeeded"
+fi
+curl -sf "$URL/$ADMINREPO/_state" | grep -q "$PTIP" || fail "pin missing from _state"
+curl -sf -X POST "$URL/$ADMINREPO/_admin/unpin" \
+  -d '{"ref":"refs/heads/main"}' | grep -q true || fail "unpin"
+git push -q "$URL/$ADMINREPO" HEAD:main || fail "push after unpin"
+ATIP=$(git rev-parse HEAD)
+
+note "public read: anonymous fetch, push still gated"
+NOAUTH="$(echo "$URL" | sed -E 's|^(https?://)[^/@]*@|\1|')"
+# a credential helper (osxkeychain) may have stored the URL-embedded token from
+# earlier pushes — empty it so these calls are genuinely unauthenticated
+ANON="-c credential.helper="
+curl -sf -X POST "$URL/$ADMINREPO/_admin/public" \
+  -d '{"enabled":true}' | grep -q true || fail "public on"
+git $ANON ls-remote "$NOAUTH/$ADMINREPO" > "$WORK/ls-pub" || fail "anonymous ls-remote"
+grep -q "refs/heads/main" "$WORK/ls-pub" || fail "anonymous ls-remote empty"
+git $ANON clone -q "$NOAUTH/$ADMINREPO" "$WORK/pubclone" || fail "anonymous clone"
+if GIT_TERMINAL_PROMPT=0 git $ANON -C "$WORK/seed" push -q "$NOAUTH/$ADMINREPO" HEAD:refs/heads/anon 2>/dev/null; then
+  fail "anonymous push to public repo succeeded"
+fi
+curl -sf -X POST "$URL/$ADMINREPO/_admin/public" \
+  -d '{"enabled":false}' | grep -q false || fail "public off"
+if GIT_TERMINAL_PROMPT=0 git $ANON ls-remote "$NOAUTH/$ADMINREPO" >/dev/null 2>&1; then
+  fail "anonymous ls-remote after public off"
+fi
+
+note "export: v3 bundle of all refs"
+curl -sf "$URL/$ADMINREPO/_admin/export" -o "$WORK/exp.bundle" || fail "export"
+head -1 "$WORK/exp.bundle" | grep -q "v3 git bundle" || fail "not a v3 bundle"
+git -C "$WORK/seed" bundle verify "$WORK/exp.bundle" >/dev/null || fail "bundle verify"
+git clone -q "$WORK/exp.bundle" "$WORK/bundleclone" || fail "clone from bundle"
+[ "$(git -C "$WORK/bundleclone" rev-parse main)" = "$ATIP" ] || fail "bundle tip"
+
+note "repo delete: tombstone -> 410 on every route"
+curl -sf -X POST "$URL/$ADMINREPO/_admin/delete" | grep -q deleted || fail "delete"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/$ADMINREPO/info/refs?service=git-upload-pack")
+[ "$code" = "410" ] || fail "deleted repo info/refs -> $code, want 410"
+if GIT_TERMINAL_PROMPT=0 git ls-remote "$URL/$ADMINREPO" >/dev/null 2>&1; then
+  fail "ls-remote on deleted repo"
+fi
+code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/$ADMINREPO/_state")
+[ "$code" = "410" ] || fail "deleted repo _state -> $code, want 410"
+
 # GC chain: only runs when the server was started with shortened windows
 # (GE_GC_QUIET_MS / GE_GC_GRACE_MS in .dev.vars) and GE_CONFORMANCE_GC=1.
 # Polls /_state until the orphan pack is swept or the deadline passes.

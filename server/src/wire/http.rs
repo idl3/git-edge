@@ -89,6 +89,7 @@ pub fn do_error_response(e: &Error) -> Result<Response, Error> {
         Error::Auth => "auth",
         Error::Forbidden => "forbidden",
         Error::NotFound => "notfound",
+        Error::Gone => "gone",
         Error::Conflict(_) => "conflict",
         Error::Unpack(_) => "unpack",
         Error::Budget => "budget",

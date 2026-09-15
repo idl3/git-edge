@@ -57,6 +57,21 @@ struct RevokeDto {
     id: String,
 }
 #[derive(serde::Deserialize)]
+struct PublicDto {
+    enabled: Option<bool>,
+}
+#[derive(serde::Deserialize)]
+struct PinDto {
+    #[serde(rename = "ref")]
+    name: String,
+    sha: String,
+}
+#[derive(serde::Deserialize)]
+struct UnpinDto {
+    #[serde(rename = "ref")]
+    name: String,
+}
+#[derive(serde::Deserialize)]
 struct N {
     n: i64,
 }
@@ -79,6 +94,7 @@ pub struct Meta {
     pub head: String,
     pub refs_version: i64,
     pub gc_epoch: i64,
+    pub deleted: bool,
 }
 
 #[durable_object]
@@ -100,6 +116,9 @@ impl DurableObject for RepoDo {
         let method = req.method();
         // ---- sync span from here to the response for every "none" route ----
         let out: Result<Option<Response>, Error> = self.boot(&hdr).and_then(|meta| {
+            if meta.deleted {
+                return Err(Error::Gone); // tombstoned: every repo route is 410
+            }
             match (&method, path.as_str()) {
                 (Method::Get, "/_do/refs") => self.list_refs().and_then(refs_json),
                 (Method::Get, "/_do/state") => self.debug_state(),
@@ -115,6 +134,10 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/tokens") => self.token_create(&parse(&body)?),
                 (Method::Get, "/_do/tokens") => self.token_list(),
                 (Method::Post, "/_do/tokens/revoke") => self.token_revoke(&parse(&body)?),
+                (Method::Post, "/_do/delete") => self.delete_repo(),
+                (Method::Post, "/_do/public") => self.set_public(&parse::<PublicDto>(&body)?),
+                (Method::Post, "/_do/pin") => self.pin(&parse::<PinDto>(&body)?),
+                (Method::Post, "/_do/unpin") => self.unpin(&parse::<UnpinDto>(&body)?),
                 _ => return Ok(None),
             }
             .map(Some)
@@ -128,6 +151,11 @@ impl DurableObject for RepoDo {
                     let r = self.fetch_v2(&body).await;
                     // boot may have enqueued jobs in this span — rearm even on error;
                     // a propagated Storage/Internal error rolls the span back anyway
+                    let _ = jobs::rearm(self).await;
+                    return r;
+                }
+                (Method::Post, "/_do/export") => {
+                    let r = self.export_bundle().await;
                     let _ = jobs::rearm(self).await;
                     return r;
                 }
@@ -163,6 +191,16 @@ impl DurableObject for RepoDo {
 
 pub fn oid(hex: &str) -> Result<ObjectId, Error> {
     ObjectId::from_hex(hex.as_bytes()).map_err(|e| Error::Protocol(e.to_string()))
+}
+
+/// A full valid refname under refs/ — the same gate apply_one uses on push commands.
+fn valid_ref(name: &str) -> Result<&str, Error> {
+    if !name.as_bytes().starts_with(b"refs/")
+        || gix_validate::reference::name(name.as_bytes().as_bstr()).is_err()
+    {
+        return Err(Error::Protocol("bad ref name".into()));
+    }
+    Ok(name)
 }
 fn refs_json((head, refs): (Option<BString>, Vec<RefRow>)) -> Result<Response, Error> {
     json(serde_json::json!({
@@ -238,9 +276,6 @@ impl RepoDo {
             schema::migrate(&sql)?;
             *self.booted.borrow_mut() = true;
         }
-        // A4: re-queue a dead maintenance job at every boot, and requeue 'running' rows that a
-        // killed isolate stranded (A12).
-        jobs::repair(&sql)?;
         #[derive(serde::Deserialize)]
         struct KV {
             key: String,
@@ -259,6 +294,7 @@ impl RepoDo {
                     head: need("head")?,
                     refs_version: num("refs_version")?,
                     gc_epoch: num("gc_epoch")?,
+                    deleted: get("deleted").is_some(),
                 }
             }
             None => {
@@ -290,9 +326,41 @@ impl RepoDo {
                     head: "refs/heads/main".into(),
                     refs_version: 0,
                     gc_epoch: 0,
+                    deleted: false,
                 }
             }
         };
+        if meta.deleted {
+            // tombstoned: the only work left is purge_repo. Keep one queued (a dead
+            // or missing row is re-enqueued at every boot), requeue a stranded
+            // 'running' row, and skip repair — the other tables are about to be
+            // dropped, so resurrecting janitor/GC would only race the wipe.
+            let now = platform::now_ms();
+            self.q(
+                "UPDATE jobs SET state='queued', run_at=?, attempts=attempts+1, \
+                 last_error='stranded mid-slice' \
+                 WHERE kind='purge_repo' AND state='running' AND started_at < ?",
+                vec![V::from(now), V::from(now.saturating_sub(60_000))],
+            )?;
+            #[derive(serde::Deserialize)]
+            struct NJ {
+                n: i64,
+            }
+            let n = self
+                .q(
+                    "SELECT COUNT(*) AS n FROM jobs WHERE kind='purge_repo' AND state IN ('queued','running')",
+                    vec![],
+                )?
+                .one::<NJ>()?
+                .n;
+            if n == 0 {
+                jobs::enqueue(&sql, JobKind::PurgeRepo, now, "{}")?;
+            }
+        } else {
+            // A4: re-queue a dead maintenance job at every boot, and requeue 'running'
+            // rows that a killed isolate stranded (A12).
+            jobs::repair(&sql)?;
+        }
         if let (Some(o), Some(r)) = (&hdr.owner, &hdr.repo) {
             if *o != meta.owner || *r != meta.repo {
                 return Err(Error::Internal("identity mismatch".into()));
@@ -316,6 +384,14 @@ impl RepoDo {
         let count = |q: &str| -> Result<i64, Error> {
             Ok(self.q(q, vec![])?.one::<N>()?.n)
         };
+        #[derive(serde::Deserialize)]
+        struct Pin {
+            name: String,
+            sha: String,
+        }
+        let pins = self
+            .q("SELECT name, sha FROM pins ORDER BY name", vec![])?
+            .to_array::<Pin>()?;
         json(serde_json::json!({
             "refs": count("SELECT COUNT(*) AS n FROM refs")?,
             "objects": count("SELECT COUNT(*) AS n FROM objects")?,
@@ -328,6 +404,12 @@ impl RepoDo {
             "pushes": count("SELECT COUNT(*) AS n FROM pushes")?,
             "marked": count("SELECT COUNT(*) AS n FROM marked")?,
             "tokens": count("SELECT COUNT(*) AS n FROM tokens")?,
+            "pins": pins
+                .iter()
+                .map(|p| serde_json::json!({ "ref": p.name, "sha": p.sha }))
+                .collect::<Vec<_>>(),
+            "public": self.meta_opt("public")?.is_some(),
+            "deleted": self.meta_opt("deleted")?.is_some(),
         }))
     }
 
@@ -403,6 +485,95 @@ impl RepoDo {
     fn token_revoke(&self, b: &RevokeDto) -> Result<Response, Error> {
         self.q("DELETE FROM tokens WHERE id=?", vec![V::from(b.id.as_str())])?;
         json(serde_json::json!({ "revoked": self.changes()? > 0 }))
+    }
+
+    /// POST /_do/delete — tombstone the repo (meta.deleted) and enqueue purge_repo.
+    /// Idempotent: the marker is a key upsert and enqueue dedups on a queued row.
+    fn delete_repo(&self) -> Result<Response, Error> {
+        let now = platform::now_ms();
+        self.q(
+            "INSERT INTO meta(key,value) VALUES('deleted',?) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            vec![V::from(now.to_string().as_str())],
+        )?;
+        jobs::enqueue(&self.sql(), JobKind::PurgeRepo, now, "{}")?;
+        json(serde_json::json!({ "deleted": true }))
+    }
+
+    /// POST /_do/public {enabled} sets the anonymous-read flag (presence of
+    /// meta.public); {} with no field is the edge's probe for unauthenticated reads.
+    fn set_public(&self, b: &PublicDto) -> Result<Response, Error> {
+        match b.enabled {
+            Some(true) => {
+                self.q(
+                    "INSERT INTO meta(key,value) VALUES('public','1') \
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    vec![],
+                )?;
+            }
+            Some(false) => {
+                self.q("DELETE FROM meta WHERE key='public'", vec![])?;
+            }
+            None => {}
+        }
+        json(serde_json::json!({ "public": self.meta_opt("public")?.is_some() }))
+    }
+
+    /// POST /_do/pin {ref, sha} — freeze a ref at exactly sha. The ref must already
+    /// resolve to it: a pin asserts the current value, it never moves a ref.
+    fn pin(&self, b: &PinDto) -> Result<Response, Error> {
+        let name = valid_ref(&b.name)?;
+        let target = oid(&b.sha)?;
+        if target.is_null() {
+            return Err(Error::Protocol("pin sha must be non-zero".into()));
+        }
+        #[derive(serde::Deserialize)]
+        struct T {
+            target: String,
+        }
+        let cur = self
+            .q("SELECT target FROM refs WHERE name=?", vec![V::from(name)])?
+            .to_array::<T>()?
+            .into_iter()
+            .next();
+        match cur {
+            Some(t) if t.target == target.to_string() => {}
+            _ => return Err(Error::Conflict(format!("{name} is not at {target}"))),
+        }
+        let n = self
+            .q("SELECT COUNT(*) AS n FROM pins WHERE name<>?", vec![V::from(name)])?
+            .one::<N>()?
+            .n;
+        if n >= 256 {
+            return Err(Error::Limit("too many pins (256 max)".into()));
+        }
+        self.q(
+            "INSERT INTO pins(name,sha,created_at) VALUES(?,?,?) \
+             ON CONFLICT(name) DO UPDATE SET sha=excluded.sha",
+            vec![V::from(name), V::from(target.to_string().as_str()), V::from(platform::now_ms())],
+        )?;
+        json(serde_json::json!({ "pinned": name, "sha": target.to_string() }))
+    }
+
+    /// POST /_do/unpin {ref}.
+    fn unpin(&self, b: &UnpinDto) -> Result<Response, Error> {
+        let name = valid_ref(&b.name)?;
+        self.q("DELETE FROM pins WHERE name=?", vec![V::from(name)])?;
+        json(serde_json::json!({ "unpinned": self.changes()? > 0 }))
+    }
+
+    /// The pinned sha for a ref name — one row in `pins` freezes the ref.
+    fn pin_sha(&self, name: &str) -> Result<Option<String>, Error> {
+        #[derive(serde::Deserialize)]
+        struct P {
+            sha: String,
+        }
+        Ok(self
+            .q("SELECT sha FROM pins WHERE name=?", vec![V::from(name)])?
+            .to_array::<P>()?
+            .into_iter()
+            .next()
+            .map(|r| r.sha))
     }
 
     /// GET /_do/refs (1.3, awaits: none).
@@ -627,6 +798,10 @@ impl RepoDo {
         }
         if c.old.is_null() && c.new.is_null() {
             return Ok(Some("funny refname"));
+        }
+        // a pinned ref is immutable: update and delete both fail before CAS/target checks
+        if self.pin_sha(&c.name)?.is_some() {
+            return Ok(Some("ref is pinned"));
         }
         if c.new.is_null() && c.name == head {
             return Ok(Some("deletion of the current branch prohibited"));
@@ -870,6 +1045,80 @@ impl RepoDo {
             .map_err(|e| Error::Internal(e.to_string()))?;
         Ok(resp)
     }
+
+    /// POST /_do/export — a git bundle (v3, no prerequisites) of every live ref.
+    /// Same awaits-as-fetch route arm: send_set + verbatim pack chunks, no pkt framing.
+    async fn export_bundle(&self) -> worker::Result<Response> {
+        match self.export_inner().await {
+            Ok(r) => Ok(r),
+            Err(e @ (Error::Storage(_) | Error::Internal(_))) => Err(worker::Error::RustError(e.message())),
+            Err(e) => {
+                worker::console_log!("export: {e}");
+                do_error_response(&e).map_err(worker::Error::from)
+            }
+        }
+    }
+
+    async fn export_inner(&self) -> Result<Response, Error> {
+        let (head, refs) = self.list_refs()?;
+        let mut wants: Vec<ObjectId> = refs.iter().map(|r| r.target).collect();
+        wants.sort_unstable();
+        wants.dedup();
+        let mut budget = ReqBudget::paid();
+        let bucket = self.bucket()?;
+        // a full bundle = every object reachable from every ref tip: the fetch
+        // machinery with no haves, no shallow/filter modes, include-tag off (tag
+        // objects reachable via refs are already wants)
+        let set = generate::send_set(
+            self, &bucket, &wants, &[], None, None, None, &[], false, false, &[], &mut budget,
+        )
+        .await?;
+        // v3 header: signature, no capabilities (sha1), no prerequisite lines, one
+        // `<sha> <ref>` line per ref (sorted), a HEAD line through meta.head, blank
+        let mut hdr = b"# v3 git bundle\n".to_vec();
+        for r in &refs {
+            hdr.extend_from_slice(r.target.to_string().as_bytes());
+            hdr.push(b' ');
+            hdr.extend_from_slice(r.name.as_slice());
+            hdr.push(b'\n');
+        }
+        if let Some(h) = &head {
+            if let Some(r) = refs.iter().find(|r| r.name.as_slice() == h.as_slice()) {
+                hdr.extend_from_slice(r.target.to_string().as_bytes());
+                hdr.extend_from_slice(b" HEAD\n");
+            }
+        }
+        hdr.push(b'\n');
+        let projected = budget
+            .used
+            .saturating_add(u32::try_from(set.reads.len()).unwrap_or(u32::MAX));
+        let max_sub = budget.max_subrequests;
+        let st = ExportStream {
+            budget,
+            bucket,
+            set,
+            next: 0,
+            hasher: gix_hash::hasher(gix_hash::Kind::Sha1),
+            prelude: Some(hdr),
+        };
+        let s = stream::unfold(st, |mut st| async move {
+            match st.step().await {
+                Ok(Some(chunk)) => Some((Ok::<Vec<u8>, Error>(chunk), st)),
+                Ok(None) => None,
+                Err(e) => {
+                    // mid-stream: a truncated bundle is the only signal left — the
+                    // header and pack prefix are already on the wire
+                    worker::console_log!("export stream: {e}");
+                    None
+                }
+            }
+        });
+        let resp = Response::from_stream(s).map_err(Error::from)?;
+        resp.headers()
+            .set("x-ge-subrequests", &format!("{projected}/{max_sub}"))
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        Ok(resp)
+    }
 }
 
 struct FetchStream {
@@ -922,6 +1171,49 @@ impl FetchStream {
                 w.flush();
                 self.next += 1;
                 Ok(Some(w.out))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// FetchStream without the pkt/sideband framing: bundle header, then the PACK
+/// bytes verbatim, then the trailer — bundle = file format, not a pkt stream.
+struct ExportStream {
+    budget: ReqBudget,
+    bucket: Bucket,
+    set: generate::SendSet,
+    next: usize,
+    hasher: gix_hash::Hasher,
+    prelude: Option<Vec<u8>>,
+}
+impl ExportStream {
+    async fn step(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        if let Some(p) = self.prelude.take() {
+            return Ok(Some(p));
+        }
+        let n = self.set.reads.len();
+        match self.next {
+            0 => {
+                let mut hdr = b"PACK".to_vec();
+                hdr.extend_from_slice(&2u32.to_be_bytes());
+                hdr.extend_from_slice(&self.set.count().to_be_bytes());
+                self.hasher.update(&hdr);
+                self.next = 1;
+                Ok(Some(hdr))
+            }
+            i if i <= n => {
+                let chunk =
+                    generate::pack_chunk(&self.bucket, &self.set, i - 1, &mut self.hasher, &mut self.budget)
+                        .await?;
+                self.next += 1;
+                Ok(Some(chunk))
+            }
+            i if i == n + 1 => {
+                let h = std::mem::replace(&mut self.hasher, gix_hash::hasher(gix_hash::Kind::Sha1));
+                let trailer = h.try_finalize().map_err(|e| Error::Internal(e.to_string()))?;
+                self.next += 1;
+                Ok(Some(trailer.as_slice().to_vec()))
             }
             _ => Ok(None),
         }

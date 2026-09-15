@@ -159,7 +159,9 @@ truncation, or corrupted ref state.
    `{name, level}` (global-write-token only — repo credentials cannot mint more),
    listed via `GET`, revoked via `DELETE /_admin/tokens/<id>`. Only sha1 hashes
    are stored; a token is shown once at creation. Read tokens get 403 on push.
-   Still no anonymous access, per-branch permissions, or user accounts.
+   `POST /_admin/public {enabled}` opens a repo to anonymous reads (ls-refs,
+   fetch, export) — a request with no credential is admitted; a presented bad
+   token still gets a 401. Still no per-branch permissions or user accounts.
 8. **No LFS.** Full objects now stream verbatim up to the 2 GiB pending-pack
    bound, so ordinary large blobs are fine — but anything pushed *as a delta*
    whose result exceeds 16 MiB is still rejected (`unpack object too large`),
@@ -169,9 +171,13 @@ truncation, or corrupted ref state.
    reliable workaround is pushing the object undeltified, e.g.
    `git -c core.bigFileThreshold=1 push`. The ~100 MB platform body cap
    applies per request. Very large assets should still live outside git.
-9. **No hooks, repo rename/delete, or web UI.** A repo is created by pushing to
-   it; `/_state` (write-auth) and `/_admin/tokens` are the only introspection /
-   management endpoints. Basic request metrics (op, status, ms, subrequests per
+9. **No hooks, repo rename, or web UI.** A repo is created by pushing to it and
+   deleted by `POST /_admin/delete` (write-auth): the repo tombstones to 410
+   immediately and a `purge_repo` job reclaims R2 packs and DO storage in the
+   background. Other management endpoints: `/_state` (write-auth introspection),
+   `/_admin/tokens`, `/_admin/public`, `/_admin/pin` + `/_admin/unpin`
+   (read-auth `GET /_admin/export` streams a v3 `git bundle` of all live refs).
+   Basic request metrics (op, status, ms, subrequests per
    repo) are emitted to Analytics Engine when the `GE_METRICS` binding exists.
 10. **Real-deploy verified:** R2 multipart semantics, DO alarms, and Paid-plan
     subrequest limits are all confirmed against a live deployment

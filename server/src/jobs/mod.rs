@@ -17,6 +17,7 @@ pub enum JobKind {
     GcMark,
     GcConsolidate,
     GcSweep,
+    PurgeRepo,
 }
 impl JobKind {
     pub fn as_str(&self) -> &'static str {
@@ -25,6 +26,7 @@ impl JobKind {
             JobKind::GcMark => "gc_mark",
             JobKind::GcConsolidate => "gc_consolidate",
             JobKind::GcSweep => "gc_sweep",
+            JobKind::PurgeRepo => "purge_repo",
         }
     }
     fn of(s: &str) -> Result<Self, Error> {
@@ -33,6 +35,7 @@ impl JobKind {
             "gc_mark" => Ok(JobKind::GcMark),
             "gc_consolidate" => Ok(JobKind::GcConsolidate),
             "gc_sweep" => Ok(JobKind::GcSweep),
+            "purge_repo" => Ok(JobKind::PurgeRepo),
             k => Err(Error::Internal(format!("unknown job kind {k}"))),
         }
     }
@@ -342,5 +345,61 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         JobKind::GcMark => gc::gc_mark(d, job, budget).await,
         JobKind::GcConsolidate => gc::gc_consolidate(d, job, budget).await,
         JobKind::GcSweep => gc::gc_sweep(d).await,
+        // stub arm — the real purge implementation lands with the jobs pass;
+        // this minimal version is already idempotent and keeps the meta tombstone
+        JobKind::PurgeRepo => purge_repo(d, job, budget).await,
     }
+}
+
+/// purge_repo: wipe every R2 object under the repo prefix, then every table except
+/// the meta tombstone (repo_id/owner/repo/head/deleted keep the DO from ever
+/// re-initializing). Every phase re-scans, so a mid-slice kill or a half-wiped DO
+/// just runs again.
+async fn purge_repo(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<SliceOutcome, Error> {
+    let bucket = d.bucket()?;
+    let prefix = format!("r/{}/", bucket.repo.0);
+    loop {
+        if budget.spent_80pct() {
+            return Ok(SliceOutcome::Continue { cursor: "{}".into() });
+        }
+        budget.req.charge(1)?;
+        let page = bucket
+            .inner
+            .list()
+            .prefix(prefix.as_str())
+            .execute()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let keys: Vec<String> = page.objects().iter().map(|o| o.key()).collect();
+        if keys.is_empty() {
+            break; // truncated pages always carry objects; empty = prefix drained
+        }
+        budget.req.charge(1)?;
+        bucket
+            .inner
+            .delete_multiple(keys.iter().map(String::as_str).collect::<Vec<_>>())
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        heartbeat(&d.sql(), job.id)?;
+    }
+    let sql = d.sql();
+    for t in [
+        "refs", "reflog", "pushes", "packs", "objects", "marked", "gc_frontier", "gc_seen",
+        "gc_parts", "tokens", "pins",
+    ] {
+        sql.exec(&format!("DELETE FROM {t}"), Some(vec![]))
+            .map_err(|e| Error::Storage(e.to_string()))?;
+    }
+    // tombstone keeps every key boot's Meta construction reads
+    sql.exec(
+        "DELETE FROM meta WHERE key NOT IN \
+         ('repo_id','owner','repo','head','refs_version','gc_epoch','deleted','created_at','schema_version')",
+        Some(vec![]),
+    )
+    .map_err(|e| Error::Storage(e.to_string()))?;
+    // every jobs row goes too — including this one: the fenced Done below finds
+    // nothing to delete, which is correct (a wiped store must not re-enqueue)
+    sql.exec("DELETE FROM jobs", Some(vec![]))
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    Ok(SliceOutcome::Done)
 }
