@@ -393,3 +393,83 @@ The benchmark surfaced two production bugs, both fixed:
   dangling (GitHub-style first-push adoption).
 
 Prioritized backlog lives in `ROADMAP.md`.
+
+## Round 8 — jobs observability, lease-fence hardening, purge_repo (feat/jobs-observability)
+
+Roadmap items 6, 7, 13 (jobs alerting/metrics, lease-overlap hardening) plus the
+audit P3 `coalesce` loud-fail and roadmap item 3's `purge_repo` job kind.
+
+- **Job-lifecycle metrics (A17).** `platform::job_event` writes one Analytics
+  Engine datapoint per dispatch event when `GE_METRICS` is bound; unbound is a
+  single failed binding lookup, never fatal. Schema (positional):
+  `index1=repo` (ctx.id.name — survives `purge_repo`'s meta wipe),
+  `blob1="job"`, `blob2=kind`, `blob3=event`
+  (start|done|continue|reschedule|retry|dead|stale), `blob4=outcome`
+  (ok|retry|dead|stale), `blob5=error_class` (`Error::class()`, bounded);
+  `double1=attempt` (1-based), `double2=duration_ms`, `double3=will_retry`.
+- **Dead-job alerting (A18).** `blob3='dead'` datapoints carry kind + repo +
+  attempts + error class — enough for `SELECT ... WHERE blob1='job' AND
+  blob3='dead'` alarm queries — and every alarm pass emits a `jobs_dead`
+  gauge datapoint (`blob1='gauge'`, `blob2='jobs_dead'`, `double1=count`)
+  while dead rows exist. Operator wiring: a Workers Analytics Engine query
+  alert on either shape, or an external cron Worker / uptime poller hitting
+  `GET /:o/:r/_state` and paging on `jobs_dead > 0`. The gauge path needs no
+  new infrastructure — `_state` already exposes the count.
+- **Lease-overlap hardening (A19).** The pre-existing design already fenced the
+  *outcome* span on the lease token; the residual gap was mid-slice: a stale
+  slice heartbeated unconditionally (refreshing the new owner's `started_at`
+  and masking a real stall) and kept issuing writes until it finished.
+  `heartbeat` is now a CAS on `id + state='running' + lease`, returns the
+  landed bit, and every call site bails with `stale_lease()` on `false` — the
+  fenced outcome no-ops, `attempts` is not consumed, dispatch records the
+  event as `stale`. `repair` clears `lease` on requeue. Residual: between
+  heartbeats a stale slice can still issue R2/SQL writes — safe by
+  construction (mark OR-merges, consolidate is deterministic replay, deletes
+  are idempotent, purge's R2 prefix is the dead repo_id).
+- **`coalesce` loud-fail (A21).** The fragment-length cast is now
+  `Error::Limit` propagated via `Result` — HTTP 413 through the existing
+  mapping — replacing both the audited `unwrap_or(u32::MAX)` and the interim
+  `expect` (a panic inside a DO aborts the isolate mid-stream).
+- **`purge_repo` job (A20).** Enqueued by `POST /:o/:r/_admin/delete` (edge
+  route lands separately). Phase A pages `list(prefix=r/<repo_id>/)` +
+  `delete_multiple`, cursor persisted as `r2:<cursor>` in `jobs.cursor`;
+  phase B CAS-fences, re-migrates the schema (covers a crashed
+  `delete_all`), deletes every table's rows and every other job row, clears
+  the alarm, `delete_all()`, `unboot()`. Verified live on workerd: push ->
+  enqueue -> repo reads back empty (fresh repo_id, zero objects/refs), R2
+  keys gone, janitor re-seeded by the next boot.
+
+## Round 9 — repo-admin surface (ROADMAP P0 #3/#5, P1 #11/#16)
+
+Four features, all verified against local workerd (git 2.54,
+`tests/conformance/run.sh` covers each):
+
+- **Repo delete** — `POST /:o/:r/_admin/delete` sets `meta.deleted` and enqueues
+  `purge_repo` in the same span; every repo route answers 410 from that moment
+  (new `Error::Gone`). `boot` on a tombstoned DO skips `jobs::repair` and keeps
+  exactly one `purge_repo` row alive (requeueing a stranded 'running' one) so
+  the wipe is the only work that can run. The merged purge is Round 8's
+  `jobs/purge.rs` (R2 `list`+`delete_multiple` under `r/<repo_id>/`, then
+  `delete_all`) — after it completes the name is free and re-boots fresh.
+  During development a tombstone-preserving stub dropped
+  `refs_version`/`gc_epoch` and tombstoned DOs 500'd until `boot`'s meta
+  whitelist was widened — caught by the conformance 410 probe.
+- **Public read** — `meta.public` presence flag via
+  `POST /_admin/public {enabled}`. Edge auth falls through to a `/_do/public`
+  probe only when the request carries *no* usable credential; a presented token
+  is still authenticated (no silent downgrade). Verified: anonymous
+  ls-remote/clone on a public repo, anonymous push still 401, private again
+  after `enabled:false`.
+- **Ref pinning** — `pins` table + `/_admin/pin {ref,sha}` /
+  `/_admin/unpin {ref}`. Pin requires the ref to already resolve to `sha`
+  (assertion, not a move; 409 otherwise). `commit_push` rejects update and
+  delete of a pinned ref with `ng "ref is pinned"` before CAS checks. Listed
+  in `_state`. Verified: update and delete both rejected, push succeeds after
+  unpin.
+- **Export** — `GET /_admin/export` (read-level; anonymous on public repos)
+  streams a real v3 `git bundle`: `# v3 git bundle` signature (the v3 literal
+  *includes* "git" — a bare `# v3 bundle` is rejected by `git bundle verify`),
+  no capability lines, no prerequisites, one `<sha> <ref>` per live ref plus a
+  `HEAD` line when `meta.head` resolves, blank line, then the send_set pack
+  verbatim (no pkt framing). Verified: `bundle verify` + clone-from-bundle +
+  fsck.

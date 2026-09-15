@@ -775,3 +775,154 @@ produced these corrections, all verified against git 2.54:
   alphabetically-first existing `refs/heads/*`. `refs/heads/main` remains
   only the boot-time default; a `master`-first repo now clones with a
   working checkout.
+
+## Amendments from the jobs-observability pass (feat/jobs-observability)
+
+Continuing the audit-fix numbering (last: A16).
+
+- **A17. Job-lifecycle metrics (extends A13).** When `GE_METRICS` is bound,
+  `jobs::dispatch` emits one Analytics Engine datapoint per job event, in
+  addition to the request datapoints. Positional layout, queried as
+  `index1`/`blobN`/`doubleN`: `index1` = repo (`owner/repo`, from
+  `ctx.id.name` so the label survives a `purge_repo` meta wipe); `blob1` =
+  `"job"` (discriminator — request datapoints carry the op here, gauges
+  `"gauge"`); `blob2` = kind (`janitor` | `gc_mark` | `gc_consolidate` |
+  `gc_sweep` | `purge_repo`); `blob3` = event (`start` | `done` |
+  `continue` | `reschedule` | `retry` | `dead` | `stale`); `blob4` =
+  outcome (`ok` | `retry` | `dead` | `stale`); `blob5` = error class
+  (`Error::class()` — the variant name, never the message, to stay
+  cardinality-safe; `""` when none); `double1` = 1-based attempt;
+  `double2` = slice wall-clock ms (0 on `start`); `double3` = 1.0 when the
+  job will run again (`continue`/`reschedule`/`retry`), else 0.0. Writes
+  are fire-and-forget: an unbound dataset or a failed write never fails a
+  job.
+- **A18. Dead-job alerting (extends A17).** A job reaching `dead` emits a
+  `dead`-event datapoint (`blob3=dead`, `blob4=dead`, `blob5` the error
+  class, `double1` the attempts consumed) — distinct and
+  cardinality-safe, so an alert can key on `blob1='job' AND blob3='dead'`.
+  Additionally, every alarm pass emits a `jobs_dead` gauge datapoint while
+  dead rows exist (`blob1='gauge'`, `blob2='jobs_dead'`, `double1` =
+  count). An operator wires the alarm either as a Workers Analytics/alert
+  query over the dataset (`SELECT blob2, double1 WHERE blob1='gauge' AND
+  blob2='jobs_dead' AND double1 > 0`) or as an external cron poller of
+  `GET /:o/:r/_state` watching `jobs_dead`.
+- **A19. Lease-fenced heartbeats (amends 4.4, hardens the A12/A20 60 s
+  straggler window).** `heartbeat` is a CAS:
+  `UPDATE jobs SET started_at=? WHERE id=? AND state='running' AND lease=?`.
+  A slice whose row was `repair`-requeued and reclaimed under a new lease
+  gets `false` and must return `stale_lease()` immediately — every write it
+  still had queued belongs to the new lease-holder, and an unconditional
+  `started_at` bump would mask a genuinely stalled new owner from `repair`.
+  `repair` now clears `lease` on requeue. Dispatch reports a fenced outcome
+  write that lands zero rows as event `stale` — never a retry, and
+  `attempts` is not consumed by the loser. Residual risk: between
+  heartbeats a stale slice can still issue R2 reads/writes — safe because
+  `gc_mark` OR-merges bitmaps, `gc_consolidate` replays deterministically
+  from `gc.pos`, janitor/purge deletes are idempotent, and `purge_repo`'s
+  R2 prefix is the dead `repo_id`.
+- **A20. `purge_repo` job kind (new).** `POST /:o/:r/_admin/delete`
+  enqueues `purge_repo` (no payload). Slice A pages `list` over the
+  `r/<repo_id>/` R2 prefix (cursor persisted in `jobs.cursor` as
+  `r2:<cursor>`) and deletes each page via `delete_multiple`; slice B is a
+  bounded span — CAS-heartbeat fence, `schema::migrate` (a crashed prior
+  attempt may have dropped the schema), `DELETE FROM` every table but the
+  job's own row, `DELETE FROM jobs WHERE id <> self`, `delete_alarm`, then
+  `storage().delete_all()` and `unboot()` so the next request re-migrates.
+  Idempotent and resumable at every await; a re-`POST` after completion
+  enqueues a fresh job that wipes a fresh repo — a no-op. Known residual:
+  a push committing between the row wipe and `delete_all` could leave a
+  stray row in a re-created repo; the window is microseconds inside one
+  slice. In-flight multipart uploads leave no listed objects and expire
+  server-side (~7 d); R2 keys written after the listing cursor may be
+  orphaned as unreferenced bytes under the dead `repo_id` prefix.
+- **A21. `coalesce` loud-fail (amends 7.2/A9-fetch-fragmentation).** The
+  fragment-length cast is `Error::Limit("read fragment exceeds window")`
+  propagated through a `Result` — HTTP 413 — never a saturating
+  `u32::MAX` and never a panic inside the DO.
+
+## Amendments from the repo-admin pass (repo delete, public read, pinning, export)
+
+- **A22. Repo delete (new).** `POST /:owner/:repo/_admin/delete` is
+  global-write-token only. It sets `meta.deleted` and enqueues a `purge_repo`
+  job (A20) in the same span; from that point every repo route — git protocol,
+  `_state`, `_admin/*`, `/_do/*` — answers **410** via a new `Error::Gone`
+  before any dispatch. `boot` on a tombstoned DO skips `jobs::repair` and
+  instead guarantees exactly one `purge_repo` row exists (re-enqueueing a
+  dead/missing one and requeueing a stranded `running` row on the same 60 s
+  rule) — the purge is the only work that may still run, via the alarm. The
+  tombstone lives until the purge's phase-B `delete_all` (A20); after that the
+  name is free and the next request re-initializes a fresh repo under a new
+  `repo_id`. Delete is idempotent at the API level; a repeated call on a
+  tombstoned repo is itself 410.
+
+- **A23. Public read (new).** `POST /:owner/:repo/_admin/public
+  {enabled: bool}` (global-write-token only) sets or clears `meta.public`.
+  On a public repo, `info/refs?service=git-upload-pack`, `POST
+  git-upload-pack`, and `GET _admin/export` need no credential: a request with
+  *no* usable `Authorization` credential on a read route falls through to a
+  `/_do/public` probe instead of an immediate 401. A presented credential is
+  still authenticated normally — an invalid token on a public repo is a 401,
+  never a silent downgrade to anonymous. receive-pack, `_state`, and all other
+  `_admin/*` routes are unchanged. `_state` reports `public` and `deleted`.
+
+- **A24. Ref pinning (new).** `POST /:owner/:repo/_admin/pin {ref, sha}` and
+  `/_admin/unpin {ref}` (global-write-token only) maintain a `pins` table.
+  `ref` must be a full valid refname under `refs/` and must already resolve to
+  `sha` — a pin asserts the current value, it never moves a ref (mismatch or
+  missing ref → 409). A pinned ref rejects every update and delete in
+  `commit_push` with `ng <ref> "ref is pinned"`, checked before the
+  head-deletion and CAS rules. Pins are capped at 256 per repo and listed in
+  `_state` under `pins`.
+
+- **A25. Export (new).** `GET /:owner/:repo/_admin/export` (read-level auth —
+  anonymous on a public repo) streams a v3 `git bundle`: the `# v3 git bundle`
+  signature, no capability lines (sha1), no prerequisites, one `<sha> <ref>`
+  line per live ref in name order, a `HEAD` line when `meta.head` resolves, a
+  blank line, then a self-contained PACK built by the same
+  `send_set`/`pack_chunk` machinery as fetch (wants = every ref tip, no haves,
+  no shallow or filter modes; `include-tag` is unnecessary because every tag
+  object reachable via a ref is already a want). The pack entries are verbatim
+  copies with the normal trailer hash; the stream carries no pkt framing —
+  a bundle is a file format, so a mid-stream failure is a truncated file.
+
+## Amendments from the request-hardening pass (feat/request-hardening)
+
+- **A26. Repo quotas (extends section 6's limit set).** Three env knobs with
+  compiled-in defaults; `<= 0` disables that cap. `GE_QUOTA_MAX_REPOS_PER_OWNER`
+  (default 50) is enforced at first push: `/_do/push/begin` reports `claimed` —
+  true once the repo has any committed (`live` or swept-`dead`) pack — and the
+  edge claims a slot in the `owner!<owner>` registry DO before ingest begins.
+  Registry DOs are the same `RepoDo` class under a name no repo route can form
+  (`!` fails `seg_ok`); `/_owner/*` routes skip `boot` entirely — schema migrate
+  only, no meta rows, no jobs, no alarm. Claims are `claim:<repo>` keys in `meta`
+  (idempotent `INSERT ... ON CONFLICT DO NOTHING`); over-cap inserts are handed
+  straight back so rejected names never accumulate, and `/_owner/release` frees a
+  slot for repo delete (ROADMAP #3). A repo that once committed keeps pushing if
+  the cap is tightened later — it is grandfathered and never re-claims.
+  `GE_QUOTA_MAX_OBJECTS` (default 2 000 000) and `GE_QUOTA_MAX_BYTES` (default
+  4 GiB) are enforced in `commit_push` after ingest has posted the pack's real
+  counts: live packs plus the push's own ingesting pack are summed; over either
+  cap the whole push is finished `rejected` (so the janitor reaps the pack now)
+  and `Error::Limit` naming the knob and the numbers rides back in `unpack`.
+  A delete-only push (no pack) skips the check so an over-cap repo can shrink.
+- **A27. Push rate limit (new).** `/_do/push/begin` runs a sliding-window check
+  before the push row exists: two fixed 60 s buckets in the `rate` table,
+  estimated as `cur + prev * (1 - frac_elapsed)`, keyed on `push:<sha1(token)>`.
+  The attempt is counted before the check so an abusive credential stays over
+  the line. Over `GE_RATE_PUSHES_PER_MIN` (default 30; `<= 0` disables) the DO
+  returns `ratelimit` + `retry_after`, which surfaces as HTTP 429 with a
+  `Retry-After` header — deliberately *without* the A2 drain, since shedding
+  load is the point (a client still mid-upload may see a reset instead).
+  Counters are per repo per credential. This is abuse damping, not metering:
+  zone-level Cloudflare rate-limit rules are the heavy hammer.
+- **A28. Advertisement memoization (extends 1.3).** The DO memoizes the refs
+  snapshot — head, ref rows, and the rendered `/_do/refs` JSON body — keyed on
+  `refs_version`, plus `/_do/ls-refs` response bytes per (refs_version, request
+  body) in an 8-entry FIFO. `refs_version` only moves inside a commit span that
+  changed refs, so a matching version is a byte-stable answer; an evicted DO
+  rebuilds once. The subrequest still happens (the edge can only learn the
+  version from the DO) but no refs scan, oid parse, or render runs on a hit.
+  Auth and the protocol-version branch stay per-request at the edge; the DO
+  stamps `x-ge-refs-version` on `/_do/refs` and the edge echoes it on
+  `info/refs`. `_state` reports `refs_memo_hits`/`refs_memo_misses` and
+  `rate_rows`.

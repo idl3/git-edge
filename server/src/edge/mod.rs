@@ -146,6 +146,11 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         (Method::Delete, p) if p.starts_with("_admin/tokens/") => {
             token_revoke(&req, &env, &route, &p["_admin/tokens/".len()..]).await
         }
+        (Method::Post, "_admin/delete") => repo_delete(&req, &env, &route).await,
+        (Method::Post, "_admin/public") => repo_public(req, &env, &route).await,
+        (Method::Post, "_admin/pin") => pin_ref(req, &env, &route, "/_do/pin").await,
+        (Method::Post, "_admin/unpin") => pin_ref(req, &env, &route, "/_do/unpin").await,
+        (Method::Get, "_admin/export") => export_bundle(&req, &env, &route).await,
         _ => Err(Error::NotFound),
     };
     let resp = respond(r, git_pkt);
@@ -232,6 +237,7 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
         _ => return Err(Error::Protocol("service must be git-upload-pack or git-receive-pack".into())),
     };
     auth::authenticate(req, env, level, route).await?; // before the DO wakes (8.1)
+    let mut refs_version = None;
     let mut w = PktWriter::default();
     if protocol_version(req)? == Some(2) && matches!(service, Service::UploadPack { .. }) {
         wire::write_capability_advertisement_v2(&mut w);
@@ -258,6 +264,7 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
         if resp.status_code() != 200 {
             return Err(Error::from_do_response(resp).await);
         }
+        refs_version = resp.headers().get("x-ge-refs-version").ok().flatten();
         let dto: RefsDto = resp.json().await.map_err(|e| Error::Internal(e.to_string()))?;
         let refs: Vec<wire::RefRow> = dto
             .refs
@@ -276,7 +283,13 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute) -> Result<Respon
             .collect::<Result<_, Error>>()?;
         wire::write_advertisement_v0(&mut w, service, dto.head.as_deref().map(|s| bstr::ByteSlice::as_bstr(s.as_bytes())), &refs);
     }
-    git_resp(w.out, ct)
+    let mut out = git_resp(w.out, ct)?;
+    if let Some(v) = refs_version {
+        out.headers_mut()
+            .set("x-ge-refs-version", &v)
+            .map_err(|e| Error::Internal(e.to_string()))?;
+    }
+    Ok(out)
 }
 
 /// GET /:owner/:repo/_state — internal observability probe (write-token gated).
@@ -422,9 +435,91 @@ async fn token_revoke(req: &Request, env: &Env, route: &RepoRoute, id: &str) -> 
     git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
 }
 
+/// Bounded JSON body for the small _admin payloads (public/pin/unpin).
+async fn json_body(req: &mut Request) -> Result<serde_json::Value, Error> {
+    if let Some(n) = req
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if n > 4_096 {
+            return Err(Error::Protocol("admin body too large".into()));
+        }
+    }
+    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    if body.len() > 4_096 {
+        return Err(Error::Protocol("admin body too large".into()));
+    }
+    serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("admin body: {e}")))
+}
+
+/// POST /:owner/:repo/_admin/delete — tombstone the repo and enqueue purge_repo.
+/// Every repo route answers 410 from the moment this returns. Idempotent.
+async fn repo_delete(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+    auth::authenticate_admin(req, env)?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let out: serde_json::Value =
+        stub_json(&stub, route, "/_do/delete", &serde_json::json!({}), &mut budget).await?;
+    owner_release(env, route).await; // free the A26 quota slot; best-effort — tombstone already landed
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
+/// POST /:owner/:repo/_admin/public {enabled: bool} — anonymous read flag.
+/// Write paths (receive-pack, token minting) stay token-gated regardless.
+async fn repo_public(mut req: Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+    auth::authenticate_admin(&req, env)?;
+    let v = json_body(&mut req).await?;
+    if v.get("enabled").and_then(|b| b.as_bool()).is_none() {
+        return Err(Error::Protocol("body must be {\"enabled\": bool}".into()));
+    }
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let out: serde_json::Value = stub_json(&stub, route, "/_do/public", &v, &mut budget).await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
+/// POST /:owner/:repo/_admin/pin {ref, sha} / _admin/unpin {ref} — ref pinning.
+async fn pin_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str) -> Result<Response, Error> {
+    auth::authenticate_admin(&req, env)?;
+    let v = json_body(&mut req).await?;
+    if v.get("ref").and_then(|r| r.as_str()).is_none()
+        || (path == "/_do/pin" && v.get("sha").and_then(|s| s.as_str()).is_none())
+    {
+        return Err(Error::Protocol("body must be {\"ref\": ..., \"sha\": ...}".into()));
+    }
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let out: serde_json::Value = stub_json(&stub, route, path, &v, &mut budget).await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
+/// GET /:owner/:repo/_admin/export — stream a v3 git bundle of every live ref.
+/// Read-level auth suffices (anonymous on a public repo); the DO builds the pack
+/// with the same send_set machinery as fetch, framed by the bundle header.
+async fn export_bundle(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+    auth::authenticate(req, env, Level::Read, route).await?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let mut resp = stub_raw(&stub, route, "/_do/export", Vec::new(), &mut budget).await?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp).await);
+    }
+    let subreqs = resp.headers().get("x-ge-subrequests").ok().flatten();
+    let stream = resp.stream().map_err(|e| Error::Internal(e.to_string()))?;
+    let mut out = git_resp_stream(stream, "application/x-git-bundle")?;
+    if let Some(v) = subreqs {
+        out.headers_mut()
+            .set("x-ge-subrequests", &v)
+            .map_err(|e| Error::Internal(e.to_string()))?;
+    }
+    Ok(out)
+}
+
 /// POST /:owner/:repo/git-receive-pack — two-phase push (2.4, 3) with the A2 error arm.
 async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Response, Error> {
     let principal = auth::authenticate(&req, &env, Level::Write, &route).await?;
+    // A27: sha1 of the presented token is the rate-limit bucket key — the raw
+    // credential never crosses the stub boundary (8.1)
+    let rate_key = auth::presented_hash(&req)?;
     let mut body = BodyReader::new(&mut req)?;
 
     // ---- pre-header: parse errors are still normal HTTP errors (A2 arm not yet active) ----
@@ -447,9 +542,15 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Re
     }
 
     // ---- post-header (A2): everything from here reports HTTP 200 + report-status ----
-    match receive_inner(&mut body, &env, &route, &hdr, &principal).await {
+    match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
+            // A27: a throttled push answers a real HTTP 429 + Retry-After, not an
+            // in-band unpack error — and skips the drain, since shedding load is the
+            // point (a client still mid-upload may see a reset instead of the 429).
+            if matches!(e, Error::RateLimit(_)) {
+                return Err(e);
+            }
             body.drain().await; // finish the client's upload before answering (see drain)
             report_status_200(&hdr, Err(e.client_message()), &[])
         }
@@ -487,21 +588,42 @@ async fn receive_inner(
     route: &RepoRoute,
     hdr: &wire::ReceiveHeader,
     principal: &str,
+    rate_key: &str,
 ) -> Result<Response, Error> {
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
     let push = PushId::random()?;
     #[derive(serde::Deserialize)]
     struct Begin {
         repo_id: String,
+        #[serde(default)]
+        claimed: bool,
     }
     let begin: Begin = stub_json(
         &stub,
         route,
         "/_do/push/begin",
-        &serde_json::json!({ "push_id": push.0, "principal": principal }),
+        &serde_json::json!({ "push_id": push.0, "principal": principal, "key": rate_key }),
         &mut budget,
     )
     .await?;
+    // A26: a repo that has never committed a pack must claim one of the owner's
+    // GE_QUOTA_MAX_REPOS_PER_OWNER slots in the `owner!<owner>` registry DO before
+    // ingest burns bandwidth. Failure here aborts the open push like any post-begin
+    // error; the Limit message reaches the client in `unpack`.
+    if !begin.claimed {
+        if let Err(e) = owner_claim(env, route, &mut budget).await {
+            let _: serde_json::Value = stub_json(
+                &stub,
+                route,
+                "/_do/push/abort",
+                &serde_json::json!({ "push_id": push.0 }),
+                &mut budget,
+            )
+            .await
+            .unwrap_or_default();
+            return Err(e);
+        }
+    }
     let bucket = Bucket::new(env.bucket("BUCKET")?, RepoId(begin.repo_id));
 
     // a post-begin failure must close the open push row now — leaving it for the
@@ -581,6 +703,7 @@ fn leak_reason(m: &str) -> &'static str {
         "deletion of the current branch prohibited" => "deletion of the current branch prohibited",
         "missing necessary objects" => "missing necessary objects",
         "gc ran during push, retry" => "gc ran during push, retry",
+        "ref is pinned" => "ref is pinned",
         _ => "failed to update ref",
     }
 }
@@ -610,4 +733,63 @@ fn report_status_200(
     };
     wire::write_report_status(&mut w, unpack.as_ref().map(|_|()).map_err(String::as_str), results, &hdr.caps)?;
     git_resp(w.out, "application/x-git-receive-pack-result")
+}
+
+/// Integer env knob, edge side — mirrors RepoDo::env_i64.
+fn env_i64(env: &Env, name: &str, default: i64) -> i64 {
+    env.var(name)
+        .ok()
+        .and_then(|v| v.to_string().parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+/// A26: claim one of the owner's GE_QUOTA_MAX_REPOS_PER_OWNER slots in the
+/// `owner!<owner>` registry DO — the same RepoDo class under a name no repo route
+/// can produce (`!` fails seg_ok), so no extra migration or binding is needed.
+/// `<= 0` disables the cap entirely (no registry hop). Over-cap -> Error::Limit,
+/// which lands in the client's `unpack` line via the A2 arm.
+async fn owner_claim(env: &Env, route: &RepoRoute, budget: &mut ReqBudget) -> Result<(), Error> {
+    if env_i64(env, "GE_QUOTA_MAX_REPOS_PER_OWNER", 50) <= 0 {
+        return Ok(());
+    }
+    let stub = env
+        .durable_object("REPO")
+        .map_err(|e| Error::Internal(e.to_string()))?
+        .id_from_name(&format!("owner!{}", route.owner))
+        .map_err(|e| Error::Internal(e.to_string()))?
+        .get_stub()
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    let mut init = worker::RequestInit::new();
+    init.with_method(Method::Post);
+    let mut r = worker::Request::new_with_init("https://do/_owner/claim", &init)
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    route.apply_headers(&mut r)?;
+    budget.charge(1)?;
+    let resp = stub.fetch_with_request(r).await?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp).await);
+    }
+    Ok(())
+}
+
+/// Release the owner's quota slot on delete. The claim row lives in the
+/// `owner!<owner>` registry DO — `purge_repo` only wipes the repo's own DO, so
+/// without this hop a deleted repo's slot would leak. Best-effort: the tombstone
+/// is already durable, a failed release just leaves a claim the owner can exceed.
+async fn owner_release(env: &Env, route: &RepoRoute) {
+    let Ok(ns) = env.durable_object("REPO") else { return };
+    let Ok(id) = ns.id_from_name(&format!("owner!{}", route.owner)) else {
+        return;
+    };
+    let Ok(stub) = id.get_stub() else { return };
+    let mut init = worker::RequestInit::new();
+    init.with_method(Method::Post);
+    let mut r = match worker::Request::new_with_init("https://do/_owner/release", &init) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    if route.apply_headers(&mut r).is_err() {
+        return;
+    }
+    let _ = stub.fetch_with_request(r).await;
 }

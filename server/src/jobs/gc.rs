@@ -296,7 +296,11 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
                 }
             }
             commit_ids(&sql, &ids, &kids, &mut bits)?; // span B: expansion commits
-            super::heartbeat(&sql, job.id)?; // a progressing slice is not a straggler
+            // CAS heartbeat: a progressing slice is not a straggler — and a stale
+            // one (requeued + reclaimed) stops before its next write (A19)
+            if !super::heartbeat(&sql, job)? {
+                return Err(super::stale_lease());
+            }
             if budget.spent_80pct() {
                 break;
             }
@@ -304,7 +308,9 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
         let rest: Vec<String> = batch.iter().filter(|s| !load_ids.contains(*s)).cloned().collect();
         if !rest.is_empty() {
             commit_ids(&sql, &rest, &[], &mut bits)?; // blobs/misses: nothing to read
-            super::heartbeat(&sql, job.id)?;
+            if !super::heartbeat(&sql, job)? {
+                return Err(super::stale_lease());
+            }
         }
     }
 }
@@ -435,7 +441,7 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
             )
             .await?
         };
-        match build(d, &sql, &bucket, &key, out, &mut pos, job.id, budget).await? {
+        match build(d, &sql, &bucket, &key, out, &mut pos, job, budget).await? {
             Flow::Yield => return Ok(SliceOutcome::Continue { cursor: "{}".into() }),
             Flow::Done => return Ok(SliceOutcome::Done),
             Flow::Retry(e) => return Err(e), // 4.4 backoff; second failure -> Rebuild
@@ -454,7 +460,7 @@ async fn build(
     key: &str,
     mut out: PackWriter,
     pos: &mut Pos,
-    job_id: i64,
+    job: &Job,
     budget: &mut SliceBudget,
 ) -> Result<Flow, Error> {
     let cands: Vec<String> = exec(sql, "SELECT pack_id FROM marked ORDER BY pack_id", vec![])?
@@ -570,7 +576,7 @@ async fn build(
                             // + WriterCkpt
                             if let Some(f) = flush(
                                 d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur,
-                                job_id, budget,
+                                job, budget,
                             )
                             .await?
                             {
@@ -594,7 +600,7 @@ async fn build(
                         pos.frag = p.saturating_sub(l.offset);
                         if let Some(f) = flush(
                             d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur,
-                            job_id, budget,
+                            job, budget,
                         )
                         .await?
                         {
@@ -642,7 +648,7 @@ async fn build(
             // flush per chunk, not per batch: `out.part` would otherwise accumulate the
             // whole 90-entry batch (~1.4 GiB of buffered pack bytes) and OOM the isolate
             if let Some(f) = flush(
-                d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job_id, budget,
+                d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job, budget,
             )
             .await?
             {
@@ -654,10 +660,13 @@ async fn build(
             staged.clear();
         }
         // a multi-MiB chunk loop can run past the 60 s straggler window on slow R2 —
-        // heartbeat so repair doesn't requeue a live consolidate into a duplicate slice
-        super::heartbeat(sql, job_id)?;
+        // CAS-heartbeat so repair doesn't requeue a live consolidate into a duplicate
+        // slice, and a duplicate that lost the row stops before its next write (A19)
+        if !super::heartbeat(sql, job)? {
+            return Err(super::stale_lease());
+        }
         if let Some(f) = flush(
-            d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job_id, budget,
+            d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job, budget,
         )
         .await?
         {
@@ -683,7 +692,7 @@ async fn flush(
     staged: &mut Vec<ObjRow>,
     spans: &mut VecDeque<Span>,
     cur: &Option<Span>,
-    job_id: i64,
+    job: &Job,
     budget: &mut SliceBudget,
 ) -> Result<Option<Flow>, Error> {
     let mut news: Vec<(u16, String)> = Vec::new();
@@ -737,7 +746,11 @@ async fn flush(
     while spans.front().map(|s| s.off + s.len <= durable) == Some(true) {
         spans.pop_front();
     }
-    super::heartbeat(sql, job_id)?; // checkpoint span: refresh the repair lease
+    // checkpoint span: refresh the repair lease — CAS on it, so a stale slice
+    // that lost the row stops instead of heartbeating the new owner's started_at
+    if !super::heartbeat(sql, job)? {
+        return Err(super::stale_lease());
+    }
     Ok(None)
 }
 

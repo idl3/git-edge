@@ -3,6 +3,7 @@
 
 pub mod gc;
 pub mod janitor;
+pub mod purge;
 
 use worker::{SqlStorage, SqlStorageValue as V};
 
@@ -17,6 +18,7 @@ pub enum JobKind {
     GcMark,
     GcConsolidate,
     GcSweep,
+    PurgeRepo,
 }
 impl JobKind {
     pub fn as_str(&self) -> &'static str {
@@ -25,6 +27,7 @@ impl JobKind {
             JobKind::GcMark => "gc_mark",
             JobKind::GcConsolidate => "gc_consolidate",
             JobKind::GcSweep => "gc_sweep",
+            JobKind::PurgeRepo => "purge_repo",
         }
     }
     fn of(s: &str) -> Result<Self, Error> {
@@ -33,6 +36,7 @@ impl JobKind {
             "gc_mark" => Ok(JobKind::GcMark),
             "gc_consolidate" => Ok(JobKind::GcConsolidate),
             "gc_sweep" => Ok(JobKind::GcSweep),
+            "purge_repo" => Ok(JobKind::PurgeRepo),
             k => Err(Error::Internal(format!("unknown job kind {k}"))),
         }
     }
@@ -45,6 +49,10 @@ pub struct Job {
     pub attempts: u32,
     pub cursor: Option<String>,
     pub payload: String,
+    /// The fencing token `dispatch` wrote at claim time. Heartbeats CAS on it
+    /// (A19): a slice whose row was requeued as stranded and reclaimed no longer
+    /// matches, and must stop writing before the fenced outcome span runs.
+    pub lease: String,
 }
 
 pub enum SliceOutcome {
@@ -73,13 +81,39 @@ impl SliceBudget {
 
 /// A checkpoint span refreshes the lease: `repair` may only requeue a row whose started_at
 /// has gone stale — a progressing slice heartbeats and is never mistaken for a stranded one.
-pub fn heartbeat(sql: &SqlStorage, job_id: i64) -> Result<(), Error> {
+///
+/// A19: the heartbeat is a CAS on the fencing token, not a bare `id` match. A slice
+/// whose row was repair-requeued (`state='queued'`) or reclaimed under a fresh lease
+/// (`lease` changed) gets `false` — it must stop immediately via `stale_lease()`,
+/// because every write it still had queued belongs to the new lease-holder, and an
+/// unconditional `started_at` bump would mask a genuinely stalled new owner from
+/// `repair`.
+pub fn heartbeat(sql: &SqlStorage, job: &Job) -> Result<bool, Error> {
     sql.exec(
-        "UPDATE jobs SET started_at=? WHERE id=? AND state='running'",
-        Some(vec![V::from(platform::now_ms()), V::from(job_id)]),
+        "UPDATE jobs SET started_at=? WHERE id=? AND state='running' AND lease=?",
+        Some(vec![
+            V::from(platform::now_ms()),
+            V::from(job.id),
+            V::from(job.lease.as_str()),
+        ]),
     )
     .map_err(|e| Error::Storage(e.to_string()))?;
-    Ok(())
+    #[derive(serde::Deserialize)]
+    struct N {
+        n: i64,
+    }
+    sql.exec("SELECT changes() AS n", Some(vec![]))
+        .map_err(|e| Error::Storage(e.to_string()))?
+        .one::<N>()
+        .map(|r| r.n == 1)
+        .map_err(|e| Error::Storage(e.to_string()))
+}
+
+/// Returned by a slice whose heartbeat CAS failed: the row belongs to another
+/// lease now. The fenced outcome span no-ops on it, `attempts` is not consumed,
+/// and dispatch reports the event as `stale`, never a retry.
+pub fn stale_lease() -> Error {
+    Error::Internal("stale job lease".into())
 }
 
 /// Sync; writes the row only (A3). Dedups against 'queued' rows: at most one queued row per kind.
@@ -132,8 +166,8 @@ pub fn repair(sql: &SqlStorage) -> Result<(), Error> {
     )
     .map_err(|e| Error::Storage(e.to_string()))?;
     sql.exec(
-        "UPDATE jobs SET state='queued', run_at=?, attempts=attempts+1, last_error='stranded mid-slice' \
-         WHERE state='running' AND started_at < ? AND attempts < 8",
+        "UPDATE jobs SET state='queued', run_at=?, attempts=attempts+1, last_error='stranded mid-slice', \
+         lease=NULL WHERE state='running' AND started_at < ? AND attempts < 8",
         Some(vec![V::from(now), V::from(now.saturating_sub(60_000))]),
     )
     .map_err(|e| Error::Storage(e.to_string()))?;
@@ -229,8 +263,30 @@ pub async fn dispatch(d: &RepoDo) -> Result<(), Error> {
     if let Err(e) = &r {
         worker::console_log!("jobs::dispatch: {e}");
     }
+    // A18: `jobs_dead > 0` is the wedge signal — one gauge datapoint per alarm
+    // pass while any row is dead, so an external alarm does not need _state polls.
+    dead_gauge(d);
     let _ = rearm(d).await;
     r
+}
+
+/// A18 dead-job gauge: high-cardinality-safe (repo index, fixed blobs, one double).
+/// Query errors — e.g. a `purge_repo` slice dropped the schema — are ignored.
+fn dead_gauge(d: &RepoDo) {
+    #[derive(serde::Deserialize)]
+    struct N {
+        n: i64,
+    }
+    let dead = d
+        .q("SELECT COUNT(*) AS n FROM jobs WHERE state='dead'", vec![])
+        .ok()
+        .and_then(|c| c.one::<N>().ok())
+        .map(|r| r.n)
+        .unwrap_or(0);
+    if dead > 0 {
+        let repo = platform::do_id_name(&d.state).unwrap_or_else(|| "-".into());
+        platform::jobs_dead_gauge(&d.env, &repo, dead);
+    }
 }
 
 async fn dispatch_inner(d: &RepoDo) -> Result<(), Error> {
@@ -273,9 +329,16 @@ async fn dispatch_inner(d: &RepoDo) -> Result<(), Error> {
         attempts: u32::try_from(r.attempts).unwrap_or(0),
         cursor: r.cursor.clone(),
         payload: r.payload.clone(),
+        lease: lease.clone(),
     };
+    // A17 metrics: the repo label comes from ctx.id.name, not meta — a purge_repo
+    // slice wipes meta mid-flight and the label must survive it.
+    let repo = platform::do_id_name(&d.state).unwrap_or_else(|| "-".into());
+    let attempt = job.attempts.saturating_add(1);
+    platform::job_event(&d.env, &repo, job.kind.as_str(), "start", "ok", attempt, 0, false, "");
     let mut budget = SliceBudget::fresh();
     let out = run_slice(d, &job, &mut budget).await;
+    let dur_ms = (js_sys::Date::now() - budget.started_ms).max(0.0) as i64;
     worker::console_log!("job {}#{} attempts={} -> {}", job.kind.as_str(), job.id, job.attempts,
         match &out { Ok(SliceOutcome::Done) => "done".into(),
             Ok(SliceOutcome::Continue { .. }) => "continue".into(),
@@ -288,9 +351,20 @@ async fn dispatch_inner(d: &RepoDo) -> Result<(), Error> {
     let fenced = |q: &str, mut args: Vec<V>| -> Result<bool, Error> {
         args.push(V::from(r.id));
         args.push(V::from(lease.as_str()));
-        d.q(q, args)?;
-        Ok(d.changes()? == 1)
+        match d.q(q, args) {
+            Ok(_) => Ok(d.changes()? == 1),
+            // a purge_repo slice drops the schema under its own outcome span —
+            // "no such table" means the row is gone for good: not landed, not an
+            // error worth logging on every successful purge
+            Err(e) if e.message().contains("no such table") => Ok(false),
+            Err(e) => Err(e),
+        }
     };
+    let emit = |event: &str, outcome: &str, will_retry: bool, class: &str| {
+        platform::job_event(&d.env, &repo, job.kind.as_str(), event, outcome, attempt, dur_ms, will_retry, class);
+    };
+    // a fenced write that lands nothing means this slice lost the row mid-flight —
+    // report `stale`, never a retry (the new owner's attempt must not consume ours)
     match out {
         Ok(SliceOutcome::Done) => {
             if fenced("DELETE FROM jobs WHERE id=? AND state='running' AND lease=?", vec![])? {
@@ -301,34 +375,50 @@ async fn dispatch_inner(d: &RepoDo) -> Result<(), Error> {
                     // chain completed — clear the resurrection counters repair uses
                     d.q("DELETE FROM meta WHERE key LIKE 'resurrected.gc_%'", vec![])?;
                 }
+                emit("done", "ok", false, "");
+            } else {
+                emit("done", "stale", false, "");
             }
         }
         Ok(SliceOutcome::Continue { cursor }) => {
-            fenced(
+            if fenced(
                 "UPDATE jobs SET state='queued', run_at=?, cursor=?, lease=NULL WHERE id=? AND state='running' AND lease=?",
                 vec![V::from(now), V::from(cursor.as_str())],
-            )?;
+            )? {
+                emit("continue", "ok", true, "");
+            } else {
+                emit("continue", "stale", false, "");
+            }
         }
         Ok(SliceOutcome::Reschedule { run_at }) => {
-            fenced(
+            if fenced(
                 "UPDATE jobs SET state='queued', run_at=?, cursor=NULL, lease=NULL WHERE id=? AND state='running' AND lease=?",
                 vec![V::from(run_at)],
-            )?;
+            )? {
+                emit("reschedule", "ok", true, "");
+            } else {
+                emit("reschedule", "stale", false, "");
+            }
         }
         Err(e) => {
-            let attempts = job.attempts.saturating_add(1);
-            let backoff = (30_000i64).saturating_mul(1i64.checked_shl(attempts.min(20)).unwrap_or(1 << 20));
+            let backoff = (30_000i64).saturating_mul(1i64.checked_shl(attempt.min(20)).unwrap_or(1 << 20));
             let next = now.saturating_add(backoff.min(3_600_000));
-            if attempts >= 8 {
-                fenced(
+            if attempt >= 8 {
+                if fenced(
                     "UPDATE jobs SET state='dead', last_error=? WHERE id=? AND state='running' AND lease=?",
                     vec![V::from(e.to_string().as_str())],
-                )?;
+                )? {
+                    emit("dead", "dead", false, e.class());
+                } else {
+                    emit("dead", "stale", false, e.class());
+                }
+            } else if fenced(
+                "UPDATE jobs SET state='queued', attempts=?, last_error=?, run_at=?, lease=NULL WHERE id=? AND state='running' AND lease=?",
+                vec![V::from(i64::from(attempt)), V::from(e.to_string().as_str()), V::from(next)],
+            )? {
+                emit("retry", "retry", true, e.class());
             } else {
-                fenced(
-                    "UPDATE jobs SET state='queued', attempts=?, last_error=?, run_at=?, lease=NULL WHERE id=? AND state='running' AND lease=?",
-                    vec![V::from(i64::from(attempts)), V::from(e.to_string().as_str()), V::from(next)],
-                )?;
+                emit("retry", "stale", false, e.class());
             }
         }
     }
@@ -342,5 +432,6 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         JobKind::GcMark => gc::gc_mark(d, job, budget).await,
         JobKind::GcConsolidate => gc::gc_consolidate(d, job, budget).await,
         JobKind::GcSweep => gc::gc_sweep(d).await,
+        JobKind::PurgeRepo => purge::run_slice(d, job, budget).await,
     }
 }
