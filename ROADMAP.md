@@ -85,7 +85,7 @@ The original (private-repo) benchmark flushed out two real bugs, both long fixed
 | 20 | **Custom domain + Cloudflare Access** | zero-code auth upgrade if a zone exists | S |
 | 21 | **Git LFS** | the structural answer for >100 MB assets; the profile rarely needs it — revisit when a real workload does | L |
 | 22 | **Streaming no-walk clone** | removes the 200k-commit bound; irrelevant below it | M |
-| 23 | **Verbatim consolidated-pack fast path** | post-GC one pack covers all reachable objects → stream it verbatim as the fetch response; ~1 subrequest per R2 `get` instead of thousands of entry reads. Lifts the 110k–263k-object clone wall for default clients. Design: `findings/scale-ceilings.md` C2 | M |
+| 23 | ~~**Verbatim consolidated-pack fast path**~~ | done — packs_live=1 + plain-clone shape streams the live pack verbatim as the fetch response; 1 subrequest per R2 `get` instead of thousands of entry reads (A29). Lifts the 110k–263k-object clone wall for default clients once a repo consolidates | M |
 | 24 | **`packfile-uris` offload** | same coverage test as #23 but hands the client a signed `/packs/<key>` URL — clone spend ~10 subrequests, bandwidth bypasses the Worker. Opt-in (`fetch.uriprotocols` defaults empty). Design: `findings/scale-ceilings.md` C1 | M |
 
 ## Wild bucket — parked, worth remembering
