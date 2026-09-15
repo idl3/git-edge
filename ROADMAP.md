@@ -38,29 +38,32 @@ The benchmark also flushed out two real bugs (both fixed in this branch):
 | 4 | **Bulk import path** | staged `git push` works but is a client-side workaround. Options: (a) `git-edge-import` CLI that auto-slices a local repo into <80 MB pushes — zero server work; (b) `POST /_admin/import` accepting an R2-uploaded bundle/pack — eliminates the body cap entirely | S–M |
 | 5 | **Anonymous/public read** | agents share read-only links constantly; today every clone needs a token. Per-repo `public` flag on the tokens API, read-side only | S |
 | 6 | **Dead-job / GC alerting** | `jobs_dead>0` in `_state` is the wedge signal; emit it to Analytics Engine (or poll from a cron Worker) so a livelocked repo pages instead of festering | S |
+| 7 | **Job-lifecycle metrics** | artifact-fs's NDJSON schema (phase/state/attempt/duration/retryable) is the model: emit mark/consolidate/sweep outcome datapoints, not just request-level — makes a wedged GC visible without `_state` polling | S |
+| 8 | **Agent skill** | ship `.devin/skills/git-edge` (or AGENTS.md section): clone/push URLs, `_admin/tokens` minting, staged-push recipe for >80 MiB, credential-helper config (never tokens in URLs — process-listing leak), `_state` introspection | S |
 
 ## Priority 1 — production hardening
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| 7 | **Repo quota + abuse limits** | a public endpoint with unbounded repo creation invites abuse; per-owner object/byte caps enforced at push commit | M |
-| 8 | **Rate limiting** | per-token or per-IP throttles on receive-pack; Cloudflare rate-limit rules can cover most of this at the zone, no code | S |
-| 9 | **Export endpoint** | `GET /:o/:r/_admin/export` → streams a `git bundle` of live refs. Disposability = easy in *and* easy out; also the backup story | M |
-| 10 | **`x-ge-subrequests` on error responses** | audit P3 — errors currently drop the accounting header | XS |
-| 11 | **Lease-overlap hardening** | audit P3 — a `running` job requeued after 60 s can overlap its original slice; heartbeats narrow it, fencing is the guard. Tighten or document | S |
-| 12 | **`coalesce` `unwrap_or(u32::MAX)`** | audit P3 — a value bounded by WINDOW should fail loudly, not saturate | XS |
-| 13 | **ls-refs caching** | agents poll `ls-remote` constantly; `info/refs` for a repo whose `refs_version` is unchanged is byte-identical — cache on it | S |
+| 9 | **Repo quota + abuse limits** | a public endpoint with unbounded repo creation invites abuse; per-owner object/byte caps enforced at push commit | M |
+| 10 | **Rate limiting** | per-token or per-IP throttles on receive-pack; Cloudflare rate-limit rules can cover most of this at the zone, no code | S |
+| 11 | **Export endpoint** | `GET /:o/:r/_admin/export` → streams a `git bundle` of live refs. Disposability = easy in *and* easy out; also the backup story | M |
+| 12 | **`x-ge-subrequests` on error responses** | audit P3 — errors currently drop the accounting header | XS |
+| 13 | **Lease-overlap hardening** | audit P3 — a `running` job requeued after 60 s can overlap its original slice; heartbeats narrow it, fencing is the guard. Tighten or document | S |
+| 14 | **`coalesce` `unwrap_or(u32::MAX)`** | audit P3 — a value bounded by WINDOW should fail loudly, not saturate | XS |
+| 15 | **ls-refs caching** | agents poll `ls-remote` constantly; a lazy-mount client (artifact-fs-style) polls HEAD/refs every ~500 ms on top — `info/refs` for an unchanged `refs_version` is byte-identical, cache on it | S |
+| 16 | **Ref pinning** | `POST /_admin/pin {ref, sha}` — frozen refs that reject updates; the server-side analog of artifact-fs's `--require-commit` verified acquisition, for deploy-snapshot workflows | S |
 
 ## Priority 2 — worthwhile, not blocking
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| 14 | **`--atomic` push** | single-ref agent pushes don't need it; multi-ref CI flows do | M |
-| 15 | **Repo rename / owner move** | cosmetic; delete+repush covers it | S |
-| 16 | **Per-ref token scopes / deploy keys** | read/write covers the profile; per-branch ACLs are the GitHub-shaped feature nobody asked for yet | M |
-| 17 | **Custom domain + Cloudflare Access** | zero-code auth upgrade if a zone exists | S |
-| 18 | **Git LFS** | the structural answer for >100 MB assets; the profile rarely needs it — revisit when a real workload does | L |
-| 19 | **Streaming no-walk clone** | removes the 200k-commit bound; irrelevant below it | M |
+| 17 | **`--atomic` push** | single-ref agent pushes don't need it; multi-ref CI flows do | M |
+| 18 | **Repo rename / owner move** | cosmetic; delete+repush covers it | S |
+| 19 | **Per-ref token scopes / deploy keys** | read/write covers the profile; per-branch ACLs are the GitHub-shaped feature nobody asked for yet | M |
+| 20 | **Custom domain + Cloudflare Access** | zero-code auth upgrade if a zone exists | S |
+| 21 | **Git LFS** | the structural answer for >100 MB assets; the profile rarely needs it — revisit when a real workload does | L |
+| 22 | **Streaming no-walk clone** | removes the 200k-commit bound; irrelevant below it | M |
 
 ## Wild bucket — parked, worth remembering
 
@@ -80,6 +83,12 @@ The benchmark also flushed out two real bugs (both fixed in this branch):
   **`tree:`/`combine:` filters**, **`object-info`**, **`bundle-uri`** —
   deliberately unadvertised; add when a client actually needs them.
 - **Jurisdiction-pinned DOs** — EU repos in EU DOs if compliance demands it.
+- **`git-edge mount` via artifact-fs** — Cloudflare's artifact-fs is a FUSE
+  lazy-mount client that works with *any* git remote, and git-edge already
+  speaks everything it needs (v2, `blob:none`, promisor backfill,
+  `allowAnySHA1InWant`). Documenting the mount path — or running their e2e
+  suite with `AFS_E2E_REPO` pointed at git-edge — is the cheapest
+  lazy-checkout story available; building our own mount client is not.
 
 ## Explicit non-goals
 
