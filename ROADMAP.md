@@ -85,12 +85,14 @@ The original (private-repo) benchmark flushed out two real bugs, both long fixed
 | 20 | **Custom domain + Cloudflare Access** | zero-code auth upgrade if a zone exists | S |
 | 21 | **Git LFS** | the structural answer for >100 MB assets; the profile rarely needs it — revisit when a real workload does | L |
 | 22 | **Streaming no-walk clone** | removes the 200k-commit bound; irrelevant below it | M |
+| 23 | **Verbatim consolidated-pack fast path** | post-GC one pack covers all reachable objects → stream it verbatim as the fetch response; ~1 subrequest per R2 `get` instead of thousands of entry reads. Lifts the 110k–263k-object clone wall for default clients. Design: `findings/scale-ceilings.md` C2 | M |
+| 24 | **`packfile-uris` offload** | same coverage test as #23 but hands the client a signed `/packs/<key>` URL — clone spend ~10 subrequests, bandwidth bypasses the Worker. Opt-in (`fetch.uriprotocols` defaults empty). Design: `findings/scale-ceilings.md` C1 | M |
 
 ## Wild bucket — parked, worth remembering
 
-- **`packfile-uris` offload** — advertise pack segments as R2 URLs (public or
-  presigned) so fetch bandwidth bypasses the Worker entirely. Cheap to try,
-  big subrequest/bandwidth win. Protocol v2 supports it today.
+- **Synthetic-ref object seeding** — split an oversize commit's objects across
+  staging refs so the real push dedups against them; client-side fix for
+  TypeScript-class imports, zero server changes (`findings/scale-ceilings.md` I2).
 - **GitHub URL import** — `POST /_admin/import {url}` server-side clones a
   public GitHub repo. No client staging at all; Worker outbound fetch has no
   body cap on the *response* side. Would obsolete item 4 for public sources.
