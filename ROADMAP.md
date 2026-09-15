@@ -5,21 +5,42 @@ hundred MB and tens of thousands of commits, high churn (create/push/dispose),
 API-driven workflows, minimal ceremony. Not a monorepo host, not a GitHub
 replacement.
 
-## Can real repos fit? (benchmarked 2026-09-15)
+## Can real repos fit? (benchmarked)
 
-Two production Rails repos pushed to a local worker, staged by commit ranges:
+Public repos staged-pushed to a local worker via `tests/bench/oss-bench.sh`
+(<60 MiB / <30k objects per slice), then cloned back:
 
 | Repo | Commits | Objects | Pack size | Import | Clone | Result |
 |---|---|---|---|---|---|---|
-| atlas-core `master` | 5,376 | 150k (all refs) | 153 MiB | 4 pushes, ~63 s | 11.6 s, fsck clean | fits |
-| grain-core `main` | 6,570 | 403k (all refs) | 434 MiB | 8 pushes, ~26 s | 20.3 s, fsck clean | fits |
+| sinatra/sinatra | 4,684 | 22.6k | 8 MiB | 1 push, 11 s | 2 s, fsck clean | fits |
+| expressjs/express | 6,169 | 32.5k | 11 MiB | 2 pushes, 15 s | 8 s, fsck clean | fits |
+| vitejs/vite | 9,678 | 110k | 75 MiB | 4 pushes, 337 s | 133 s, fsck clean | fits |
+| facebook/react | 21,698 | 263k | 1,078 MiB | 25 pushes, 337 s | **413** | import fits, clone over budget |
+| rails/rails | 99,661 | 787k | 308 MiB | 39 pushes, 644 s | **413** | import fits, clone over budget |
+| microsoft/TypeScript | 39,366 | 945k | 2,805 MiB | stopped | — | **import infeasible** — single commit introduces 222k objects; can't stage below one-commit granularity |
 
-Every structural limit has 5–25× headroom at this scale: 200k-commit fetch
-walk, 1M objects per fetch, 2M objects per pack, 2 GiB pending pack, 65k refs.
-The binding constraint is the ~100 MB per-request body cap on initial import —
-worked around today by staged pushes.
+**The binding constraints are now mapped.** Import scales far past the profile
+(rails' 787k objects landed fine in 39 slices); the walls that bite are:
 
-The benchmark also flushed out two real bugs (both fixed in this branch):
+- **~100 MB request body cap** on initial import — staged pushes (or the
+  `tools/git-edge-import.sh` slicer) are the workaround.
+- **Single-commit object explosions can't be staged** — TypeScript carries a
+  commit that alone introduces ~222k objects; staged-push granularity is one
+  commit, so no client-side slicing can get it under the ingest budget. This
+  is the concrete case for server-side import (`POST /_admin/import`).
+- **Per-request subrequest budget on clone/fetch** — somewhere between
+  110k objects (vite ✓) and 263k objects (react ✗) a full clone exhausts the
+  request budget and the DO returns `Error::Budget` → HTTP 413 mid-walk.
+  `blob:none` does not help: the budget is spent on object-index reads
+  (commits + trees), not blob bytes. Everything else has 5–25× headroom at
+  profile scale (200k-commit walk, 1M objects/fetch, 2M objects/pack,
+  2 GiB pending pack, 65k refs).
+
+For the small-app profile — typically well under 50k objects — both clone and
+import sit comfortably inside limits. Repos in the react/rails class import
+fine but need a lift on the fetch budget before they can be cloned.
+
+The original (private-repo) benchmark flushed out two real bugs, both long fixed:
 
 - **Clone 413 on wide histories** — `read_entries` bounds one call at 48 MiB of
   coalesced spans; a 10k-tree chunk or a multi-pack commit prefetch can exceed

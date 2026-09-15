@@ -107,10 +107,16 @@ the previous one, so each push is a clean fast-forward. Plain `--topo-order`
 can land a boundary on a merge's side-branch commit — pushing it moves the ref
 sideways and is rejected non-fast-forward.
 
-`tools/git-edge-import.sh` (landing) automates this slice-and-push loop. Then
-verify: clone back and `git fsck --strict`. Old repos may carry pre-existing
-fsck findings (e.g. `zeroPaddedFilemode`) — compare against fsck of the source,
-not against empty output.
+`tools/git-edge-import.sh` automates this slice-and-push loop (plus resume,
+`--all-branches`, `--dry-run`, and 429 retry):
+
+```bash
+GE_TOKEN=<write-token> tools/git-edge-import.sh <local-repo-or-url> <edge-url>
+```
+
+Then verify: clone back and `git fsck --strict`. Old repos may carry
+pre-existing fsck findings (e.g. `zeroPaddedFilemode`) — compare against fsck
+of the source, not against empty output.
 
 ## Introspection
 
@@ -138,6 +144,7 @@ wedged. Pushes are CAS; a stale push is rejected — refetch and retry, don't
 | Push links (tree edges) per push | 1,000,000 | `push references too many objects` → smaller slices (seen on repos with giant trees) |
 | Push rate | 30/min per credential per repo (`GE_RATE_PUSHES_PER_MIN`) | HTTP 429 + `Retry-After` → wait and retry |
 | Quotas | 2M objects / 4 GiB stored per repo, 50 repos/owner (`GE_QUOTA_MAX_*`) | `unpack objects N > GE_QUOTA_MAX_OBJECTS=M` etc. — the message names the cap |
+| Full clone scale | ~110k objects verified, ~260k fails | `fetch request budget exhausted` → HTTP 413 mid-walk — index reads (commits+trees) spend the budget, so `--filter=blob:none` does NOT help. Imports past this size work; only the clone back fails |
 | Client floor | git ≥ 2.26 | v0/v1 fetch → `ERR protocol v2 required` |
 
 Each push lands as its own pack; GC consolidates after a ~10 min quiet window

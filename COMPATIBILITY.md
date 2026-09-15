@@ -200,8 +200,12 @@ truncation, or corrupted ref state.
 | Push 20 MiB blob → GC consolidate → clone (local) | streamed verbatim copy, fsck clean |
 | Push ~95 MiB pack (prod) | 35 s — near the ~100 MB platform body cap |
 | Push ~130 MiB pack (prod) | HTTP 413 at the zone before app code — split the push |
-| Import atlas-core `master` (5,376 commits, ~150k objects, 153 MiB pack) | 4 staged pushes, ~63 s; clone 11.6 s, fsck clean |
-| Import grain-core `main` (6,570 commits, ~403k objects, 434 MiB pack) | 8 staged pushes, ~26 s; clone 20.3 s, fsck clean |
+| Import sinatra/sinatra (4,684 commits, 22.6k objects, 8 MiB pack) | 1 push, 11 s; clone 2 s, fsck clean |
+| Import expressjs/express (6,169 commits, 32.5k objects, 11 MiB pack) | 2 staged pushes, 15 s; clone 8 s, fsck clean |
+| Import vitejs/vite (9,678 commits, 110k objects, 75 MiB pack) | 4 staged pushes, 337 s; clone 133 s, fsck clean |
+| Import facebook/react (21,698 commits, 263k objects, 1,078 MiB pack) | 25 staged pushes, 337 s; **clone fails** — `Error::Budget` → HTTP 413 mid-walk (per-request subrequest budget) |
+| Import rails/rails (99,661 commits, 787k objects, 308 MiB pack) | 39 staged pushes, 644 s; **clone fails** — same budget wall; `blob:none` doesn't help (budget is index reads, not blob bytes) |
+| Import microsoft/TypeScript (39,366 commits, 945k objects, 2.8 GiB pack) | **import infeasible** — one commit alone adds ~222k objects; staging can't split below a commit |
 
 ## Interoperability test matrix (git 2.54, live)
 
