@@ -144,7 +144,7 @@ wedged. Pushes are CAS; a stale push is rejected — refetch and retry, don't
 | Push links (tree edges) per push | 1,000,000 | `push references too many objects` → smaller slices (seen on repos with giant trees) |
 | Push rate | 30/min per credential per repo (`GE_RATE_PUSHES_PER_MIN`) | HTTP 429 + `Retry-After` → wait and retry |
 | Quotas | 2M objects / 4 GiB stored per repo, 50 repos/owner (`GE_QUOTA_MAX_*`) | `unpack objects N > GE_QUOTA_MAX_OBJECTS=M` etc. — the message names the cap |
-| Full clone scale | ~110k objects verified, ~260k fails | `fetch request budget exhausted` → HTTP 413 mid-walk — index reads (commits+trees) spend the budget, so `--filter=blob:none` does NOT help. Imports past this size work; only the clone back fails |
+| Full clone scale | ~110k objects verified on the walking path; verbatim fast path (A29) lifts it | When `packs_live: 1` (post-GC consolidation), a plain clone streams the live pack verbatim — ~1 subrequest. Otherwise index reads (commits+trees) spend the 9,000 budget → HTTP 413 mid-walk between ~110k–263k objects; `--filter=blob:none` does NOT help |
 | Client floor | git ≥ 2.26 | v0/v1 fetch → `ERR protocol v2 required` |
 
 Each push lands as its own pack; GC consolidates after a ~10 min quiet window

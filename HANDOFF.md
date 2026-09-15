@@ -1,4 +1,4 @@
-# git-edge handoff — 2026-09-15
+# git-edge handoff — 2026-09-15 (C2 shipped)
 
 Serverless Git smart-HTTP host: Rust/WASM Cloudflare Worker + per-repo SQLite
 Durable Object + R2 packfiles. Repo: `idl3/git-edge`. Main is at `257184b`,
@@ -7,36 +7,50 @@ clean tree, all work merged (PRs #7–#15).
 ## Where things stand
 
 All P0/P1 roadmap items are done except server-side import (#4b — deliberately
-deferred). Shipped this session: repo delete+purge, public read, ref pinning,
-bundle export, job metrics + dead-job alerting, lease fencing, quotas, rate
-limits, ls-refs memoization, `x-ge-subrequests` on errors, agent skill
-(`.devin/skills/git-edge/SKILL.md`), `tools/git-edge-import.sh`,
-`tests/bench/oss-bench.sh`. artifact-fs e2e: 23 pass / 0 fail / 3 skip —
-protocol-compatible today.
+deferred). **C2 (verbatim consolidated-pack fast path, ROADMAP #23) is done**:
+a plain-clone-shaped fetch whose wants resolve into the repo's single live
+pack streams that pack verbatim — one R2 GET, `x-ge-subrequests: 1` —
+gated on empty haves and no filter/shallow/deepen args so a superset pack
+can't violate those contracts. See `repo_do/mod.rs` `consolidated_pack` +
+`VerbatimStream`; CONTRACTS A29.
+
+**Latent bug C2 exposed and fixed**: `PackWriter::append_stored` hashed each
+entry eagerly AND again at part upload (flush/checkpoint/finish are the only
+feeders by design), so every GC-consolidated pack stored a wrong trailer.
+Walking-path fetches never saw it (they rebuild the trailer); the verbatim
+path made it visible — `git fsck` caught it as an SHA1 mismatch. One-line
+fix in `store/mod.rs`; `GE_CONFORMANCE_GC=1` is the regression check
+(post-GC clone + fsck through C2).
+
+Verified live: full suite + `GE_CONFORMANCE_GC=1` PASS — post-GC repo at
+`packs_live:1` clones at 1 subrequest and passes `fsck --strict`.
 
 ## The two measured ceilings (next work)
 
 | Wall | Evidence | Fix order |
 |---|---|---|
-| **Clone** dies at `Error::Budget`→413 between 110k–263k objects (vite ✓ / react ✗ / rails ✗). `blob:none` doesn't help — spend is R2 entry reads, sqlite is free | benchmark round 10 | **C2 then C1** |
+| **Clone** dies at `Error::Budget`→413 between 110k–263k objects (vite ✓ / react ✗ / rails ✗). `blob:none` doesn't help — spend is R2 entry reads, sqlite is free | benchmark round 10 | ~~C2~~ **C1 next** |
 | **Import** can't stage a single commit with >ingest-budget objects (TypeScript: one commit = 222k objects) | `git-edge-import.sh` unsplittable-slice error | **I1** (I2 as interim) |
 
-**Design doc: `findings/scale-ceilings.md`** — read first. Recommended next
-implementation is **C2 (verbatim consolidated-pack fast path)**: when
-`packs_live:1` covers the full-clone send set, stream that pack verbatim
-instead of per-object `read_entries`. Verified premise: react sits at one live
-pack post-GC. Then **C1 (packfile-uris)** with signed `/packs/<key>` URLs.
+**Design doc: `findings/scale-ceilings.md`** — read first. Next
+implementation is **C1 (packfile-uris)** with signed `/packs/<key>` URLs:
+offloads the pack bytes off the Worker's subrequest/wall-clock budget
+entirely for clients that advertise the capability (git >= 2.41ish,
+off by default — most clients still take the C2 path). Then **I1**
+server-side import jobs.
 
-### C2 pointers
+### C1 pointers
 
-- Fetch path: `server/src/repo_do/mod.rs` `fetch_v2_inner` →
-  `generate::send_set` → `FetchStream` over `set.reads`.
-- Budget: `server/src/lib.rs` `ReqBudget` — `charge(1)` per R2 op;
-  `PAID_SUBREQUESTS = 9000`, 240s.
-- Gate to plain full clone only: wants=tip, empty haves, no filter/shallow/
-  deepen args. Superset objects are legal but must not violate shallow/filter
-  contracts.
-- Stream via `bucket.get(key)` → `body` — ~1 subrequest regardless of size.
+- C2's `consolidated_pack` gate + pack lookup is the same coverage test C1
+  wants — a `packfile-uris` capable request advertises the URI instead of
+  streaming.
+- Response shape: `wire::write_fetch_prelude` + a `packfile-uris` section
+  before `packfile` (protocol v2 fetch section ordering — check git docs).
+- Signing: see design doc for the `/packs/<key>` URL scheme; tokens stay
+  out of URLs, sign server-side.
+- Re-bench react/rails post-C2 first — C2 may already clear the measured
+  wall for consolidated repos; C1's remaining value is pre-GC and
+  multi-pack cases.
 
 ## Environment / workflow
 

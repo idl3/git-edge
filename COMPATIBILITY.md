@@ -203,8 +203,8 @@ truncation, or corrupted ref state.
 | Import sinatra/sinatra (4,684 commits, 22.6k objects, 8 MiB pack) | 1 push, 11 s; clone 2 s, fsck clean |
 | Import expressjs/express (6,169 commits, 32.5k objects, 11 MiB pack) | 2 staged pushes, 15 s; clone 8 s, fsck clean |
 | Import vitejs/vite (9,678 commits, 110k objects, 75 MiB pack) | 4 staged pushes, 337 s; clone 133 s, fsck clean |
-| Import facebook/react (21,698 commits, 263k objects, 1,078 MiB pack) | 25 staged pushes, 337 s; **clone fails** — `Error::Budget` → HTTP 413 mid-walk (per-request subrequest budget) |
-| Import rails/rails (99,661 commits, 787k objects, 308 MiB pack) | 39 staged pushes, 644 s; **clone fails** — same budget wall; `blob:none` doesn't help (budget is index reads, not blob bytes) |
+| Import facebook/react (21,698 commits, 263k objects, 1,078 MiB pack) | 25 staged pushes, 337 s; **clone fails** — `Error::Budget` → HTTP 413 mid-walk (per-request subrequest budget). *Pre-A29: once GC consolidates to `packs_live=1` the clone takes the verbatim path (~1 subrequest)* |
+| Import rails/rails (99,661 commits, 787k objects, 308 MiB pack) | 39 staged pushes, 644 s; **clone fails** — same budget wall; `blob:none` doesn't help (budget is index reads, not blob bytes). *Pre-A29: verbatim path applies once consolidated to one live pack* |
 | Import microsoft/TypeScript (39,366 commits, 945k objects, 2.8 GiB pack) | **import infeasible** — one commit alone adds ~222k objects; staging can't split below a commit |
 
 ## Interoperability test matrix (git 2.54, live)

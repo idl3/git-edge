@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use bstr::{BString, ByteSlice};
-use futures_util::stream;
+use futures_util::{stream, StreamExt};
 use gix_hash::ObjectId;
 use worker::{durable_object, DurableObject, Env, Method, Request, Response, SqlCursor, SqlStorage, SqlStorageValue as V, State};
 
@@ -13,7 +13,7 @@ use crate::error::Error;
 use crate::jobs::{self, JobKind};
 use crate::pack::generate;
 use crate::platform;
-use crate::store::{schema, Bucket, Index, ObjLoc, PackId, RepoId};
+use crate::store::{keys, schema, Bucket, Index, ObjLoc, PackId, RepoId};
 use crate::wire::{self, http::{do_error_response, json, parse, RepoHeaders}, FetchArgs, PktWriter, RefRow, V2Command};
 use crate::{ReqBudget, Spend};
 
@@ -1255,6 +1255,66 @@ impl RepoDo {
             wire::write_fetch_prelude(&mut w, &args, &acks, &[], &[], &[])?;
             return Response::from_bytes(w.out).map_err(|e| Error::Internal(e.to_string()));
         }
+        // C2 (ROADMAP #23): a plain-clone-shaped fetch whose wants all live in the
+        // repo's single live pack is answered by streaming that pack verbatim —
+        // one R2 GET instead of a read_entries pass over every send-set span.
+        // packs_live=1 makes "every markable object is in this pack" a construction
+        // guarantee (the index only resolves live packs), so the stream is a
+        // wire-legal superset: git index-packs extras, connectivity still passes.
+        // Any shallow/deepen/filter arg carries a contract a superset can violate,
+        // so the gate is strict on request shape.
+        let plain_clone = args.haves.is_empty()
+            && args.shallow.is_empty()
+            && args.deepen.is_none()
+            && args.deepen_since.is_none()
+            && args.deepen_not.is_empty()
+            && !args.deepen_relative
+            && args.filter.is_none();
+        if plain_clone {
+            if let Some(pack) = self.consolidated_pack(&idx, &wants)? {
+                let key = keys::pack(&bucket.repo, &pack);
+                budget.charge(1)?; // one GET streams the whole pack (7.1)
+                let obj = bucket
+                    .inner
+                    .get(&key)
+                    .execute()
+                    .await?
+                    .ok_or_else(|| Error::Storage(format!("missing {key}")))?;
+                let body = obj
+                    .body()
+                    .ok_or_else(|| Error::Storage(format!("no body for {key}")))?;
+                let pack_stream = body.stream().map_err(Error::from)?;
+                wire::write_fetch_prelude(&mut w, &args, &acks, &wanted_refs, &[], &[])?;
+                // the charge above is the whole projected spend — the body stream
+                // charges nothing further per chunk
+                let projected = budget.used;
+                let max_sub = budget.max_subrequests;
+                let st = VerbatimStream {
+                    budget,
+                    body: pack_stream,
+                    prelude: Some(w.out),
+                    finished: false,
+                };
+                let s = stream::unfold(st, |mut st| async move {
+                    match st.step().await {
+                        Ok(Some(chunk)) => Some((Ok::<Vec<u8>, Error>(chunk), st)),
+                        Ok(None) => None,
+                        Err(e) => {
+                            // mid-stream: one band-3 ERR frame, then end (section 10)
+                            st.finished = true;
+                            let mut w = PktWriter::default();
+                            wire::Sideband::new(&mut w).error(&format!("ERR {}", e.client_message()));
+                            Some((Ok(w.out), st))
+                        }
+                    }
+                });
+                let resp = Response::from_stream(s).map_err(Error::from)?;
+                resp.headers()
+                    .set("x-ge-subrequests", &format!("{projected}/{max_sub}"))
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                return Ok(resp);
+            }
+        }
         // steps 3-5: the send set
         let set = generate::send_set(
             self,
@@ -1300,6 +1360,30 @@ impl RepoDo {
             .set("x-ge-subrequests", &format!("{projected}/{max_sub}"))
             .map_err(|e| Error::Internal(e.to_string()))?;
         Ok(resp)
+    }
+
+    /// The C2 gate's server half: exactly one live pack, and every resolved want
+    /// has its objects row in it. A want the walk would reject ("not our ref") or
+    /// one living in another pack returns None so the walking path answers.
+    fn consolidated_pack(&self, idx: &Index<'_>, wants: &[ObjectId]) -> Result<Option<PackId>, Error> {
+        #[derive(serde::Deserialize)]
+        struct P {
+            id: String,
+        }
+        let live = self
+            .q("SELECT id FROM packs WHERE state='live'", vec![])?
+            .to_array::<P>()?;
+        let [p] = live.as_slice() else {
+            return Ok(None);
+        };
+        let pack = PackId(p.id.clone());
+        for loc in idx.lookup(wants)? {
+            match loc {
+                Some(l) if l.pack == pack => {}
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(pack))
     }
 
     /// POST /_do/export — a git bundle (v3, no prerequisites) of every live ref.
@@ -1430,6 +1514,42 @@ impl FetchStream {
                 Ok(Some(w.out))
             }
             _ => Ok(None),
+        }
+    }
+}
+
+/// C2's stream: the verbatim R2 pack body re-framed as band-1 sideband data.
+/// Prelude (through `packfile`), then each upstream chunk framed — the pack's own
+/// header/trailer ride inside the body bytes, so no hashing — then one flush.
+/// `charge(0)` per chunk keeps the 240 s wall-clock bound a normal fetch has.
+struct VerbatimStream {
+    budget: ReqBudget,
+    body: worker::ByteStream,
+    prelude: Option<Vec<u8>>,
+    finished: bool,
+}
+impl VerbatimStream {
+    async fn step(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        if let Some(p) = self.prelude.take() {
+            return Ok(Some(p));
+        }
+        if self.finished {
+            return Ok(None);
+        }
+        self.budget.charge(0)?;
+        match self.body.next().await {
+            Some(Ok(chunk)) => {
+                let mut w = PktWriter::default();
+                wire::Sideband::new(&mut w).data(&chunk);
+                Ok(Some(w.out))
+            }
+            Some(Err(e)) => Err(Error::from(e)),
+            None => {
+                self.finished = true;
+                let mut w = PktWriter::default();
+                w.flush();
+                Ok(Some(w.out))
+            }
         }
     }
 }
