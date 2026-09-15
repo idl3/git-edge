@@ -45,13 +45,13 @@ The benchmark also flushed out two real bugs (both fixed in this branch):
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| 9 | **Repo quota + abuse limits** | a public endpoint with unbounded repo creation invites abuse; per-owner object/byte caps enforced at push commit | M |
-| 10 | **Rate limiting** | per-token or per-IP throttles on receive-pack; Cloudflare rate-limit rules can cover most of this at the zone, no code | S |
+| 9 | ~~Repo quota + abuse limits~~ | done — `GE_QUOTA_MAX_REPOS_PER_OWNER` (50) via `owner!<o>` registry DO, `GE_QUOTA_MAX_OBJECTS` (2M)/`GE_QUOTA_MAX_BYTES` (4 GiB) at `commit_push` (A17) | M |
+| 10 | ~~Rate limiting~~ | done — sliding-window `rate` table check in `push_begin`, `GE_RATE_PUSHES_PER_MIN` (30), 429 + `Retry-After` (A18); zone rules remain the heavy hammer | S |
 | 11 | **Export endpoint** | `GET /:o/:r/_admin/export` → streams a `git bundle` of live refs. Disposability = easy in *and* easy out; also the backup story | M |
 | 12 | **`x-ge-subrequests` on error responses** | audit P3 — errors currently drop the accounting header | XS |
 | 13 | **Lease-overlap hardening** | audit P3 — a `running` job requeued after 60 s can overlap its original slice; heartbeats narrow it, fencing is the guard. Tighten or document | S |
 | 14 | **`coalesce` `unwrap_or(u32::MAX)`** | audit P3 — a value bounded by WINDOW should fail loudly, not saturate | XS |
-| 15 | **ls-refs caching** | agents poll `ls-remote` constantly; a lazy-mount client (artifact-fs-style) polls HEAD/refs every ~500 ms on top — `info/refs` for an unchanged `refs_version` is byte-identical, cache on it | S |
+| 15 | ~~ls-refs caching~~ | done — DO memoizes the refs snapshot + `/_do/refs`/`/_do/ls-refs` bytes on `refs_version` (A19); `_state` reports hits/misses | S |
 | 16 | **Ref pinning** | `POST /_admin/pin {ref, sha}` — frozen refs that reject updates; the server-side analog of artifact-fs's `--require-commit` verified acquisition, for deploy-snapshot workflows | S |
 
 ## Priority 2 — worthwhile, not blocking

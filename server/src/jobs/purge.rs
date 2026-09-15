@@ -25,7 +25,7 @@ const PAGE: u32 = 1_000; // one list page == one delete_multiple call (<= 1000 k
 
 /// Every table but `jobs` — our own row goes last so a re-sliced run can find it.
 const TABLES: &[&str] = &[
-    "objects", "packs", "pushes", "refs", "reflog", "tokens",
+    "objects", "packs", "pushes", "refs", "reflog", "tokens", "pins", "rate",
     "marked", "gc_frontier", "gc_seen", "gc_parts", "meta",
 ];
 

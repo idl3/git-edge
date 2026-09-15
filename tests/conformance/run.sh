@@ -131,15 +131,71 @@ git -C "$WORK/seed" bundle verify "$WORK/exp.bundle" >/dev/null || fail "bundle 
 git clone -q "$WORK/exp.bundle" "$WORK/bundleclone" || fail "clone from bundle"
 [ "$(git -C "$WORK/bundleclone" rev-parse main)" = "$ATIP" ] || fail "bundle tip"
 
-note "repo delete: tombstone -> 410 on every route"
+note "repo delete: tombstone 410 window, purge, name reusable"
 curl -sf -X POST "$URL/$ADMINREPO/_admin/delete" | grep -q deleted || fail "delete"
-code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/$ADMINREPO/info/refs?service=git-upload-pack")
-[ "$code" = "410" ] || fail "deleted repo info/refs -> $code, want 410"
-if GIT_TERMINAL_PROMPT=0 git ls-remote "$URL/$ADMINREPO" >/dev/null 2>&1; then
-  fail "ls-remote on deleted repo"
+# The purge can complete before this probe (alarm is ~instant in dev): either the
+# tombstone still answers 410, or the repo is already reborn — in both cases the
+# old refs must be gone.
+code=$(curl -s -o "$WORK/dr" -w '%{http_code}' "$URL/$ADMINREPO/info/refs?service=git-upload-pack")
+if [ "$code" = "200" ]; then
+  ! grep -q "$ATIP" "$WORK/dr" || fail "deleted repo still serves old refs"
+elif [ "$code" != "410" ]; then
+  fail "deleted repo info/refs -> $code, want 410 or reborn-empty 200"
 fi
-code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/$ADMINREPO/_state")
-[ "$code" = "410" ] || fail "deleted repo _state -> $code, want 410"
+if GIT_TERMINAL_PROMPT=0 git ls-remote "$URL/$ADMINREPO" 2>/dev/null | grep -q "$ATIP"; then
+  fail "ls-remote on deleted repo still advertises old tip"
+fi
+# a repush to the same name must succeed once the tombstone clears (or immediately
+# if the purge already wiped) — the disposable profile depends on name reuse
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  mkdir -p "$WORK/reuse" && cd "$WORK/reuse" && rm -rf .git
+  git init -q && git config user.email t@t && git config user.name t
+  echo reuse > r && git add r && git commit -qm reuse && git branch -M main
+  if git push -q "$URL/$ADMINREPO" main 2>/dev/null; then break; fi
+  [ "$i" = "10" ] && fail "name never reusable after delete"
+  sleep 1
+done
+
+# Quota + push rate-limit checks (A26/A27): only runs with GE_CONFORMANCE_LIMITS=1
+# and the dev server started with small caps, e.g. .dev.vars:
+#   GE_QUOTA_MAX_OBJECTS=25 GE_QUOTA_MAX_REPOS_PER_OWNER=3 GE_RATE_PUSHES_PER_MIN=12
+# (25 stays above the main suite's ~12 objects/repo; 12 stays above its 9 pushes.)
+if [ "${GE_CONFORMANCE_LIMITS:-0}" = "1" ]; then
+  O="quota-$SECONDS-$$"
+  post() { # one canned receive-pack POST (bad pack body is fine — it reaches begin)
+    curl -s -X POST "$URL/$1/git-receive-pack" \
+      -H 'Content-Type: application/x-git-receive-pack-request' --data-binary @"$WORK/badpkt.bin"
+  }
+
+  note "object quota: push over GE_QUOTA_MAX_OBJECTS rejects naming the cap"
+  mkdir "$WORK/q" && cd "$WORK/q"
+  git init -q && git config user.email t@t && git config user.name t
+  for i in $(seq 1 12); do echo "$i" > "f$i"; git add "f$i"; git commit -qm "c$i"; done
+  git branch -M main
+  if git push "$URL/$O/obj" main >"$WORK/qerr" 2>&1; then
+    fail "expected object-quota rejection (is GE_QUOTA_MAX_OBJECTS <= ~36?)"
+  fi
+  grep -qi "quota" "$WORK/qerr" || fail "no quota reason in push output: $(cat "$WORK/qerr")"
+
+  note "repo quota: claims past GE_QUOTA_MAX_REPOS_PER_OWNER are rejected"
+  # $O/obj already claimed slot 1; fill the remaining two, then the next must fail
+  post "$O/b" >/dev/null
+  post "$O/c" >/dev/null
+  out=$(post "$O/d")
+  echo "$out" | grep -q "GE_QUOTA_MAX_REPOS_PER_OWNER" \
+    || fail "repo-cap rejection missing GE_QUOTA_MAX_REPOS_PER_OWNER: $out"
+
+  note "rate limit: pushes past GE_RATE_PUSHES_PER_MIN get HTTP 429 + Retry-After"
+  code=""
+  for i in $(seq 1 16); do
+    code=$(curl -s -o "$WORK/rl" -D "$WORK/rlh" -w '%{http_code}' -X POST \
+      "$URL/$O/rl/git-receive-pack" \
+      -H 'Content-Type: application/x-git-receive-pack-request' --data-binary @"$WORK/badpkt.bin")
+    [ "$code" = "429" ] && break
+  done
+  [ "$code" = "429" ] || fail "no 429 after 16 pushes (last=$code; is GE_RATE_PUSHES_PER_MIN < 16?)"
+  grep -qi '^retry-after:' "$WORK/rlh" || fail "429 without Retry-After header"
+fi
 
 # GC chain: only runs when the server was started with shortened windows
 # (GE_GC_QUIET_MS / GE_GC_GRACE_MS in .dev.vars) and GE_CONFORMANCE_GC=1.
@@ -174,7 +230,9 @@ fi
 # Runs only with GE_CONFORMANCE_PURGE=1 and a build that has the admin route.
 if [ "${GE_CONFORMANCE_PURGE:-0}" = "1" ]; then
   note "purge: _admin/delete -> purge_repo wipes the repo"
-  PREPO="$REPO-purge"
+  # own owner: under GE_CONFORMANCE_LIMITS caps the suite's owner already holds
+  # its slots (run/-admin/-gc), so the purge repo must not contend for a claim
+  PREPO="purge$$/repo"
   mkdir "$WORK/purge" && cd "$WORK/purge"
   git init -q && git config user.email t@t && git config user.name t
   echo purge > p && git add p && git commit -qm p && git branch -M main

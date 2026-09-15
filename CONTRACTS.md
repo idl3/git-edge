@@ -884,3 +884,45 @@ Continuing the audit-fix numbering (last: A16).
   object reachable via a ref is already a want). The pack entries are verbatim
   copies with the normal trailer hash; the stream carries no pkt framing —
   a bundle is a file format, so a mid-stream failure is a truncated file.
+
+## Amendments from the request-hardening pass (feat/request-hardening)
+
+- **A26. Repo quotas (extends section 6's limit set).** Three env knobs with
+  compiled-in defaults; `<= 0` disables that cap. `GE_QUOTA_MAX_REPOS_PER_OWNER`
+  (default 50) is enforced at first push: `/_do/push/begin` reports `claimed` —
+  true once the repo has any committed (`live` or swept-`dead`) pack — and the
+  edge claims a slot in the `owner!<owner>` registry DO before ingest begins.
+  Registry DOs are the same `RepoDo` class under a name no repo route can form
+  (`!` fails `seg_ok`); `/_owner/*` routes skip `boot` entirely — schema migrate
+  only, no meta rows, no jobs, no alarm. Claims are `claim:<repo>` keys in `meta`
+  (idempotent `INSERT ... ON CONFLICT DO NOTHING`); over-cap inserts are handed
+  straight back so rejected names never accumulate, and `/_owner/release` frees a
+  slot for repo delete (ROADMAP #3). A repo that once committed keeps pushing if
+  the cap is tightened later — it is grandfathered and never re-claims.
+  `GE_QUOTA_MAX_OBJECTS` (default 2 000 000) and `GE_QUOTA_MAX_BYTES` (default
+  4 GiB) are enforced in `commit_push` after ingest has posted the pack's real
+  counts: live packs plus the push's own ingesting pack are summed; over either
+  cap the whole push is finished `rejected` (so the janitor reaps the pack now)
+  and `Error::Limit` naming the knob and the numbers rides back in `unpack`.
+  A delete-only push (no pack) skips the check so an over-cap repo can shrink.
+- **A27. Push rate limit (new).** `/_do/push/begin` runs a sliding-window check
+  before the push row exists: two fixed 60 s buckets in the `rate` table,
+  estimated as `cur + prev * (1 - frac_elapsed)`, keyed on `push:<sha1(token)>`.
+  The attempt is counted before the check so an abusive credential stays over
+  the line. Over `GE_RATE_PUSHES_PER_MIN` (default 30; `<= 0` disables) the DO
+  returns `ratelimit` + `retry_after`, which surfaces as HTTP 429 with a
+  `Retry-After` header — deliberately *without* the A2 drain, since shedding
+  load is the point (a client still mid-upload may see a reset instead).
+  Counters are per repo per credential. This is abuse damping, not metering:
+  zone-level Cloudflare rate-limit rules are the heavy hammer.
+- **A28. Advertisement memoization (extends 1.3).** The DO memoizes the refs
+  snapshot — head, ref rows, and the rendered `/_do/refs` JSON body — keyed on
+  `refs_version`, plus `/_do/ls-refs` response bytes per (refs_version, request
+  body) in an 8-entry FIFO. `refs_version` only moves inside a commit span that
+  changed refs, so a matching version is a byte-stable answer; an evicted DO
+  rebuilds once. The subrequest still happens (the edge can only learn the
+  version from the DO) but no refs scan, oid parse, or render runs on a hit.
+  Auth and the protocol-version branch stay per-request at the edge; the DO
+  stamps `x-ge-refs-version` on `/_do/refs` and the edge echoes it on
+  `info/refs`. `_state` reports `refs_memo_hits`/`refs_memo_misses` and
+  `rate_rows`.

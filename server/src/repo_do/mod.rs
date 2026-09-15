@@ -1,7 +1,8 @@
 //! RepoDo — one Durable Object per repo: refs, meta, pushes, jobs tables; internal HTTP routes.
 //! CONTRACTS.md 1.3, 3, 8. Ported from repo-do-ref-authority + refs-sqlite-objects-r2 + auth proofs.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use bstr::{BString, ByteSlice};
 use futures_util::stream;
@@ -19,6 +20,27 @@ use crate::ReqBudget;
 /// A ref row is ~90 bytes in an ls-refs advertisement — a token holder could otherwise
 /// mint refs until the advertisement alone exceeds the isolate. 65k refs is already huge.
 const MAX_REFS: i64 = 65_536;
+
+/// A26 quota defaults for the small-disposable-app profile (ROADMAP P1 #9): bite abuse
+/// before the structural limits (2M objects/pack, 2 GiB/push) do. Env vars override;
+/// <= 0 disables that cap.
+const DEFAULT_MAX_REPOS_PER_OWNER: i64 = 50; // GE_QUOTA_MAX_REPOS_PER_OWNER
+const DEFAULT_MAX_OBJECTS: i64 = 2_000_000; // GE_QUOTA_MAX_OBJECTS
+const DEFAULT_MAX_BYTES: i64 = 4 << 30; // GE_QUOTA_MAX_BYTES (4 GiB)
+/// A27: pushes per minute per credential per repo (GE_RATE_PUSHES_PER_MIN). Abuse
+/// damping only — the heavy hammer is a zone-level Cloudflare rate-limit rule.
+const DEFAULT_PUSHES_PER_MIN: i64 = 30;
+
+/// A28: memoized advertisement state, valid for exactly one refs_version. `ls` holds a
+/// few (request body -> response body) pairs for /_do/ls-refs so a lazy-mount poller
+/// repeating an identical ls-refs skips the parse+render too.
+struct RefsMemo {
+    version: i64,
+    head: Option<BString>,
+    refs: Vec<RefRow>,
+    json: Vec<u8>, // the /_do/refs response body
+    ls: RefCell<Vec<(Vec<u8>, Vec<u8>)>>,
+}
 
 #[derive(serde::Deserialize)]
 pub struct CmdDto {
@@ -42,6 +64,9 @@ pub struct CommitResponse {
 struct BeginDto {
     push_id: String,
     principal: String,
+    /// sha1 of the presented token — the A27 rate-limit bucket key.
+    #[serde(default)]
+    key: String,
 }
 #[derive(serde::Deserialize)]
 struct AuthDto {
@@ -102,11 +127,21 @@ pub struct RepoDo {
     pub(crate) state: State,
     pub(crate) env: Env,
     booted: RefCell<bool>,
+    refs_memo: RefCell<Option<Rc<RefsMemo>>>,
+    memo_hits: Cell<u64>,
+    memo_misses: Cell<u64>,
 }
 
 impl DurableObject for RepoDo {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env, booted: RefCell::new(false) }
+        Self {
+            state,
+            env,
+            booted: RefCell::new(false),
+            refs_memo: RefCell::new(None),
+            memo_hits: Cell::new(0),
+            memo_misses: Cell::new(0),
+        }
     }
 
     async fn fetch(&self, mut req: Request) -> worker::Result<Response> {
@@ -115,12 +150,17 @@ impl DurableObject for RepoDo {
         let path = req.path();
         let method = req.method();
         // ---- sync span from here to the response for every "none" route ----
-        let out: Result<Option<Response>, Error> = self.boot(&hdr).and_then(|meta| {
+        // A26: `owner!<owner>` registry DOs never boot as repos — no meta, no jobs,
+        // no alarm. Their routes are intercepted before boot.
+        let out: Result<Option<Response>, Error> = if path.starts_with("/_owner/") {
+            self.owner_route(&method, &path, &hdr).map(Some)
+        } else {
+            self.boot(&hdr).and_then(|meta| {
             if meta.deleted {
                 return Err(Error::Gone); // tombstoned: every repo route is 410
             }
             match (&method, path.as_str()) {
-                (Method::Get, "/_do/refs") => self.list_refs().and_then(refs_json),
+                (Method::Get, "/_do/refs") => self.refs_route(&meta),
                 (Method::Get, "/_do/state") => self.debug_state(),
                 (Method::Post, "/_do/push/begin") => self.push_begin(&meta, &parse::<BeginDto>(&body)?),
                 (Method::Post, "/_do/push/lookup") => self.push_lookup(&parse(&body)?),
@@ -141,7 +181,8 @@ impl DurableObject for RepoDo {
                 _ => return Ok(None),
             }
             .map(Some)
-        });
+            })
+        };
         let resp = match out {
             Ok(Some(r)) => Ok(r),
             Ok(None) => match (&method, path.as_str()) {
@@ -202,13 +243,14 @@ fn valid_ref(name: &str) -> Result<&str, Error> {
     }
     Ok(name)
 }
-fn refs_json((head, refs): (Option<BString>, Vec<RefRow>)) -> Result<Response, Error> {
-    json(serde_json::json!({
-        "head": head.map(|h| h.to_string()),
+/// The /_do/refs DTO body — built once per refs_version and memoized (A28).
+fn refs_value(head: &Option<BString>, refs: &[RefRow]) -> serde_json::Value {
+    serde_json::json!({
+        "head": head.as_ref().map(|h| h.to_string()),
         "refs": refs.iter().map(|r| serde_json::json!({
             "name": r.name.to_string(), "target": r.target.to_string(),
             "peeled": r.peeled.map(|p| p.to_string()) })).collect::<Vec<_>>()
-    }))
+    })
 }
 
 impl RepoDo {
@@ -267,11 +309,66 @@ impl RepoDo {
         self.env_ms("GE_GC_GRACE_MS", 3_600_000)
     }
     fn env_ms(&self, name: &str, default: i64) -> i64 {
+        self.env_i64(name, default)
+    }
+    /// Any integer knob: compiled-in default, `env.var` override, unparseable falls back.
+    fn env_i64(&self, name: &str, default: i64) -> i64 {
         self.env
             .var(name)
             .ok()
             .and_then(|v| v.to_string().parse::<i64>().ok())
             .unwrap_or(default)
+    }
+
+    /// A26: `owner!<owner>` registry routes — the cross-repo quota oracle. These DOs
+    /// never boot as repos: schema migrate runs lazily, but no meta rows, no jobs,
+    /// no alarm are created. `claim:<repo>` keys live in `meta` (no schema change).
+    /// Identity arrives via the usual x-ge-owner/x-ge-repo headers.
+    fn owner_route(&self, method: &Method, path: &str, hdr: &RepoHeaders) -> Result<Response, Error> {
+        if !*self.booted.borrow() {
+            schema::migrate(&self.sql())?;
+            *self.booted.borrow_mut() = true;
+        }
+        let (owner, repo) = (
+            hdr.owner.as_deref().ok_or_else(|| Error::Internal("owner route without identity".into()))?,
+            hdr.repo.as_deref().ok_or_else(|| Error::Internal("owner route without identity".into()))?,
+        );
+        match (method, path) {
+            // Idempotent claim of one of the owner's GE_QUOTA_MAX_REPOS_PER_OWNER slots.
+            // Over-cap inserts are handed back so rejected names never accumulate.
+            (Method::Post, "/_owner/claim") => {
+                let cap = self.env_i64("GE_QUOTA_MAX_REPOS_PER_OWNER", DEFAULT_MAX_REPOS_PER_OWNER);
+                if cap <= 0 {
+                    return json(serde_json::json!({ "claimed": true, "cap": 0 }));
+                }
+                let key = format!("claim:{repo}");
+                self.q(
+                    "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT DO NOTHING",
+                    vec![V::from(key.as_str()), V::from(platform::now_ms())],
+                )?;
+                let inserted = self.changes()? == 1;
+                let n = self
+                    .q("SELECT COUNT(*) AS n FROM meta WHERE key LIKE 'claim:%'", vec![])?
+                    .one::<N>()?
+                    .n;
+                if inserted && n > cap {
+                    self.q("DELETE FROM meta WHERE key=?", vec![V::from(key.as_str())])?;
+                    return Err(Error::Limit(format!(
+                        "owner {owner} has {n} repos, over GE_QUOTA_MAX_REPOS_PER_OWNER={cap}"
+                    )));
+                }
+                json(serde_json::json!({ "claimed": true, "repos": n, "cap": cap }))
+            }
+            // Called by repo delete (ROADMAP #3) once that lands — frees the slot.
+            (Method::Post, "/_owner/release") => {
+                self.q(
+                    "DELETE FROM meta WHERE key=?",
+                    vec![V::from(format!("claim:{repo}"))],
+                )?;
+                json(serde_json::json!({ "released": self.changes()? == 1 }))
+            }
+            _ => Err(Error::NotFound),
+        }
     }
 
     /// Section 8.2. Sync span: migrate schema, write/verify meta, enqueue Janitor.
@@ -415,6 +512,11 @@ impl RepoDo {
                 .collect::<Vec<_>>(),
             "public": self.meta_opt("public")?.is_some(),
             "deleted": self.meta_opt("deleted")?.is_some(),
+            "rate_rows": count("SELECT COUNT(*) AS n FROM rate")?,
+            // A28 memo counters — hits/(hits+misses) is the advertisement-rebuild
+            // saving a lazy-mount poller would otherwise cost per request
+            "refs_memo_hits": self.memo_hits.get(),
+            "refs_memo_misses": self.memo_misses.get(),
         }))
     }
 
@@ -581,6 +683,37 @@ impl RepoDo {
             .map(|r| r.sha))
     }
 
+    /// A28: refs snapshot memoized on refs_version. A push is the only writer and
+    /// bumps the version inside the commit span, so a matching version is a
+    /// byte-stable answer; an evicted DO just rebuilds once. Both advertisement
+    /// routes share the snapshot — the edge still does auth and the protocol-version
+    /// branch per request.
+    fn refs_snapshot(&self, meta: &Meta) -> Result<Rc<RefsMemo>, Error> {
+        if let Some(m) = self.refs_memo.borrow().as_ref() {
+            if m.version == meta.refs_version {
+                self.memo_hits.set(self.memo_hits.get() + 1);
+                return Ok(Rc::clone(m));
+            }
+        }
+        let (head, refs) = self.list_refs()?;
+        let json = serde_json::to_vec(&refs_value(&head, &refs)).map_err(|e| Error::Internal(e.to_string()))?;
+        let m = Rc::new(RefsMemo { version: meta.refs_version, head, refs, json, ls: RefCell::new(Vec::new()) });
+        self.memo_misses.set(self.memo_misses.get() + 1);
+        *self.refs_memo.borrow_mut() = Some(Rc::clone(&m));
+        Ok(m)
+    }
+
+    /// GET /_do/refs — memoized body; stamps x-ge-refs-version so the edge can echo
+    /// it on info/refs responses (a poller can watch it move).
+    fn refs_route(&self, meta: &Meta) -> Result<Response, Error> {
+        let m = self.refs_snapshot(meta)?;
+        let r = Response::from_bytes(m.json.clone()).map_err(|e| Error::Internal(e.to_string()))?;
+        let h = r.headers();
+        h.set("Content-Type", "application/json").map_err(|e| Error::Internal(e.to_string()))?;
+        h.set("x-ge-refs-version", &m.version.to_string()).map_err(|e| Error::Internal(e.to_string()))?;
+        Ok(r)
+    }
+
     /// GET /_do/refs (1.3, awaits: none).
     pub fn list_refs(&self) -> Result<(Option<BString>, Vec<RefRow>), Error> {
         #[derive(serde::Deserialize)]
@@ -607,20 +740,32 @@ impl RepoDo {
         Ok((Some(head.into()), refs))
     }
 
-    /// POST /_do/ls-refs (raw v2 body, awaits: none).
-    fn ls_refs(&self, _meta: &Meta, body: &[u8]) -> Result<Response, Error> {
+    /// POST /_do/ls-refs (raw v2 body, awaits: none). Response bytes memoized per
+    /// (refs_version, request body) — a poller's identical ls-refs skips the parse
+    /// and render entirely (A28).
+    fn ls_refs(&self, meta: &Meta, body: &[u8]) -> Result<Response, Error> {
+        let m = self.refs_snapshot(meta)?;
+        if let Some((_, out)) = m.ls.borrow().iter().find(|(b, _)| b.as_slice() == body) {
+            return Response::from_bytes(out.clone()).map_err(|e| Error::Internal(e.to_string()));
+        }
         let args = match wire::parse_v2_command(body)? {
             V2Command::LsRefs(a) => a,
             _ => return Err(Error::Protocol("not ls-refs".into())),
         };
-        let (head, refs) = self.list_refs()?;
         let mut w = PktWriter::default();
-        wire::write_ls_refs(&mut w, &args, head.as_deref().map(|v| bstr::ByteSlice::as_bstr(v.as_slice())), &refs);
+        wire::write_ls_refs(&mut w, &args, m.head.as_deref().map(|v| bstr::ByteSlice::as_bstr(v.as_slice())), &m.refs);
+        let mut ls = m.ls.borrow_mut();
+        if ls.len() >= 8 {
+            ls.remove(0); // small FIFO — arg mixes past 8 simply re-render
+        }
+        ls.push((body.to_vec(), w.out.clone()));
+        drop(ls);
         Response::from_bytes(w.out).map_err(|e| Error::Internal(e.to_string()))
     }
 
     /// Section 3 step 0: the push row carrying the gc_epoch the whole push validates against.
     fn push_begin(&self, meta: &Meta, b: &BeginDto) -> Result<Response, Error> {
+        self.rate_check(&b.key)?; // A27: before the row exists — throttled pushes hold nothing
         // an 'open' push owns a pending/ key and eventually a packs row; bound how many
         // a client may hold at once (expired ones are reaped by the janitor)
         let open = self.q("SELECT COUNT(*) AS n FROM pushes WHERE state='open'", vec![])?.one::<N>()?.n;
@@ -636,9 +781,65 @@ impl RepoDo {
                 V::from(meta.gc_epoch),
             ],
         )?;
+        // A26: a repo counts against GE_QUOTA_MAX_REPOS_PER_OWNER until its first
+        // committed pack lands (live, or dead after sweep). `claimed=false` tells the
+        // edge to take the registry hop; a repo that once committed keeps pushing even
+        // if the cap was tightened after (grandfathered — it never re-claims).
+        let claimed =
+            self.q("SELECT COUNT(*) AS n FROM packs WHERE state<>'ingesting'", vec![])?.one::<N>()?.n > 0;
         json(serde_json::json!({
-            "repo_id": meta.repo_id, "refs_version": meta.refs_version, "gc_epoch": meta.gc_epoch
+            "repo_id": meta.repo_id, "refs_version": meta.refs_version, "gc_epoch": meta.gc_epoch,
+            "claimed": claimed
         }))
+    }
+
+    /// A27 sliding-window throttle: two fixed 60 s counter buckets in `rate`; the
+    /// estimate is cur + prev*(1-frac_elapsed). The attempt is counted before the
+    /// check so an abusive credential stays over the line instead of hovering at it.
+    /// Keyed on the presented token's sha1 (`push:<hash>`); per-repo by construction —
+    /// the counter lives in this DO. GE_RATE_PUSHES_PER_MIN <= 0 disables.
+    fn rate_check(&self, key: &str) -> Result<(), Error> {
+        let limit = self.env_i64("GE_RATE_PUSHES_PER_MIN", DEFAULT_PUSHES_PER_MIN);
+        if limit <= 0 {
+            return Ok(());
+        }
+        let now = platform::now_ms();
+        let win = now.div_euclid(60_000);
+        let frac = now.rem_euclid(60_000) as f64 / 60_000.0;
+        let bucket = format!("push:{key}");
+        self.q(
+            "INSERT INTO rate(bucket,window,count) VALUES(?,?,1) \
+             ON CONFLICT(bucket,window) DO UPDATE SET count=count+1",
+            vec![V::from(bucket.as_str()), V::from(win)],
+        )?;
+        #[derive(serde::Deserialize)]
+        struct R {
+            window: i64,
+            count: i64,
+        }
+        let (mut cur, mut prev) = (0i64, 0i64);
+        for r in self
+            .q(
+                "SELECT window, count FROM rate WHERE bucket=? AND window>=?",
+                vec![V::from(bucket.as_str()), V::from(win - 1)],
+            )?
+            .to_array::<R>()?
+        {
+            if r.window == win {
+                cur = r.count;
+            } else {
+                prev = r.count;
+            }
+        }
+        self.q(
+            "DELETE FROM rate WHERE bucket=? AND window<?",
+            vec![V::from(bucket.as_str()), V::from(win - 1)],
+        )?;
+        if cur as f64 + prev as f64 * (1.0 - frac) > limit as f64 {
+            let retry = u32::try_from((60_000 - now.rem_euclid(60_000)).div_euclid(1_000)).unwrap_or(60);
+            return Err(Error::RateLimit(retry.max(1)));
+        }
+        Ok(())
     }
 
     /// POST /_do/push/abort — a post-begin failure closes the row immediately instead
@@ -747,6 +948,32 @@ impl RepoDo {
             return self.finish_push(req, "rejected", now, results);
         }
         if let Some(pack) = &req.pack_id {
+            // A26: per-repo object/byte quotas, evaluated now that ingest has posted
+            // the pack's real counts. Live packs plus this push's own ingesting pack
+            // are the total; other pushes' in-flight packs don't count against us.
+            // A delete-only push (no pack) skips the check so an over-cap repo can
+            // still shrink. The whole push rejects with the cap named in the message.
+            let (objects, bytes) = self.storage_totals(&req.push_id)?;
+            let max_obj = self.env_i64("GE_QUOTA_MAX_OBJECTS", DEFAULT_MAX_OBJECTS);
+            let max_bytes = self.env_i64("GE_QUOTA_MAX_BYTES", DEFAULT_MAX_BYTES);
+            let over = if max_obj > 0 && objects > max_obj {
+                Some(format!("objects {objects} > GE_QUOTA_MAX_OBJECTS={max_obj}"))
+            } else if max_bytes > 0 && bytes > max_bytes {
+                Some(format!("bytes {bytes} > GE_QUOTA_MAX_BYTES={max_bytes}"))
+            } else {
+                None
+            };
+            if let Some(m) = over {
+                // 'rejected' + pack_id lets the janitor reap the ingesting pack now
+                // rather than on the orphan timeout
+                self.finish_push(
+                    req,
+                    "rejected",
+                    now,
+                    cmds.iter().map(|c| (c.name.clone(), Some("over repo quota"))).collect(),
+                )?;
+                return Err(Error::Limit(format!("repo quota exceeded: {m}")));
+            }
             // step 3
             self.q(
                 // bound to this push: an ingesting pack that belongs to a different push
@@ -877,6 +1104,25 @@ impl RepoDo {
             ],
         )?;
         Ok(CommitResponse { results })
+    }
+
+    /// A26 quota accounting: sum of packs.count/bytes over live packs plus this
+    /// push's own ingesting pack (its real counts are posted before commit). Other
+    /// pushes' in-flight packs are excluded — they may never commit.
+    fn storage_totals(&self, push_id: &str) -> Result<(i64, i64), Error> {
+        #[derive(serde::Deserialize)]
+        struct T {
+            objects: i64,
+            bytes: i64,
+        }
+        let t = self
+            .q(
+                "SELECT COALESCE(SUM(count),0) AS objects, COALESCE(SUM(bytes),0) AS bytes \
+                 FROM packs WHERE state='live' OR (state='ingesting' AND push_id=?)",
+                vec![V::from(push_id)],
+            )?
+            .one::<T>()?;
+        Ok((t.objects, t.bytes))
     }
 
     /// POST /_do/fetch (section 9): the only DO route that awaits (R2 reads).
