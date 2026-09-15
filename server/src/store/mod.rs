@@ -929,6 +929,7 @@ pub mod schema {
         "CREATE TABLE IF NOT EXISTS gc_parts (part_no INTEGER PRIMARY KEY, etag TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL, level TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS tokens_hash ON tokens(hash)",
+        "CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, sha TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID",
     ];
     /// Columns added after first deploy. CREATE TABLE IF NOT EXISTS never updates an
     /// existing table, so DOs booted under an older schema need ALTER TABLE — SQLite

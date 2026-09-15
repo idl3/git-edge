@@ -146,6 +146,11 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         (Method::Delete, p) if p.starts_with("_admin/tokens/") => {
             token_revoke(&req, &env, &route, &p["_admin/tokens/".len()..]).await
         }
+        (Method::Post, "_admin/delete") => repo_delete(&req, &env, &route).await,
+        (Method::Post, "_admin/public") => repo_public(req, &env, &route).await,
+        (Method::Post, "_admin/pin") => pin_ref(req, &env, &route, "/_do/pin").await,
+        (Method::Post, "_admin/unpin") => pin_ref(req, &env, &route, "/_do/unpin").await,
+        (Method::Get, "_admin/export") => export_bundle(&req, &env, &route).await,
         _ => Err(Error::NotFound),
     };
     let resp = respond(r, git_pkt);
@@ -422,6 +427,84 @@ async fn token_revoke(req: &Request, env: &Env, route: &RepoRoute, id: &str) -> 
     git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
 }
 
+/// Bounded JSON body for the small _admin payloads (public/pin/unpin).
+async fn json_body(req: &mut Request) -> Result<serde_json::Value, Error> {
+    if let Some(n) = req
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if n > 4_096 {
+            return Err(Error::Protocol("admin body too large".into()));
+        }
+    }
+    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    if body.len() > 4_096 {
+        return Err(Error::Protocol("admin body too large".into()));
+    }
+    serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("admin body: {e}")))
+}
+
+/// POST /:owner/:repo/_admin/delete — tombstone the repo and enqueue purge_repo.
+/// Every repo route answers 410 from the moment this returns. Idempotent.
+async fn repo_delete(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+    auth::authenticate_admin(req, env)?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let out: serde_json::Value =
+        stub_json(&stub, route, "/_do/delete", &serde_json::json!({}), &mut budget).await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
+/// POST /:owner/:repo/_admin/public {enabled: bool} — anonymous read flag.
+/// Write paths (receive-pack, token minting) stay token-gated regardless.
+async fn repo_public(mut req: Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+    auth::authenticate_admin(&req, env)?;
+    let v = json_body(&mut req).await?;
+    if v.get("enabled").and_then(|b| b.as_bool()).is_none() {
+        return Err(Error::Protocol("body must be {\"enabled\": bool}".into()));
+    }
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let out: serde_json::Value = stub_json(&stub, route, "/_do/public", &v, &mut budget).await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
+/// POST /:owner/:repo/_admin/pin {ref, sha} / _admin/unpin {ref} — ref pinning.
+async fn pin_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str) -> Result<Response, Error> {
+    auth::authenticate_admin(&req, env)?;
+    let v = json_body(&mut req).await?;
+    if v.get("ref").and_then(|r| r.as_str()).is_none()
+        || (path == "/_do/pin" && v.get("sha").and_then(|s| s.as_str()).is_none())
+    {
+        return Err(Error::Protocol("body must be {\"ref\": ..., \"sha\": ...}".into()));
+    }
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let out: serde_json::Value = stub_json(&stub, route, path, &v, &mut budget).await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
+/// GET /:owner/:repo/_admin/export — stream a v3 git bundle of every live ref.
+/// Read-level auth suffices (anonymous on a public repo); the DO builds the pack
+/// with the same send_set machinery as fetch, framed by the bundle header.
+async fn export_bundle(req: &Request, env: &Env, route: &RepoRoute) -> Result<Response, Error> {
+    auth::authenticate(req, env, Level::Read, route).await?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid());
+    let mut resp = stub_raw(&stub, route, "/_do/export", Vec::new(), &mut budget).await?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp).await);
+    }
+    let subreqs = resp.headers().get("x-ge-subrequests").ok().flatten();
+    let stream = resp.stream().map_err(|e| Error::Internal(e.to_string()))?;
+    let mut out = git_resp_stream(stream, "application/x-git-bundle")?;
+    if let Some(v) = subreqs {
+        out.headers_mut()
+            .set("x-ge-subrequests", &v)
+            .map_err(|e| Error::Internal(e.to_string()))?;
+    }
+    Ok(out)
+}
+
 /// POST /:owner/:repo/git-receive-pack — two-phase push (2.4, 3) with the A2 error arm.
 async fn receive_pack(mut req: Request, env: Env, route: RepoRoute) -> Result<Response, Error> {
     let principal = auth::authenticate(&req, &env, Level::Write, &route).await?;
@@ -581,6 +664,7 @@ fn leak_reason(m: &str) -> &'static str {
         "deletion of the current branch prohibited" => "deletion of the current branch prohibited",
         "missing necessary objects" => "missing necessary objects",
         "gc ran during push, retry" => "gc ran during push, retry",
+        "ref is pinned" => "ref is pinned",
         _ => "failed to update ref",
     }
 }

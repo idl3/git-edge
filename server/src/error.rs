@@ -11,6 +11,7 @@ pub enum Error {
     Unpack(String),
     Budget,
     Limit(String),
+    Gone,
     Storage(String),
     Internal(String),
 }
@@ -26,6 +27,7 @@ impl std::fmt::Display for Error {
             Error::Unpack(m) => write!(f, "unpack failed: {m}"),
             Error::Budget => write!(f, "request budget exhausted"),
             Error::Limit(m) => write!(f, "limit exceeded: {m}"),
+            Error::Gone => write!(f, "repository deleted"),
             Error::Storage(m) => write!(f, "storage error: {m}"),
             Error::Internal(m) => write!(f, "internal error: {m}"),
         }
@@ -68,6 +70,7 @@ impl Error {
             Error::Budget => "budget",
             Error::Limit(_) => "limit",
             Error::Storage(_) => "storage",
+            Error::Gone => "gone",
             Error::Internal(_) => "internal",
         }
     }
@@ -88,6 +91,7 @@ impl Error {
                     Some("auth") => Error::Auth,
                     Some("forbidden") => Error::Forbidden,
                     Some("notfound") => Error::NotFound,
+                    Some("gone") => Error::Gone,
                     Some("conflict") => Error::Conflict(msg),
                     Some("unpack") => Error::Unpack(msg),
                     Some("budget") => Error::Budget,
@@ -108,6 +112,7 @@ impl Error {
             Error::Forbidden => "forbidden".into(),
             Error::NotFound => "not found".into(),
             Error::Budget => "request budget exhausted".into(),
+            Error::Gone => "repository deleted".into(),
         }
     }
     /// The client-safe form: Internal/Storage details (R2 keys, SQL errors) stay in the
@@ -134,6 +139,7 @@ impl Error {
             Error::Auth => 401,
             Error::Forbidden => 403,
             Error::NotFound => 404,
+            Error::Gone => 410,
             Error::Conflict(_) => 409,
             Error::Budget | Error::Limit(_) => 413,
             Error::Unpack(_) | Error::Storage(_) | Error::Internal(_) => 500,

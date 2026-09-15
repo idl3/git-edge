@@ -839,3 +839,48 @@ Continuing the audit-fix numbering (last: A16).
   fragment-length cast is `Error::Limit("read fragment exceeds window")`
   propagated through a `Result` — HTTP 413 — never a saturating
   `u32::MAX` and never a panic inside the DO.
+
+## Amendments from the repo-admin pass (repo delete, public read, pinning, export)
+
+- **A22. Repo delete (new).** `POST /:owner/:repo/_admin/delete` is
+  global-write-token only. It sets `meta.deleted` and enqueues a `purge_repo`
+  job (A20) in the same span; from that point every repo route — git protocol,
+  `_state`, `_admin/*`, `/_do/*` — answers **410** via a new `Error::Gone`
+  before any dispatch. `boot` on a tombstoned DO skips `jobs::repair` and
+  instead guarantees exactly one `purge_repo` row exists (re-enqueueing a
+  dead/missing one and requeueing a stranded `running` row on the same 60 s
+  rule) — the purge is the only work that may still run, via the alarm. The
+  tombstone lives until the purge's phase-B `delete_all` (A20); after that the
+  name is free and the next request re-initializes a fresh repo under a new
+  `repo_id`. Delete is idempotent at the API level; a repeated call on a
+  tombstoned repo is itself 410.
+
+- **A23. Public read (new).** `POST /:owner/:repo/_admin/public
+  {enabled: bool}` (global-write-token only) sets or clears `meta.public`.
+  On a public repo, `info/refs?service=git-upload-pack`, `POST
+  git-upload-pack`, and `GET _admin/export` need no credential: a request with
+  *no* usable `Authorization` credential on a read route falls through to a
+  `/_do/public` probe instead of an immediate 401. A presented credential is
+  still authenticated normally — an invalid token on a public repo is a 401,
+  never a silent downgrade to anonymous. receive-pack, `_state`, and all other
+  `_admin/*` routes are unchanged. `_state` reports `public` and `deleted`.
+
+- **A24. Ref pinning (new).** `POST /:owner/:repo/_admin/pin {ref, sha}` and
+  `/_admin/unpin {ref}` (global-write-token only) maintain a `pins` table.
+  `ref` must be a full valid refname under `refs/` and must already resolve to
+  `sha` — a pin asserts the current value, it never moves a ref (mismatch or
+  missing ref → 409). A pinned ref rejects every update and delete in
+  `commit_push` with `ng <ref> "ref is pinned"`, checked before the
+  head-deletion and CAS rules. Pins are capped at 256 per repo and listed in
+  `_state` under `pins`.
+
+- **A25. Export (new).** `GET /:owner/:repo/_admin/export` (read-level auth —
+  anonymous on a public repo) streams a v3 `git bundle`: the `# v3 git bundle`
+  signature, no capability lines (sha1), no prerequisites, one `<sha> <ref>`
+  line per live ref in name order, a `HEAD` line when `meta.head` resolves, a
+  blank line, then a self-contained PACK built by the same
+  `send_set`/`pack_chunk` machinery as fetch (wants = every ref tip, no haves,
+  no shallow or filter modes; `include-tag` is unnecessary because every tag
+  object reachable via a ref is already a want). The pack entries are verbatim
+  copies with the normal trailer hash; the stream carries no pkt framing —
+  a bundle is a file format, so a mid-stream failure is a truncated file.
