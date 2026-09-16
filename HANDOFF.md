@@ -128,8 +128,15 @@ drained c.parked via mem::take (now budget-gated with re-park). Job
 liveness: strands (isolate death mid-slice) now count separately from
 attempts (real errors) — strands reset per completed slice, cap 64, so
 rebuild/restart churn can't dead-letter a healthy multi-hour import.
-Undeltified normalization means the 1.12 GiB react pack lands ~6× bigger
-in R2 — `GE_QUOTA_MAX_BYTES` must be sized for the *stored* footprint.
+Dead-MPU recovery (A34): `finish` used to abort the output MPU on any
+inner failure, so a retry looped on `uploadPart … does not exist` until
+dead-letter — the job now probes the pack key on that error shape and
+either commits the already-landed object from `import_open` spans or
+wipes output state and re-emits onto a fresh MPU; imports finish via
+`finish_resumable` (no abort) and a non-`open` pushes row ends the job
+Done. Undeltified normalization means the 1.12 GiB react pack lands ~6×
+bigger in R2 — `GE_QUOTA_MAX_BYTES` must be sized for the *stored*
+footprint.
 
 ## Environment / workflow
 

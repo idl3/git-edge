@@ -1107,3 +1107,24 @@ Continuing the audit-fix numbering (last: A16).
   prefix so delete/purge takes them too. No `verify` callback, locking
   API, or custom transfer adapters; a deployment without
   `GE_URL_SIGNING_KEY` answers 403 on every batch.
+
+- **A34. Import dead-upload recovery (amends I1).** The output MPU can
+  die independently of the job cursor — aborted by a failing `finish`,
+  reaped server-side, or lost with the isolate — and
+  `resume_multipart_upload` is lazy, so a dead upload only surfaces at
+  the first `upload_part`/`complete` touching it, anywhere inside a
+  resolve or commit slice. `run_slice` catches that error shape
+  (`multipart upload … not exist` / `NoSuchUpload`) and probes the pack
+  key: if the object exists, the dead slice's `complete()` won and
+  commit runs straight from the posted `import_open` spans; otherwise
+  `import_parts`/`import_open`/`import_tail`/`objects` are wiped,
+  `scan_after` resets to -1, and resolve re-emits the pack onto a fresh
+  MPU — deterministic bytes make the rebuild safe, just slow. The
+  import finishes through `finish_resumable`, which leaves the MPU
+  alive on a mid-finish failure (transient part upload, a check fixed
+  in a later build) so the retry re-finishes from the checkpoint;
+  non-resumable callers keep the aborting `finish` so a failed inline
+  push can't orphan an upload. A pushes row that is no longer `open`
+  ends the job `Done` rather than erroring — a crash between
+  `commit_push` and the fenced job-row delete must not dead-letter an
+  import that already committed.
