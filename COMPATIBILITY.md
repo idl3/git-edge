@@ -220,7 +220,7 @@ truncation, or corrupted ref state.
 | Import facebook/react (21,698 commits, 263k objects, 1,078 MiB pack) | 25 staged pushes, 337 s; clone 18.7 s @ 1 subrequest verbatim / 14.8 s via signed `packfile-uris` — the budget wall is cleared once consolidated |
 | Import facebook/react — all 1,149 refs (462,299 objects, 1.12 GiB pack) | server-side import, committed across ~7 isolate strands incl. a dead-MPU rebuild; clone-back 6.41 GiB in 219 s, `fsck --strict` clean, refs exact |
 | Import rails/rails (99,661 commits, 787k objects, 308 MiB pack) | 39 staged pushes, 644 s; GC consolidated 23→1 live pack (718,383 objects); clone + `fsck --strict` clean |
-| Import microsoft/TypeScript (39,366 commits, ~985k objects, 2.7 GiB pack) | server-side import — the 222k-object mega-commit that client-side slicing can't express |
+| Import microsoft/TypeScript (39,366 commits, 984,826 objects, 2.72 GiB pack) | server-side import in ~1h52m (44 parts, zero retries); normalized to one 18.63 GiB live pack; clone 1,020 s via signed `packfile-uris`, `fsck --strict` clean, 324 refs + HEAD exact. Inline verbatim clone exceeds the 240 s request wall past ~7 GiB wire — set `fetch.uriprotocols` |
 
 ## Interoperability test matrix (git 2.54, live)
 

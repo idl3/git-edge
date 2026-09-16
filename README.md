@@ -15,7 +15,7 @@ All of this is exercised by the conformance suite (`tests/conformance/run.sh`) a
 - **Per-repo credentials.** Deployment-wide read/write tokens, plus per-repo tokens minted on `/_admin/tokens` with optional ref scopes (deploy keys that may only push `refs/heads/release-*`, say). Public/anonymous read is a flag, not a second deployment.
 - **Ref pinning, delete, export.** Pin a ref to freeze it; `/_admin/delete` tombstones a repo and a purge job reclaims its bytes; `/_admin/export` streams a real `git bundle`.
 - **Git LFS (basic transfer).** The batch API answers `upload`/`download` with HMAC-signed URLs; objects live under the repo's purge prefix and count toward its byte quota.
-- **Server-side resumable import.** Stage a pack in parts, then `/_admin/import` runs a job that ingests it across slices — the path that survives a Worker isolate dying mid-history. Proven on a 462,299-object facebook/react pack (1,149 refs) and running against microsoft/TypeScript's ~985k objects, whose single 222k-object commit cannot be pushed in slices at all.
+- **Server-side resumable import.** Stage a pack in parts, then `/_admin/import` runs a job that ingests it across slices — the path that survives a Worker isolate dying mid-history. Proven on a 462,299-object facebook/react pack (1,149 refs) and microsoft/TypeScript's 984,826 objects (324 refs, ~1h52m), whose single 222k-object commit cannot be pushed in slices at all.
 - **Quota + abuse limits.** Per-owner repo caps, per-repo object/byte caps, per-credential push rate limiting.
 - **Self-healing jobs.** GC (mark → consolidate → sweep), imports, and purges run as alarm-driven jobs with resumable cursors, lease fencing, and separate strand-vs-error accounting — a rebuild or isolate death can't kill a multi-hour job.
 
@@ -28,10 +28,11 @@ All of this is exercised by the conformance suite (`tests/conformance/run.sh`) a
 | Same clone via `packfile-uris` offload | **14.8 s**, ~4 subrequests — bandwidth leaves the Worker entirely |
 | Clone 718,383 objects (rails, consolidated) | fsck clean |
 | Server-side import, facebook/react all refs | 462,299 objects + 1,149 refs committed; clone-back 6.41 GiB in 219 s, fsck clean, HEAD exact |
+| Server-side import, microsoft/TypeScript all refs | 984,826 objects + 324 refs in ~1h52m (44 parts, zero retries); normalized to one 18.63 GiB pack; clone-back via `packfile-uris` in 1,020 s, fsck clean, HEAD exact |
 | Push 200 MiB / 10,207 objects | 21 s |
 | 4× parallel 20k clones | 6.9 s total |
 
-The shape that matters: once a repo consolidates to one live pack, a plain clone costs ~1 R2 read regardless of history size — the subrequest wall that used to stop clones near ~263k objects is gone, and for opted-in clients the pack bytes never touch the Worker at all.
+The shape that matters: once a repo consolidates to one live pack, a plain clone costs ~1 R2 read regardless of history size — the subrequest wall that used to stop clones near ~263k objects is gone, and for opted-in clients the pack bytes never touch the Worker at all. The remaining inline-clone bound is wall-clock: verbatim streaming does ~32 MiB/s inside the 240 s request budget, so past ~7 GiB on the wire a clone needs `fetch.uriprotocols` — the URI path downloaded TypeScript's 18.63 GiB pack without touching the fetch budget at all.
 
 ## What is in this repository
 
@@ -131,8 +132,9 @@ curl https://<host>/<owner>/<repo>/_admin/import/$PUSH \
 The job parses the staged pack across slices, resolves deltas server-side,
 and commits all refs atomically — it resumes across isolate deaths and
 rebuilds its output upload if one goes stale mid-run. Verified: a
-1.12 GiB / 462,299-object react pack (1,149 refs) commits end-to-end and
-clones back `fsck --strict` clean.
+1.12 GiB / 462,299-object react pack (1,149 refs) and a 2.72 GiB /
+984,826-object TypeScript pack (324 refs) both commit end-to-end and
+clone back `fsck --strict` clean.
 
 **Client-side slicing (small/medium repos).** `tools/git-edge-import.sh`
 slices the branch's first-parent chain into pushes that each stay under the

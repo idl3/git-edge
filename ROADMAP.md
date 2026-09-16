@@ -18,7 +18,7 @@ Public repos staged-pushed to a local worker via `tests/bench/oss-bench.sh`
 | facebook/react | 21,698 | 263k | 1,078 MiB | 25 pushes, 337 s | **18.7 s inline / 14.8 s via packfile-uris, fsck clean** | fits post-A29/A30 |
 | rails/rails | 99,661 | 787k | 308 MiB | 39 pushes, 644 s | **fsck clean** — consolidated 23→1 pack (718,383 objects) then verbatim-cloned | fits post-A29/A30 |
 | facebook/react — all refs | 21,698+branches/tags | 462k | 1,123 MiB | server-side import (1 job, dead-MPU rebuild survived) | 219 s for 6.41 GiB, fsck clean, 1,149 refs exact | fits via #25 |
-| microsoft/TypeScript | 39,366 | 985k | 2,720 MiB | server-side import (#25) | — | single 222k-object commit imports via `POST /_admin/import` job — in flight |
+| microsoft/TypeScript | 39,366 | 984,826 | 2,720 MiB | server-side import, ~1h52m, 44 parts | 1,020 s via packfile-uris (18.63 GiB normalized), fsck clean, 324 refs + HEAD exact | fits via #25 — inline clone needs `fetch.uriprotocols` past ~7 GiB wire |
 
 **Re-bench post-A29/A30 (C2/C1):** the react clone that used to die at HTTP 413
 now streams the consolidated pack verbatim — `x-ge-subrequests: 1/9000`, one R2

@@ -75,9 +75,12 @@ prefix delete of `pending/<push>.`.
 **Verified live**: full conformance incl. `GE_CONFORMANCE_IMPORT=1` PASS
 (import → commit → clone → fsck). The 462k-object react pack committed —
 1,149 refs, `push:committed` after a dead-MPU wipe+rebuild — and cloned back
-6.41 GiB in 219 s, `fsck --strict` clean, HEAD exact. TypeScript
-(984,777 objects, 2.72 GiB staged in 44 parts) is the last parity target,
-in flight on the same path.
+6.41 GiB in 219 s, `fsck --strict` clean, HEAD exact. TypeScript followed:
+984,826 objects staged in 44 parts, imported ~1h52m with zero retries,
+normalized to one 18.63 GiB live pack (6.85× undeltified expansion),
+cloned back via `packfile-uris` in 1,020 s, `fsck --strict` clean,
+324/324 refs + HEAD exact. That closes the parity matrix — every
+benchmarked repo fits.
 
 **Latent bug C2 exposed and fixed**: `PackWriter::append_stored` hashed each
 entry eagerly AND again at part upload, so every GC-consolidated pack stored
@@ -93,7 +96,8 @@ on wrangler dev — including a real git 2.55 clone over the signed URI.
 | Wall | Evidence | Status |
 |---|---|---|
 | **Clone** 413 between 110k–263k objects | benchmark round 10 | **cleared** — react 263k in 18.7 s @ 1 subrequest (A29); URI-offloaded in 14.8 s (A30) |
-| **Import** single commit > ingest budget (TS: 222k objects) | unsplittable-slice error | **cleared by I1** — react's 462k pack committed end-to-end; TypeScript's 985k in flight |
+| **Import** single commit > ingest budget (TS: 222k objects) | unsplittable-slice error | **cleared by I1** — react's 462k pack and TypeScript's 985k both committed end-to-end |
+| **Inline clone > ~7 GiB wire** | TypeScript's 18.63 GiB normalized pack hit `ERR request budget exhausted` at ~245 s (240 s wall ÷ ~32 MiB/s sideband rate) | inherent platform bound — `packfile-uris` is the path past it (1,020 s clone incl. index-pack). Documented in COMPATIBILITY |
 | **Multi-pack / pre-GC fetch** still walks the index | residual case neither A29 nor A30 covers | **cleared by #22** — `no_walk_set` marks all live packs and streams every live object in (pack,idx) order; the 200k walk bound now applies only to haves-ful incremental fetches |
 | **No-walk clone during GC transition** | `index-pack: same object appears twice` on the public-read conformance clone | **cleared** — a sha can sit in two live packs between gc_commit and gc_sweep; `no_walk_set` now scans `objects` ordered by sha and marks only the first copy (unit test + conformance overlap-window regression) |
 | **Import push expires during a >1h DO stall** | first TypeScript run: host disk filled (~17:59), froze all DO sqlite incl. the began_at heartbeat, ~35 min downtime pushed past `PUSH_TIMEOUT_MS` (1h), boot janitor swept push+TOC+staging | inherent — the heartbeat is correct; the guard is operational. Long imports need the host healthy. Dead MPU part blobs in dev state were reclaimed by hand (see below) |
@@ -103,9 +107,10 @@ on wrangler dev — including a real git 2.55 clone over the signed URI.
 - **Re-bench rails post-C2/C1** (787k objects — biggest cloneable repo) once
   consolidated; confirm the react number generalizes. ✅ done — 718,383
   objects consolidated 23→1 pack, clone + `fsck --strict` clean.
-- **TypeScript via I1** — the original parity target: `ts-all.pack` (2.72 GiB,
-  984,777 objects, 44 staged parts, 324 ref commands) is importing now;
-  confirm the 222k-object commit lands, then clone + fsck.
+- **TypeScript via I1** — ✅ done. 984,826 objects / 44 parts / ~1h52m /
+  324 refs + HEAD exact / clone 1,020 s via URIs / fsck clean. First run
+  was lost to host disk-full + push expiry (ceilings table); the rerun
+  was a clean single pass (attempts 0, strands 0).
 - P2 sweep — all done: #18 rename (resolved-wontfix, delete+repush
   documented), #19 per-ref token scopes (`scope` on mint, enforced in
   `apply_one` + `import_start`), #20 domain/Access docs, #21 LFS basic
