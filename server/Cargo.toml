@@ -27,6 +27,8 @@ gix-traverse    = { version = "0.61.0", default-features = false, features = ["s
 gix-zlib        = { version = "0.1.0", default-features = false }
 gix-validate    = { version = "0.11.4", default-features = false }
 serde_bytes = "0.11"
+hmac = "0.12"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = "z"
