@@ -1,14 +1,24 @@
-# git-edge handoff — 2026-09-16 (I1 import shipped; C2+C1 in PRs)
+# git-edge handoff — 2026-09-16 (P0–P2 all done; full conformance green)
 
 Serverless Git smart-HTTP host: Rust/WASM Cloudflare Worker + per-repo SQLite
-Durable Object + R2 packfiles. Repo: `idl3/git-edge`. Main is at `257184b`,
-clean tree, all work merged (PRs #7–#16).
+Durable Object + R2 packfiles. Repo: `idl3/git-edge`. Main is at `9369116`
+(PR #17 C2 merged). **Note:** PR #18 (C1) shows MERGED on GitHub but its merge
+commit never reached main — `p2-robustness` carries its commit, so merging the
+branch lands C1's content.
 
 ## Where things stand
 
-All P0/P1 roadmap items are done. **C2 (A29), C1 (A30), and I1 (A31) are
-implemented** — C2/C1 are PRs #17/#18 (both OPEN/CLEAN, stacked); I1 sits
-uncommitted on the working branch pending the at-scale validation below:
+All P0/P1/P2 roadmap items are done and verified. Everything sits on
+`p2-robustness` (11 commits on main): C1 `packfile-uris`, the robustness/P2
+batch (gc_tail, shared-push import, no-walk clone, token scopes, LFS, atomic),
+I1 resumable import with dead-MPU recovery + strand accounting, the no-walk
+cross-pack dedup fix, and the conformance suite additions.
+
+**Full conformance PASS** — all flags (`GC`, `IMPORT`, `LIMITS`, `PURGE`,
+`URIS`) on a dedicated wrangler with quota caps (`--persist-to` fresh state +
+`--var GE_QUOTA_MAX_*`/`GE_RATE_PUSHES_PER_MIN`; a shared dev instance can't
+run LIMITS because owner-registry claims accumulate across runs — only
+repo-delete releases them).
 
 - **C2 verbatim consolidated-pack fast path** (`consolidated_pack` +
   `VerbatimStream` in `repo_do/mod.rs`): plain-clone-shaped fetch + exactly
@@ -63,19 +73,11 @@ running job — fixed by shared-push staging (`?push=&part=`) + a janitor
 prefix delete of `pending/<push>.`.
 
 **Verified live**: full conformance incl. `GE_CONFORMANCE_IMPORT=1` PASS
-(import → commit → clone → fsck). In flight at handoff: 462k-object react
-pack (1.1 GiB, 17 staged parts) — resolve phase crossing slices cleanly.
-
-- **C2 verbatim consolidated-pack fast path** (`consolidated_pack` +
-  `VerbatimStream` in `repo_do/mod.rs`): plain-clone-shaped fetch + exactly
-  one live pack covering all wants → stream that R2 object verbatim, one
-  `bucket.get`, `x-ge-subrequests: 1`.
-- **C1 `packfile-uris`** (`pack_uri_response` + `sign.rs` + edge `pack_get`):
-  opted-in clients (`fetch.uriprotocols`, git >= 2.40) instead get a signed
-  `/_packs/<id>.pack?e=&r=&s=` URL — HMAC-SHA256 over `v1\nrepo_id\npack\nexp`
-  keyed by `GE_URL_SIGNING_KEY`, 1h TTL. Inline `packfile` section is a legal
-  empty pack; the `<hash>` token is the pack's real trailer SHA-1 (client
-  verifies). Bandwidth fully bypasses the Worker.
+(import → commit → clone → fsck). The 462k-object react pack committed —
+1,149 refs, `push:committed` after a dead-MPU wipe+rebuild — and cloned back
+6.41 GiB in 219 s, `fsck --strict` clean, HEAD exact. TypeScript
+(984,777 objects, 2.72 GiB staged in 44 parts) is the last parity target,
+in flight on the same path.
 
 **Latent bug C2 exposed and fixed**: `PackWriter::append_stored` hashed each
 entry eagerly AND again at part upload, so every GC-consolidated pack stored
@@ -91,20 +93,24 @@ on wrangler dev — including a real git 2.55 clone over the signed URI.
 | Wall | Evidence | Status |
 |---|---|---|
 | **Clone** 413 between 110k–263k objects | benchmark round 10 | **cleared** — react 263k in 18.7 s @ 1 subrequest (A29); URI-offloaded in 14.8 s (A30) |
-| **Import** single commit > ingest budget (TS: 222k objects) | unsplittable-slice error | **cleared by I1** — server-side job slices the staged pack; 462k-object react pack in flight |
+| **Import** single commit > ingest budget (TS: 222k objects) | unsplittable-slice error | **cleared by I1** — react's 462k pack committed end-to-end; TypeScript's 985k in flight |
 | **Multi-pack / pre-GC fetch** still walks the index | residual case neither A29 nor A30 covers | **cleared by #22** — `no_walk_set` marks all live packs and streams every live object in (pack,idx) order; the 200k walk bound now applies only to haves-ful incremental fetches |
+| **No-walk clone during GC transition** | `index-pack: same object appears twice` on the public-read conformance clone | **cleared** — a sha can sit in two live packs between gc_commit and gc_sweep; `no_walk_set` now scans `objects` ordered by sha and marks only the first copy (unit test + conformance overlap-window regression) |
 
 ## Next work
 
 - **Re-bench rails post-C2/C1** (787k objects — biggest cloneable repo) once
   consolidated; confirm the react number generalizes. ✅ done — 718,383
   objects consolidated 23→1 pack, clone + `fsck --strict` clean.
-- **TypeScript via I1** — the original parity target: stage `ts-all.pack`,
-  `/_admin/import`, confirm the 222k-object commit lands, then clone.
+- **TypeScript via I1** — the original parity target: `ts-all.pack` (2.72 GiB,
+  984,777 objects, 44 staged parts, 324 ref commands) is importing now;
+  confirm the 222k-object commit lands, then clone + fsck.
 - P2 sweep — all done: #18 rename (resolved-wontfix, delete+repush
   documented), #19 per-ref token scopes (`scope` on mint, enforced in
   `apply_one` + `import_start`), #20 domain/Access docs, #21 LFS basic
-  transfer (A33), #22 no-walk clone.
+  transfer (A33), #22 no-walk clone (incl. the cross-pack dedup fix).
+- Push `p2-robustness` + open PR — carries C1's content (PR #18's merge never
+  landed on main), so this merge resolves that anomaly.
 - Then the WILD section (TTL repos, GitHub-URL import, synthetic-ref seeding).
 
 **Bugs the rails GC + react 462k re-run flushed out** (all fixed): GC's

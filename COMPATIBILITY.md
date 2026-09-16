@@ -217,9 +217,10 @@ truncation, or corrupted ref state.
 | Import sinatra/sinatra (4,684 commits, 22.6k objects, 8 MiB pack) | 1 push, 11 s; clone 2 s, fsck clean |
 | Import expressjs/express (6,169 commits, 32.5k objects, 11 MiB pack) | 2 staged pushes, 15 s; clone 8 s, fsck clean |
 | Import vitejs/vite (9,678 commits, 110k objects, 75 MiB pack) | 4 staged pushes, 337 s; clone 133 s, fsck clean |
-| Import facebook/react (21,698 commits, 263k objects, 1,078 MiB pack) | 25 staged pushes, 337 s; **clone fails** — `Error::Budget` → HTTP 413 mid-walk (per-request subrequest budget). *Post-A29/A30: once GC consolidates to `packs_live=1`, plain clones take the verbatim path (~1 subrequest); `fetch.uriprotocols` clients get a signed pack URL instead — bandwidth off the Worker* |
-| Import rails/rails (99,661 commits, 787k objects, 308 MiB pack) | 39 staged pushes, 644 s; **clone fails** — same budget wall; `blob:none` doesn't help (budget is index reads, not blob bytes). *Post-A29/A30: verbatim path (or signed-URI offload for opted-in clients) applies once consolidated to one live pack* |
-| Import microsoft/TypeScript (39,366 commits, 945k objects, 2.8 GiB pack) | **import infeasible** — one commit alone adds ~222k objects; staging can't split below a commit |
+| Import facebook/react (21,698 commits, 263k objects, 1,078 MiB pack) | 25 staged pushes, 337 s; clone 18.7 s @ 1 subrequest verbatim / 14.8 s via signed `packfile-uris` — the budget wall is cleared once consolidated |
+| Import facebook/react — all 1,149 refs (462,299 objects, 1.12 GiB pack) | server-side import, committed across ~7 isolate strands incl. a dead-MPU rebuild; clone-back 6.41 GiB in 219 s, `fsck --strict` clean, refs exact |
+| Import rails/rails (99,661 commits, 787k objects, 308 MiB pack) | 39 staged pushes, 644 s; GC consolidated 23→1 live pack (718,383 objects); clone + `fsck --strict` clean |
+| Import microsoft/TypeScript (39,366 commits, ~985k objects, 2.7 GiB pack) | server-side import — the 222k-object mega-commit that client-side slicing can't express |
 
 ## Interoperability test matrix (git 2.54, live)
 
