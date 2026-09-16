@@ -2,6 +2,7 @@
 //! CONTRACTS.md 1.3, 3, 8. Ported from repo-do-ref-authority + refs-sqlite-objects-r2 + auth proofs.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use bstr::{BString, ByteSlice};
@@ -1783,10 +1784,17 @@ impl RepoDo {
         Ok(Some((pack, bytes)))
     }
 
-    /// #22 no-walk clone: every live pack marked whole — `plan_reads` then
-    /// coalesces contiguous entries into 8 MiB reads exactly like the walked
-    /// path, and `pack_chunk` copies each verbatim. Duplicate shas across packs
-    /// emit twice (legal — index-pack dedups) rather than paying a seen-set.
+    /// #22 no-walk clone: every live pack's entries are emitted verbatim —
+    /// `plan_reads` coalesces contiguous entries into 8 MiB reads exactly like
+    /// the walked path, and `pack_chunk` copies each span byte-for-byte.
+    /// The same sha can sit in two live packs during a GC transition (the
+    /// consolidated pack goes live at gc_commit while gc_sweep — a later job —
+    /// still has the sources live), and git's index-pack REJECTS a pack whose
+    /// entries name the same object twice. Rows are scanned ordered by sha so
+    /// an object's copies across packs are adjacent; marking the first row of
+    /// each run emits it exactly once (O(1) memory, no seen-set). The IN list
+    /// pins the dedup domain to the snapshot's packs: a pack going live
+    /// mid-scan cannot win a sha's single slot and leave it unmarked.
     /// None when <2 live packs: single-pack clones take the A29/C1 path.
     fn no_walk_set(&self, idx: &Index<'_>, budget: &ReqBudget) -> Result<Option<generate::SendSet>, Error> {
         #[derive(serde::Deserialize)]
@@ -1802,17 +1810,35 @@ impl RepoDo {
             return Ok(None);
         }
         let mut set = generate::SendSet::default();
-        for p in live {
+        let mut by_pack: HashMap<String, usize> = HashMap::new();
+        let mut args: Vec<V> = Vec::with_capacity(live.len() + 1);
+        let marks = live.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        for p in &live {
             let count = u32::try_from(p.count).map_err(|_| Error::Internal("count".into()))?;
             let bytes = u64::try_from(p.bytes).map_err(|_| Error::Internal("bytes".into()))?;
             let bits = usize::try_from(count).map_err(|_| Error::Internal("count".into()))?.div_ceil(8);
-            let mut bitmap = vec![0xFFu8; bits];
-            if count % 8 != 0 {
-                if let Some(last) = bitmap.last_mut() {
-                    *last &= (1u8 << (count % 8)) - 1;
-                }
+            by_pack.insert(p.id.clone(), set.packs.len());
+            args.push(V::from(p.id.as_str()));
+            set.packs.push(generate::PackSlice { pack: PackId(p.id.clone()), count, bytes, bitmap: vec![0; bits] });
+        }
+        let mut last = String::new();
+        loop {
+            let mut page = args.clone();
+            page.push(V::from(last.as_str()));
+            let rows = self
+                .q(
+                    &format!(
+                        "SELECT sha, pack_id, idx FROM objects \
+                         WHERE pack_id IN ({marks}) AND sha > ? ORDER BY sha LIMIT 5000"
+                    ),
+                    page,
+                )?
+                .to_array::<DedupRow>()?;
+            let n = rows.len();
+            mark_dedup(&rows, &mut set.packs, &by_pack, &mut last)?;
+            if n < 5000 {
+                break;
             }
-            set.packs.push(generate::PackSlice { pack: PackId(p.id), count, bytes, bitmap });
         }
         generate::plan_reads(idx, &mut set, budget)?;
         Ok(Some(set))
@@ -2087,6 +2113,42 @@ impl RepoDo {
     }
 }
 
+/// One row of `no_walk_set`'s sha-ordered dedup scan.
+#[derive(serde::Deserialize)]
+struct DedupRow {
+    sha: String,
+    pack_id: String,
+    idx: u32,
+}
+
+/// Marks the first row of each same-sha run into its pack slice's bitmap —
+/// the scan's `ORDER BY sha` makes a sha's copies across packs adjacent, so
+/// each object gets exactly one physical entry in the emitted pack. `last`
+/// is the sha cursor: it equals the caller's `sha > ?` page bound, so a group
+/// split across pages still dedups (later copies sort ahead of the bound).
+fn mark_dedup(
+    rows: &[DedupRow],
+    packs: &mut [generate::PackSlice],
+    by_pack: &HashMap<String, usize>,
+    last: &mut String,
+) -> Result<(), Error> {
+    for r in rows {
+        if r.sha == *last {
+            continue;
+        }
+        let i = *by_pack
+            .get(&r.pack_id)
+            .ok_or_else(|| Error::Internal("object row in unlisted pack".into()))?;
+        let byte = usize::try_from(r.idx / 8).map_err(|_| Error::Internal("idx".into()))?;
+        *packs
+            .get_mut(i)
+            .and_then(|p| p.bitmap.get_mut(byte))
+            .ok_or_else(|| Error::Storage("idx past pack count".into()))? |= 1u8 << (r.idx % 8);
+        *last = r.sha.clone();
+    }
+    Ok(())
+}
+
 struct FetchStream {
     budget: ReqBudget,
     bucket: Bucket,
@@ -2258,7 +2320,59 @@ struct PackMetaDto {
 
 #[cfg(test)]
 mod tests {
-    use super::{scope_allows, scope_pattern_ok};
+    use super::{mark_dedup, scope_allows, scope_pattern_ok, DedupRow};
+    use crate::pack::generate;
+    use crate::store::PackId;
+    use std::collections::HashMap;
+
+    fn slice(id: &str, count: u32) -> generate::PackSlice {
+        generate::PackSlice {
+            pack: PackId(id.to_string()),
+            count,
+            bytes: 100,
+            bitmap: vec![0; (count as usize).div_ceil(8)],
+        }
+    }
+
+    fn row(sha: &str, pack: &str, idx: u32) -> DedupRow {
+        DedupRow { sha: sha.to_string(), pack_id: pack.to_string(), idx }
+    }
+
+    /// The GC-transition shape that produced "same object appears twice in the
+    /// pack": the consolidated pack and its not-yet-swept sources are all live,
+    /// so a sha has one objects row per pack. Ordered by sha those copies are
+    /// adjacent — mark_dedup must emit exactly one physical entry per object.
+    #[test]
+    fn no_walk_dedup() {
+        let mut packs = vec![slice("p1", 2), slice("p2", 2)];
+        let by_pack: HashMap<String, usize> =
+            [("p1".to_string(), 0usize), ("p2".to_string(), 1)].into_iter().collect();
+        // sha order: a in p1@0 + p2@0 (dup), b only p1@1, c only p2@1
+        let rows = vec![
+            row("a", "p1", 0),
+            row("a", "p2", 0),
+            row("b", "p1", 1),
+            row("c", "p2", 1),
+        ];
+        let mut last = String::new();
+        mark_dedup(&rows, &mut packs, &by_pack, &mut last).unwrap();
+        assert_eq!(packs[0].bitmap[0], 0b11); // a + b
+        assert_eq!(packs[1].bitmap[0], 0b10); // c only — a's second copy skipped
+        assert_eq!(last, "c");
+
+        // page boundary mid-group: `last` carries the boundary sha across
+        // pages, so a group's tail rows in the next page are still skipped
+        let mut packs = vec![slice("p1", 2), slice("p2", 2)];
+        let mut last = String::new();
+        mark_dedup(&[row("a", "p1", 0), row("a", "p2", 0)], &mut packs, &by_pack, &mut last).unwrap();
+        mark_dedup(&[row("b", "p1", 1), row("b", "p2", 1)], &mut packs, &by_pack, &mut last).unwrap();
+        assert_eq!(packs[0].bitmap[0], 0b11);
+        assert_eq!(packs[1].bitmap[0], 0);
+
+        // idx past the slice's count errors instead of wrapping into a corrupt set
+        let mut packs = vec![slice("p1", 1)];
+        assert!(mark_dedup(&[row("z", "p1", 9)], &mut packs, &by_pack, &mut String::new()).is_err());
+    }
 
     #[test]
     fn scope_pattern_validation() {
