@@ -96,6 +96,7 @@ on wrangler dev — including a real git 2.55 clone over the signed URI.
 | **Import** single commit > ingest budget (TS: 222k objects) | unsplittable-slice error | **cleared by I1** — react's 462k pack committed end-to-end; TypeScript's 985k in flight |
 | **Multi-pack / pre-GC fetch** still walks the index | residual case neither A29 nor A30 covers | **cleared by #22** — `no_walk_set` marks all live packs and streams every live object in (pack,idx) order; the 200k walk bound now applies only to haves-ful incremental fetches |
 | **No-walk clone during GC transition** | `index-pack: same object appears twice` on the public-read conformance clone | **cleared** — a sha can sit in two live packs between gc_commit and gc_sweep; `no_walk_set` now scans `objects` ordered by sha and marks only the first copy (unit test + conformance overlap-window regression) |
+| **Import push expires during a >1h DO stall** | first TypeScript run: host disk filled (~17:59), froze all DO sqlite incl. the began_at heartbeat, ~35 min downtime pushed past `PUSH_TIMEOUT_MS` (1h), boot janitor swept push+TOC+staging | inherent — the heartbeat is correct; the guard is operational. Long imports need the host healthy. Dead MPU part blobs in dev state were reclaimed by hand (see below) |
 
 ## Next work
 
@@ -161,6 +162,12 @@ footprint.
   put tokens in git URLs (credential helper / `GE_TOKEN` env only).
 - Owner quota (50 repos default) accumulates across conformance runs — use a
   unique `GE_REPO` owner or expect registry-DO claim exhaustion.
+- **miniflare dev-state leak**: dead/aborted MPU part blobs persist in
+  `.wrangler/state/v3/r2` (`_mf_multipart_parts` rows + `blobs/` files) even
+  after complete/abort — reclaim by deleting part blob files by `blob_id`
+  then clearing both `_mf_multipart_*` tables (only when no live jobs).
+  Orphaned `pending/` objects whose DO no longer exists can be deleted the
+  same way via `_mf_objects`. Freed ~18 GiB after the TS expiry sweep.
 
 ## Local state on the old machine (won't transfer)
 
