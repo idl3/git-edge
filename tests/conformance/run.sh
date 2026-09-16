@@ -351,7 +351,10 @@ curl -sf "$URL/$ADMINREPO/_admin/export" -o "$WORK/exp.bundle" || fail "export"
 head -1 "$WORK/exp.bundle" | grep -q "v3 git bundle" || fail "not a v3 bundle"
 git -C "$WORK/seed" bundle verify "$WORK/exp.bundle" >/dev/null || fail "bundle verify"
 git clone -q "$WORK/exp.bundle" "$WORK/bundleclone" || fail "clone from bundle"
-[ "$(git -C "$WORK/bundleclone" rev-parse main)" = "$ATIP" ] || fail "bundle tip"
+# HEAD is a detached oid in the bundle (git's own format does the same), so with
+# two refs at the same tip the checked-out branch is ambiguous — assert the
+# remote-tracking ref carries main's tip instead of relying on a local branch
+[ "$(git -C "$WORK/bundleclone" rev-parse origin/main)" = "$ATIP" ] || fail "bundle tip"
 
 note "repo delete: tombstone 410 window, purge, name reusable"
 curl -sf -X POST "$URL/$ADMINREPO/_admin/delete" | grep -q deleted || fail "delete"
@@ -380,8 +383,9 @@ done
 
 # Quota + push rate-limit checks (A26/A27): only runs with GE_CONFORMANCE_LIMITS=1
 # and the dev server started with small caps, e.g. .dev.vars:
-#   GE_QUOTA_MAX_OBJECTS=25 GE_QUOTA_MAX_REPOS_PER_OWNER=3 GE_RATE_PUSHES_PER_MIN=12
-# (25 stays above the main suite's ~12 objects/repo; 12 stays above its 9 pushes.)
+#   GE_QUOTA_MAX_OBJECTS=25 GE_QUOTA_MAX_REPOS_PER_OWNER=4 GE_RATE_PUSHES_PER_MIN=12
+# (25 stays above the main suite's ~12 objects/repo; 12 stays above its 9 pushes;
+# the owner cap must exceed the suite's peak live claims — run+admin+gc+import = 4.)
 if [ "${GE_CONFORMANCE_LIMITS:-0}" = "1" ]; then
   O="quota-$SECONDS-$$"
   post() { # one canned receive-pack POST (bad pack body is fine — it reaches begin)
@@ -400,10 +404,13 @@ if [ "${GE_CONFORMANCE_LIMITS:-0}" = "1" ]; then
   grep -qi "quota" "$WORK/qerr" || fail "no quota reason in push output: $(cat "$WORK/qerr")"
 
   note "repo quota: claims past GE_QUOTA_MAX_REPOS_PER_OWNER are rejected"
-  # $O/obj already claimed slot 1; fill the remaining two, then the next must fail
-  post "$O/b" >/dev/null
-  post "$O/c" >/dev/null
-  out=$(post "$O/d")
+  # $O/obj already claimed slot 1; fill until the registry refuses — the exact
+  # cap is the dev server's, so this loop (not a fixed third post) is the test
+  out=""
+  for r in b c d e f g h; do
+    out=$(post "$O/$r")
+    echo "$out" | grep -q "GE_QUOTA_MAX_REPOS_PER_OWNER" && break
+  done
   echo "$out" | grep -q "GE_QUOTA_MAX_REPOS_PER_OWNER" \
     || fail "repo-cap rejection missing GE_QUOTA_MAX_REPOS_PER_OWNER: $out"
 
@@ -504,6 +511,34 @@ if [ "${GE_CONFORMANCE_IMPORT:-0}" = "1" ]; then
   # and a stage that re-begins the now-committed push is refused the same way
   code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$IREPO/_admin/import/stage?push=$PUSH&part=c" --data-binary @"$WORK/stage.part.ab")
   [ "$code" = "409" ] || fail "re-begin committed push -> $code, want 409"
+  # no-walk dedup regression: a second import re-ships an object already live,
+  # so while its pack is live pre-sweep that object sits in two live packs at
+  # once — the exact shape a gc_consolidate/gc_sweep window creates. A clone
+  # must emit each sha once; index-pack rejects duplicates in one pack. The
+  # pack carries only the tip commit (its tree/blob resolve against the live
+  # pack at check) so GE_QUOTA_MAX_OBJECTS stays comfortably under a limits run.
+  echo "$NEW" | git pack-objects --stdout > "$WORK/dup.pack"
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import/stage" --data-binary @"$WORK/dup.pack")
+  PUSH3=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["push"])')
+  KEY3=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+  BYTES3=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["bytes"])')
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import" -H 'Content-Type: application/json' \
+    -d "{\"push\":\"$PUSH3\",\"parts\":[{\"key\":\"$KEY3\",\"bytes\":$BYTES3}],\"commands\":[{\"old\":\"$ZERO\",\"new\":\"$NEW\",\"name\":\"refs/heads/dup2\"}]}")
+  echo "$st" | grep -q queued || fail "overlap import start: $st"
+  deadline=$((SECONDS + 60))
+  while :; do
+    st=$(curl -sf "$URL/$IREPO/_admin/import/$PUSH3")
+    ps=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("push_state"))')
+    [ "$ps" = "committed" ] && break
+    [ "$ps" = "rejected" ] && fail "overlap import rejected: $st"
+    [ $SECONDS -lt $deadline ] || fail "overlap import did not commit: $st"
+    sleep 0.2
+  done
+  # clone inside the overlap window — GC's quiet period holds the sweep back
+  OVRLAP=$(curl -sf "$URL/$IREPO/_state" | python3 -c 'import sys,json;print(json.load(sys.stdin)["packs_live"])')
+  git clone -q "$URL/$IREPO" "$WORK/dclone" || fail "overlap-window clone"
+  git -C "$WORK/dclone" fsck --strict || fail "overlap-window fsck"
+  [ "$OVRLAP" -ge 2 ] && note "overlap clone exercised dedup (packs_live=$OVRLAP)" || note "sweep beat the clone — dedup path not exercised this run"
 fi
 
 # purge_repo job: POST _admin/delete enqueues it; the repo converges to empty
