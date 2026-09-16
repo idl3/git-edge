@@ -1104,6 +1104,7 @@ fn leak_reason(m: &str) -> &'static str {
         "missing necessary objects" => "missing necessary objects",
         "gc ran during push, retry" => "gc ran during push, retry",
         "ref is pinned" => "ref is pinned",
+        "ref outside token scope" => "ref outside token scope",
         _ => "failed to update ref",
     }
 }
