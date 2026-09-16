@@ -26,6 +26,31 @@ git branch -M main
 git push -q "$URL/$REPO" main || fail "initial push"
 TIP1=$(git rev-parse HEAD)
 
+note "verbatim consolidated-pack fast path (C2): packs_live=1 streams the pack whole"
+# one live pack covers everything, so a plain-clone fetch is one R2 GET — the DO
+# stamps its projected spend on the response: exactly 1, where the walking path
+# is one subrequest per planned read. A hand-rolled POST asserts the count;
+# a real clone proves the verbatim pack is wire-valid.
+python3 - "$TIP1" > "$WORK/fetchpkt.bin" <<'PY'
+import sys
+tip = sys.argv[1]
+def pkt(b):
+    return f"{len(b)+4:04x}".encode() + b
+out = pkt(b"command=fetch\n") + pkt(b"object-format=sha1\n") + b"0001"
+out += pkt(f"want {tip}\n".encode()) + pkt(b"done\n") + b"0000"
+sys.stdout.buffer.write(out)
+PY
+curl -s -D "$WORK/fh" -o "$WORK/fresp.bin" -X POST "$URL/$REPO/git-upload-pack" \
+  -H 'Git-Protocol: version=2' -H 'Content-Type: application/x-git-upload-pack-request' \
+  --data-binary @"$WORK/fetchpkt.bin"
+grep -aq "packfile" "$WORK/fresp.bin" || fail "no packfile section in fetch response"
+grep -aq "PACK" "$WORK/fresp.bin" || fail "no PACK bytes in fetch response"
+n=$(tr -d '\r' < "$WORK/fh" | sed -nE 's/^x-ge-subrequests: ([0-9]+).*/\1/ip' | tail -1)
+[ "$n" = "1" ] || fail "verbatim path not taken (x-ge-subrequests=$n, want 1)"
+git clone -q "$URL/$REPO" "$WORK/clone1" || fail "single-pack clone"
+[ "$(git -C "$WORK/clone1" rev-parse main)" = "$TIP1" ] || fail "single-pack clone tip"
+git -C "$WORK/clone1" fsck --strict || fail "single-pack clone fsck"
+
 note "incremental push (thin pack with deltas)"
 dd if=/dev/urandom of=big.bin bs=1m count=6 2>/dev/null
 git add big.bin && git commit -qm big

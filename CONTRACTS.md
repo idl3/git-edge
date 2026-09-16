@@ -926,3 +926,22 @@ Continuing the audit-fix numbering (last: A16).
   stamps `x-ge-refs-version` on `/_do/refs` and the edge echoes it on
   `info/refs`. `_state` reports `refs_memo_hits`/`refs_memo_misses` and
   `rate_rows`.
+- **A29. Verbatim consolidated-pack fast path (amends section 9 step 6).**
+  When a fetch is plain-clone-shaped — no haves, no `shallow`, no
+  `deepen`/`deepen-since`/`deepen-not`/`deepen-relative`, no `filter` — and the
+  repo has exactly one live pack containing every resolved want, the DO
+  streams that pack's R2 object verbatim as the `packfile` section instead of
+  walking a send set and copying entries through `pack_chunk`. `packs_live=1`
+  makes the send set a subset of the pack by construction (the index only
+  resolves live packs), so the verbatim bytes are a wire-legal superset: the
+  client index-packs extras and its connectivity check still passes. Cost is
+  one R2 `get` — `x-ge-subrequests` reports `1` — where the walking path
+  charges one subrequest per planned read plus the walk's own loads; the
+  pack's own header and trailer ride inside the body bytes, so no trailer
+  hash is computed. The request-shape gate is strict precisely because
+  superset objects are legal: any shallow or filter argument carries a
+  contract extra objects would violate. A want the index does not resolve
+  into that one pack — including an unresolvable want the walking path would
+  reject — falls back to `send_set`, which produces the proper response.
+  Mid-stream failures degrade exactly like step 6's: one band-3 `ERR` frame,
+  then the stream ends.

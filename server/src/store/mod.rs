@@ -604,7 +604,6 @@ impl PackWriter {
         let (kind, _size, _hlen) = codec::entry_header(entry)?;
         let len = u32::try_from(entry.len()).map_err(|_| Error::Limit("entry too long".into()))?;
         self.part.extend_from_slice(entry);
-        self.sha1.update(entry);
         let offset = self.offset;
         self.offset = offset.saturating_add(u64::from(len));
         if kind == Kind::Commit {
