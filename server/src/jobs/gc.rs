@@ -1090,3 +1090,27 @@ pub async fn gc_sweep(d: &RepoDo) -> Result<SliceOutcome, Error> {
     exec(&sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
     Ok(SliceOutcome::Done)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Pos;
+
+    /// A gc.pos persisted before tail/(bci,bidx,bfrag) existed must still load —
+    /// serde defaults degrade a missing tail to 0, which the resume path reads
+    /// as "nothing undrained persisted" and falls back to boundary replay.
+    #[test]
+    fn pos_backward_compat() {
+        let old = r#"{"ci":0,"idx":20407,"pack":"p","upload":"u","st":null,
+                     "frag":0,"total":718383,"lo":0,"hi":0}"#;
+        let p: Pos = serde_json::from_str(old).unwrap();
+        assert_eq!(p.idx, 20407);
+        assert_eq!(p.tail, 0);
+        assert_eq!((p.bci, p.bidx, p.bfrag), (0, 0, 0));
+        // a cursor with the fields round-trips
+        let new = r#"{"ci":1,"idx":5,"pack":"p","upload":"u","st":null,"frag":9,
+                     "total":10,"lo":0,"hi":0,"tail":6427865,"bci":0,"bidx":3,"bfrag":2}"#;
+        let p: Pos = serde_json::from_str(new).unwrap();
+        assert_eq!(p.tail, 6427865);
+        assert_eq!((p.bci, p.bidx, p.bfrag), (0, 3, 2));
+    }
+}

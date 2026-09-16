@@ -154,7 +154,7 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         if done {
             // I1 staging tables die with the push: committed imports already cleaned
             // theirs (no-op), expired/rejected ones get theirs dropped here
-            for t in ["push_links", "import_toc", "import_parts", "import_open"] {
+            for t in ["push_links", "import_toc", "import_parts", "import_open", "import_tail"] {
                 d.q(&format!("DELETE FROM {t} WHERE push_id=?"), vec![V::from(p.id.as_str())])?;
             }
             d.q("UPDATE pushes SET swept_at=? WHERE id=?", vec![V::from(now), V::from(p.id.as_str())])?;

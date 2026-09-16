@@ -979,7 +979,7 @@ pub mod schema {
         "CREATE TABLE IF NOT EXISTS objects (sha TEXT NOT NULL, pack_id TEXT NOT NULL, idx INTEGER NOT NULL, offset INTEGER NOT NULL, len INTEGER NOT NULL, kind INTEGER NOT NULL, size INTEGER NOT NULL, PRIMARY KEY (sha, pack_id)) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS objects_pack ON objects(pack_id, idx)",
         "CREATE INDEX IF NOT EXISTS objects_pack_off ON objects(pack_id, offset)",
-        "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, run_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, cursor TEXT, payload TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'queued', last_error TEXT, started_at INTEGER, lease TEXT)",
+        "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, run_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, cursor TEXT, payload TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'queued', last_error TEXT, started_at INTEGER, lease TEXT, strands INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS marked (pack_id TEXT PRIMARY KEY, bitmap BLOB NOT NULL) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_frontier (sha TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_seen (sha TEXT PRIMARY KEY) WITHOUT ROWID",
@@ -1012,6 +1012,10 @@ pub mod schema {
         // a byte replay (PackWriter cannot write out of order).
         "CREATE TABLE IF NOT EXISTS import_open (push_id TEXT NOT NULL, idx INTEGER NOT NULL, off INTEGER NOT NULL, end INTEGER, sha TEXT, kind INTEGER, size INTEGER, PRIMARY KEY (push_id, idx)) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS import_open_off ON import_open(push_id, off)",
+        // A32 for the import side: the undrained <PART writer tail, chunked
+        // under the SqlStorage value ceiling — persisted at yield, reloaded at
+        // resume so a sub-part slice's appends don't die with the isolate
+        "CREATE TABLE IF NOT EXISTS import_tail (push_id TEXT NOT NULL, seq INTEGER NOT NULL, blob BLOB NOT NULL, PRIMARY KEY (push_id, seq)) WITHOUT ROWID",
     ];
     /// Columns added after first deploy. CREATE TABLE IF NOT EXISTS never updates an
     /// existing table, so DOs booted under an older schema need ALTER TABLE — SQLite
@@ -1021,6 +1025,7 @@ pub mod schema {
         ("packs", "dead_at", "dead_at INTEGER"),
         ("jobs", "started_at", "started_at INTEGER"),
         ("jobs", "lease", "lease TEXT"),
+        ("jobs", "strands", "strands INTEGER NOT NULL DEFAULT 0"),
         ("import_open", "sha", "sha TEXT"),
         ("import_open", "kind", "kind INTEGER"),
         ("import_open", "size", "size INTEGER"),

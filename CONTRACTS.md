@@ -1076,6 +1076,19 @@ Continuing the audit-fix numbering (last: A16).
   its checkpoint can't rebind to wrong part numbers. All GC wipe paths —
   mark-cycle start, sweep reschedule, begin_build early-outs, rebuild,
   finish — delete `gc_tail` with the rest.
+  The import resolver has the same hazard with the same fix
+  (`import_tail(push_id, seq, blob)`, cursor `scan_after` + `tail`):
+  `scan_after` keeps the TOC queue scan monotonic so resume never re-walks
+  the completed prefix, `tail` is the persisted `<PART` buffer length.
+  Ordering differs from GC because the import can re-run a boundary entry
+  mid-body: the `lost`-writers pass runs at `out.offset()==durable` first;
+  if any entry needs the straddler re-run (`end IS NULL` past the boundary),
+  the tail is discarded rather than restored — its bytes belong to offsets
+  the re-run would overwrite. Otherwise the tail loads back wholesale,
+  `import_open` rows inside `[durable, durable+tail)` supply the completed
+  count and commit span, and the requeue bound becomes `durable+tail_len`.
+  `import_tail` dies with the push on abort, rebuild, terminal cleanup, and
+  janitor sweep.
 
 - **A33. Git LFS basic transfer (`/_do/lfs/batch`, `/_lfs/<oid>`).** The
   standard LFS batch endpoint

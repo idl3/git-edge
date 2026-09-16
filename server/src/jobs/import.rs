@@ -43,6 +43,9 @@ const QUEUE_BATCH: i64 = 20_000;
 const TOC_FANOUT: usize = 10;
 /// 2.5 sweep page.
 const CHECK_PAGE: i64 = 1_000;
+/// import_tail row size — under the SqlStorage value ceiling; a <PART tail is
+/// ~128 rows.
+const TAIL_CHUNK: usize = 64 << 10;
 
 #[derive(Deserialize)]
 struct Part {
@@ -66,7 +69,11 @@ struct Parked {
     base: String,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+fn neg_one() -> i64 {
+    -1
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Cursor {
     phase: String, // "" | "resolve" | "check" | "commit"
@@ -80,6 +87,31 @@ struct Cursor {
     st: Option<WriterCkpt>,
     // 2.5 sweep
     check_after: String,
+    // resolve queue position: entries at or below it are done (objects row),
+    // parked (c.parked), or non-durable (requeue set rebuilt per slice) —
+    // the scan is monotonic and never re-walks them
+    #[serde(default = "neg_one")]
+    scan_after: i64,
+    // byte length of the writer tail persisted to import_tail at the last
+    // yield — 0 when nothing undrained survived the slice
+    #[serde(default)]
+    tail: u64,
+}
+impl Default for Cursor {
+    fn default() -> Self {
+        Self {
+            phase: String::new(),
+            parse_pos: 0,
+            next_idx: 0,
+            count: 0,
+            parked: Vec::new(),
+            upload: String::new(),
+            st: None,
+            check_after: String::new(),
+            scan_after: -1,
+            tail: 0,
+        }
+    }
 }
 
 fn exec(sql: &SqlStorage, q: &str, args: Vec<V>) -> Result<worker::SqlCursor, Error> {
@@ -390,11 +422,14 @@ async fn resume_drain<'a>(
         if let Ok(mpu) = bucket.inner.resume_multipart_upload(&key, &c.upload) {
             let _ = mpu.abort().await;
         }
-        for t in ["import_parts", "import_open"] {
+        for t in ["import_parts", "import_open", "import_tail"] {
             exec(sql, &format!("DELETE FROM {t} WHERE push_id=?"), vec![V::from(p.push.as_str())])?;
         }
         exec(sql, "DELETE FROM objects WHERE pack_id=?", vec![V::from(pack.0.as_str())])?;
         c.upload.clear();
+        // the scan cursor and tail refer to the deleted output — start over
+        c.scan_after = -1;
+        c.tail = 0;
     }
     let mut out = if c.upload.is_empty() {
         let w = PackWriter::create(&bucket, &key, c.count, &mut budget.req).await?;
@@ -456,20 +491,12 @@ async fn resume_drain<'a>(
     let mut pending: HashMap<ObjectId, Vec<u32>> = HashMap::new();
     let mut parked_set: HashSet<u32> = HashSet::new();
     // --- derive the durable boundary: identical for a clean continue and a crash.
-    // Posted rows past the last uploaded part describe bytes that never landed —
-    // delete them so the queue re-runs those entries, then find the writer whose
-    // span straddles the boundary via import_open (written at first append).
-    let durable = c.st.as_ref().map(|s| s.pos).unwrap_or(0);
-    exec(
-        sql,
-        "DELETE FROM objects WHERE pack_id=? AND offset+len>?",
-        vec![V::from(pack.0.as_str()), i64v(durable)?],
-    )?;
     // Writers that never posted a row at-or-below the boundary (bounded by the
     // post batch): a fully-durable one is re-sealed by direct-inserting the shadow
     // row (byte-identical replay is impossible — the writer can't write out of
     // order); the single straddler — always last, later writers start past the
     // boundary — resumes mid-body at skip = durable - off.
+    let durable = c.st.as_ref().map(|s| s.pos).unwrap_or(0);
     #[derive(Deserialize)]
     struct W {
         idx: i64,
@@ -489,6 +516,54 @@ async fn resume_drain<'a>(
         vec![V::from(p.push.as_str()), i64v(durable)?, V::from(pack.0.as_str())],
     )?
     .to_array::<W>()?;
+    // The yield-persisted tail (import_tail) sits between `durable` and
+    // `durable+c.tail`: a yield-resume restores it into the writer, so objects
+    // rows inside it keep their bytes; a crash-resume finds no/short rows and
+    // falls back to the bare durable bound — those entries re-run via requeue.
+    // A straddler re-run appends at out.offset()==durable with skip=durable-off,
+    // so discovering one forces the tail to be discarded — its bytes belong to
+    // offsets the straddler re-run would overwrite.
+    let straddler = lost.iter().any(|w| {
+        w.end
+            .and_then(|v| u64::try_from(v).ok())
+            .into_iter()
+            .chain(w.next_off.and_then(|v| u64::try_from(v).ok()))
+            .min()
+            .unwrap_or(u64::MAX)
+            > durable
+    });
+    #[derive(Deserialize)]
+    struct TB {
+        #[serde(with = "serde_bytes")]
+        blob: Vec<u8>,
+    }
+    let tail: Vec<u8> = exec(
+        sql,
+        "SELECT blob FROM import_tail WHERE push_id=? ORDER BY seq",
+        vec![V::from(p.push.as_str())],
+    )?
+    .to_array::<TB>()?
+    .into_iter()
+    .flat_map(|r| r.blob)
+    .collect();
+    exec(
+        sql,
+        "DELETE FROM import_tail WHERE push_id=?",
+        vec![V::from(p.push.as_str())],
+    )?;
+    let tail_len = if !straddler && c.tail > 0 && tail.len() as u64 == c.tail {
+        c.tail
+    } else {
+        0 // tail lost/short/unsafe — entries past `durable` re-run via requeue
+    };
+    c.tail = 0;
+    // Posted rows past the live end describe bytes that never landed —
+    // delete them so the queue re-runs those entries.
+    exec(
+        sql,
+        "DELETE FROM objects WHERE pack_id=? AND offset+len>?",
+        vec![V::from(pack.0.as_str()), i64v(durable.saturating_add(tail_len))?],
+    )?;
     let mut done_set: HashSet<u32> = HashSet::new();
     for w in lost {
         let (woff, wend, wnext) = (
@@ -553,9 +628,68 @@ async fn resume_drain<'a>(
             }
         }
     }
+    if tail_len > 0 {
+        // restore the yield-persisted <PART tail now that any boundary re-runs are
+        // done: entries that completed inside it posted their rows at the yield —
+        // count them so the writer's totals and commit span continue exactly
+        #[derive(Deserialize)]
+        struct TN {
+            n: i64,
+        }
+        let n = exec(
+            sql,
+            "SELECT COUNT(*) AS n FROM import_open WHERE push_id=? AND off>? AND end<=?",
+            vec![
+                V::from(p.push.as_str()),
+                i64v(durable)?,
+                i64v(durable.saturating_add(tail_len))?,
+            ],
+        )?
+        .one::<TN>()?
+        .n;
+        #[derive(Deserialize)]
+        struct CS {
+            lo: Option<i64>,
+            hi: Option<i64>,
+        }
+        let cs = exec(
+            sql,
+            "SELECT MIN(off) AS lo, MAX(end) AS hi FROM import_open \
+             WHERE push_id=? AND off>? AND end<=? AND kind=1",
+            vec![
+                V::from(p.push.as_str()),
+                i64v(durable)?,
+                i64v(durable.saturating_add(tail_len))?,
+            ],
+        )?
+        .one::<CS>()?;
+        out.resume_tail(
+            &tail,
+            u32::try_from(n).unwrap_or(0),
+            cs.lo.and_then(|v| u64::try_from(v).ok()).unwrap_or(u64::MAX),
+            cs.hi.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
+        );
+    }
     // re-attempt parked entries rather than trusting the cursor's base ids: a base
     // may have resolved since the cursor saved (crash slices lose wake bookkeeping)
-    for pk in std::mem::take(&mut c.parked) {
+    let parked_list = std::mem::take(&mut c.parked);
+    let mut parked_iter = parked_list.into_iter().peekable();
+    while let Some(pk) = parked_iter.next() {
+        if budget.spent_80pct() {
+            // re-park this and every un-attempted entry — the take already
+            // emptied the persisted list, so dropping them here would lose them
+            if let Ok(b) = crate::repo_do::oid(&pk.base) {
+                pending.entry(b).or_default().push(pk.i);
+            }
+            parked_set.insert(pk.i);
+            for pk in parked_iter.by_ref() {
+                if let Ok(b) = crate::repo_do::oid(&pk.base) {
+                    pending.entry(b).or_default().push(pk.i);
+                }
+                parked_set.insert(pk.i);
+            }
+            break;
+        }
         match one_entry(&mut cx, &toc, pk.i as usize, need_ids, &mut out, &mut any, &mut rows, &mut budget.req, 0)
             .await?
         {
@@ -570,10 +704,68 @@ async fn resume_drain<'a>(
             }
         }
     }
-    // Enumerate the TOC idx-ordered, paging within the slice. done = objects row
-    // posted AND bytes durable (import_open.end <= durable) — survives dup-sha
-    // dedup and mid-entry crashes; rescan each slice so >durable deletes re-run.
-    let mut scan_after = -1i64; // TOC idx is 0-based
+    // TOC idx is 0-based; -1 = from the start. Entries at or below it are done,
+    // parked, or handled by the requeue pass — the scan is monotonic.
+    let mut scan_after = c.scan_after;
+    // Undone entries at or below the persisted scan cursor re-run here — the
+    // queue scan below is forward-only and never revisits them. Undone means:
+    // no objects row (resume-time DELETE + never-posted), and no import_open
+    // row sealed at-or-inside the live end. This catches marked-then-lost
+    // spans AND never-marked entries — one that parked only in a dead slice's
+    // memory, or the boundary entry a yield consumed without processing —
+    // both invisible to an import_open-based probe.
+    {
+        #[derive(Deserialize)]
+        struct Rq {
+            idx: i64,
+        }
+        let requeue: Vec<i64> = exec(
+            sql,
+            "SELECT t.idx AS idx FROM import_toc t WHERE t.push_id=? AND t.idx<=? \
+             AND NOT EXISTS(SELECT 1 FROM objects o WHERE o.pack_id=? AND o.idx=t.idx) \
+             AND NOT EXISTS(SELECT 1 FROM import_open io WHERE io.push_id=? AND io.idx=t.idx \
+                            AND io.end IS NOT NULL AND io.end<=?) \
+             ORDER BY t.idx",
+            vec![
+                V::from(p.push.as_str()),
+                V::from(scan_after),
+                V::from(pack.0.as_str()),
+                i64v(durable.saturating_add(tail_len))?,
+            ],
+        )?
+        .to_array::<Rq>()?
+        .into_iter()
+        .map(|r| r.idx)
+        .collect();
+        for i in requeue {
+            if budget.spent_80pct() {
+                break;
+            }
+            let Ok(i) = u32::try_from(i) else { continue };
+            if parked_set.contains(&i) || done_set.contains(&i) {
+                continue;
+            }
+            match one_entry(&mut cx, &toc, i as usize, need_ids, &mut out, &mut any, &mut rows, &mut budget.req, 0)
+                .await?
+            {
+                Step::Done(id) => {
+                    done_set.insert(i);
+                    run_wakes(&mut cx, &toc, need_ids, &mut out, &mut any, &mut rows, budget, &mut pending, &mut parked_set, &mut done_set, id).await?;
+                }
+                Step::Await(base) => {
+                    pending.entry(base).or_default().push(i);
+                    parked_set.insert(i);
+                }
+            }
+            if rows.len() >= 10_000 {
+                any.post(&rows, &mut budget.req).await?;
+                rows.clear();
+            }
+        }
+    }
+    // Enumerate the TOC idx-ordered, resuming at the persisted scan cursor —
+    // a slice never re-walks the done prefix (that rescan alone could eat a
+    // whole slice's budget near the tail — the freeze this cursor prevents).
     let mut done = false;
     'queue: loop {
         if budget.spent_80pct() {
@@ -604,14 +796,18 @@ async fn resume_drain<'a>(
         .collect();
         let exhausted = page.len() < QUEUE_BATCH as usize;
         for i in page {
-            scan_after = i;
-            let Ok(i) = u32::try_from(i) else { continue };
+            // scan_after advances only once the entry is durably tracked —
+            // processed, or known-parked/done. Consuming it before the budget
+            // check would lose the boundary entry at every yield.
+            let Ok(i) = u32::try_from(i) else { scan_after = i; continue };
             if parked_set.contains(&i) || done_set.contains(&i) {
+                scan_after = i64::from(i);
                 continue;
             }
             if budget.spent_80pct() {
                 break 'queue;
             }
+            let i64_i = i64::from(i);
             match one_entry(&mut cx, &toc, i as usize, need_ids, &mut out, &mut any, &mut rows, &mut budget.req, 0)
                 .await?
             {
@@ -624,6 +820,7 @@ async fn resume_drain<'a>(
                     parked_set.insert(i);
                 }
             }
+            scan_after = i64_i;
             if rows.len() >= 10_000 {
                 any.post(&rows, &mut budget.req).await?;
                 rows.clear();
@@ -648,6 +845,7 @@ async fn resume_drain<'a>(
         .iter()
         .flat_map(|(b, ws)| ws.iter().map(move |i| Parked { i: *i, base: b.to_string() }))
         .collect();
+    c.scan_after = scan_after;
     Ok(Drain { out, sink, rows, done })
 }
 
@@ -797,6 +995,22 @@ async fn flush_ckpt(
     .n as u32;
     sink.flush_links()?;
     c.st = Some(st);
+    // A32 for the import side: the undrained <PART tail must survive the slice
+    // or a sub-part slice's appends die with the isolate — a requeue set just
+    // under PART would re-run forever without ever draining
+    exec(sql, "DELETE FROM import_tail WHERE push_id=?", vec![V::from(push)])?;
+    for (i, chunk) in out.buffered_bytes().chunks(TAIL_CHUNK).enumerate() {
+        exec(
+            sql,
+            "INSERT INTO import_tail(push_id,seq,blob) VALUES(?,?,?)",
+            vec![
+                V::from(push),
+                V::from(i64::try_from(i).map_err(|_| Error::Internal("tail seq".into()))?),
+                V::from(chunk.to_vec()),
+            ],
+        )?;
+    }
+    c.tail = out.buffered();
     Ok(())
 }
 
@@ -910,11 +1124,37 @@ async fn commit_slice(
         Err(e) => worker::console_log!("import {} commit error: {e}", p.push),
     }
     // staging tables + the staged pack itself are garbage now
-    for t in ["push_links", "import_toc", "import_parts", "import_open"] {
+    for t in ["push_links", "import_toc", "import_parts", "import_open", "import_tail"] {
         exec(sql, &format!("DELETE FROM {t} WHERE push_id=?"), vec![V::from(p.push.as_str())])?;
     }
     for part in &p.parts {
         let _ = bucket.inner.delete(part.key.as_str()).await;
     }
     r.map(|_| SliceOutcome::Done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cursor;
+
+    /// A cursor persisted before scan_after/tail existed must still load —
+    /// serde defaults or a live import's saved state fails to deserialize and
+    /// the job restarts from zero (or dies).
+    #[test]
+    fn cursor_backward_compat() {
+        let old = r#"{"phase":"resolve","parse_pos":100,"next_idx":50,"count":462299,
+                     "parked":[{"i":7,"base":"c2a8424708547d87ce798c608beed5cd37c745da"}],
+                     "upload":"u","st":null,"check_after":""}"#;
+        let c: Cursor = serde_json::from_str(old).unwrap();
+        assert_eq!(c.scan_after, -1, "missing scan_after must mean full rescan");
+        assert_eq!(c.tail, 0, "missing tail must mean no persisted tail");
+        assert_eq!(c.phase, "resolve");
+        assert_eq!(c.parked.len(), 1);
+        // and a cursor with the fields round-trips
+        let new = r#"{"phase":"resolve","parse_pos":0,"next_idx":0,"count":0,"parked":[],
+                      "upload":"","st":null,"check_after":"","scan_after":337551,"tail":6427865}"#;
+        let c: Cursor = serde_json::from_str(new).unwrap();
+        assert_eq!(c.scan_after, 337551);
+        assert_eq!(c.tail, 6427865);
+    }
 }

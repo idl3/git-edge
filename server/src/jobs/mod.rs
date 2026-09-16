@@ -161,17 +161,20 @@ pub async fn rearm(d: &RepoDo) -> Result<(), Error> {
 /// killed isolate stranded (a slice cannot legally exceed ~20 s; 60 s is generous).
 pub fn repair(sql: &SqlStorage) -> Result<(), Error> {
     let now = platform::now_ms();
-    // a stranded 'running' row is a crashed slice — it must count as an attempt or a
-    // crash-looping job retries at every boot forever, bypassing the dead threshold
+    // A stranded 'running' row is a crashed isolate, not a job error — it counts
+    // against `strands`, not `attempts`, so a legitimately long multi-slice job
+    // survives rebuild/restart churn. A crash-looping job still dies: strands
+    // only reset when a slice completes, so 64 consecutive dead isolates means
+    // the slice itself is what kills them.
     sql.exec(
-        "UPDATE jobs SET state='dead', last_error='stranded: attempts exhausted' \
-         WHERE state='running' AND started_at < ? AND attempts >= 8",
+        "UPDATE jobs SET state='dead', last_error='stranded: isolate died 64x without a completed slice' \
+         WHERE state='running' AND started_at < ? AND strands >= 64",
         Some(vec![V::from(now.saturating_sub(60_000))]),
     )
     .map_err(|e| Error::Storage(e.to_string()))?;
     sql.exec(
-        "UPDATE jobs SET state='queued', run_at=?, attempts=attempts+1, last_error='stranded mid-slice', \
-         lease=NULL WHERE state='running' AND started_at < ? AND attempts < 8",
+        "UPDATE jobs SET state='queued', run_at=?, strands=strands+1, last_error='stranded mid-slice', \
+         lease=NULL WHERE state='running' AND started_at < ? AND strands < 64",
         Some(vec![V::from(now), V::from(now.saturating_sub(60_000))]),
     )
     .map_err(|e| Error::Storage(e.to_string()))?;
@@ -386,7 +389,7 @@ async fn dispatch_inner(d: &RepoDo) -> Result<(), Error> {
         }
         Ok(SliceOutcome::Continue { cursor }) => {
             if fenced(
-                "UPDATE jobs SET state='queued', run_at=?, cursor=?, lease=NULL WHERE id=? AND state='running' AND lease=?",
+                "UPDATE jobs SET state='queued', run_at=?, cursor=?, strands=0, lease=NULL WHERE id=? AND state='running' AND lease=?",
                 vec![V::from(now), V::from(cursor.as_str())],
             )? {
                 emit("continue", "ok", true, "");
@@ -396,7 +399,7 @@ async fn dispatch_inner(d: &RepoDo) -> Result<(), Error> {
         }
         Ok(SliceOutcome::Reschedule { run_at }) => {
             if fenced(
-                "UPDATE jobs SET state='queued', run_at=?, cursor=NULL, lease=NULL WHERE id=? AND state='running' AND lease=?",
+                "UPDATE jobs SET state='queued', run_at=?, cursor=NULL, strands=0, lease=NULL WHERE id=? AND state='running' AND lease=?",
                 vec![V::from(run_at)],
             )? {
                 emit("reschedule", "ok", true, "");
