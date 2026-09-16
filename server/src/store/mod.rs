@@ -571,6 +571,17 @@ impl PackWriter {
             let _ = self.mpu.abort().await;
             return Err(e);
         }
+        self.seal(budget).await
+    }
+    /// finish() for a resumable caller (the import job): a mid-finish failure —
+    /// a transient part-upload error, a fixed-in-a-later-build check — leaves
+    /// the MPU and its parts alive so the retry resumes the checkpoint and
+    /// re-finishes instead of rebuilding gigabytes of output from scratch.
+    pub async fn finish_resumable(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+        self.finish_inner(budget).await?;
+        self.seal(budget).await
+    }
+    async fn seal(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
         let bytes = self.offset.saturating_add(20);
         budget.charge(1)?;
         let obj = self

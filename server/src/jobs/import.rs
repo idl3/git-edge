@@ -33,7 +33,7 @@ use crate::pack::ingest::{
 };
 use crate::platform;
 use crate::repo_do::{CmdDto, CommitRequest, RepoDo};
-use crate::store::{keys, Bucket, Index, ObjRow, PackId, PackWriter, WriterCkpt, PART};
+use crate::store::{keys, Bucket, Index, ObjRow, PackId, PackMeta, PackWriter, WriterCkpt, PART};
 use crate::ReqBudget;
 
 /// Fresh queue rows per resolve pass — 20k small entries ≈ 40 R2 reads worst case,
@@ -153,20 +153,119 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         .map(|s| s.state)
         .unwrap_or_default();
     if st != "open" {
-        return Err(Error::Conflict(format!("import push is {st}")));
+        // the pushes row is the truth: committed means a dead slice's
+        // commit_push already won (Done deletes the job row), aborted/expired
+        // means the import is moot — either way there is nothing to retry
+        worker::console_log!("import {} push is {st} — job done", p.push);
+        return Ok(SliceOutcome::Done);
     }
     exec(
         &sql,
         "UPDATE pushes SET began_at=? WHERE id=?",
         vec![V::from(platform::now_ms()), V::from(p.push.as_str())],
     )?;
-    match c.phase.as_str() {
+    let out = match c.phase.as_str() {
         "" => toc_slice(d, job, &sql, &p, &mut c, budget).await,
         "resolve" => resolve_slice(d, job, &sql, &p, &mut c, budget).await,
         "check" => check_slice(d, job, &sql, &p, &mut c, budget).await,
         "commit" => commit_slice(d, job, &sql, &p, &mut c, budget).await,
         ph => Err(Error::Internal(format!("import phase {ph}"))),
+    };
+    match out {
+        // The bound MPU is gone — aborted by a dead slice's finish path, reaped
+        // server-side, or lost with the isolate. Retrying the same slice fails
+        // forever: either commit the durable object complete() already landed,
+        // or wipe the output state and rebuild it on a fresh upload.
+        Err(e) if dead_upload(&e) => recover_dead_upload(d, &sql, &p, &mut c, budget).await,
+        out => out,
     }
+}
+
+/// upload_part/complete errors against a dead MPU. `resume_multipart_upload`
+/// is lazy so a dead upload only surfaces at the first R2 call touching it —
+/// mid-drain, mid-checkpoint, or mid-finish — anywhere in the slice body.
+fn dead_upload(e: &Error) -> bool {
+    let m = e.message();
+    (m.contains("multipart upload") && m.contains("not exist")) || m.contains("NoSuchUpload")
+}
+
+/// A slice died on a spent upload: probe the pack key, then either commit the
+/// already-durable object or wipe the output tables and reslice the rebuild.
+async fn recover_dead_upload(
+    d: &RepoDo,
+    sql: &SqlStorage,
+    p: &Payload,
+    c: &mut Cursor,
+    budget: &mut SliceBudget,
+) -> Result<SliceOutcome, Error> {
+    let bucket = d.bucket()?;
+    let pack = PackId(p.pack.clone());
+    let key = keys::pack(&bucket.repo, &pack);
+    budget.req.charge(1)?;
+    // complete() may have won inside the dead slice — the object is durable,
+    // only commit_push never ran. Synthesize its meta from the posted spans.
+    if c.phase == "commit" {
+        if let Some(h) = bucket.inner.head(&key).await? {
+            worker::console_log!("import {} output already landed; committing", p.push);
+            let meta = meta_from_tables(sql, &p.push, &pack, h.size())?;
+            return commit_meta(d, sql, p, &bucket, meta).await;
+        }
+    }
+    worker::console_log!("import {} output upload dead — wiping output state, rebuild follows", p.push);
+    wipe_output(sql, &p.push, &pack, c)?;
+    continue_(c)
+}
+
+/// Output state refers to the dead upload — etags, byte spans, the persisted
+/// tail and checkpoint all go; the TOC and push survive so resolve re-runs.
+fn wipe_output(sql: &SqlStorage, push: &str, pack: &PackId, c: &mut Cursor) -> Result<(), Error> {
+    for t in ["import_parts", "import_open", "import_tail"] {
+        exec(sql, &format!("DELETE FROM {t} WHERE push_id=?"), vec![V::from(push)])?;
+    }
+    exec(sql, "DELETE FROM objects WHERE pack_id=?", vec![V::from(pack.0.as_str())])?;
+    c.upload.clear();
+    c.st = None;
+    c.tail = 0;
+    c.scan_after = -1;
+    c.phase = "resolve".into();
+    Ok(())
+}
+
+/// PackMeta for a pack whose object is already durable: the writer is gone, so
+/// count and commit span come from the per-entry spans posted into import_open.
+fn meta_from_tables(sql: &SqlStorage, push: &str, pack: &PackId, bytes: u64) -> Result<PackMeta, Error> {
+    #[derive(Deserialize)]
+    struct N {
+        n: i64,
+    }
+    let n = exec(
+        sql,
+        "SELECT COUNT(*) AS n FROM import_open WHERE push_id=? AND end IS NOT NULL",
+        vec![V::from(push)],
+    )?
+    .one::<N>()?
+    .n;
+    #[derive(Deserialize)]
+    struct CS {
+        lo: Option<i64>,
+        hi: Option<i64>,
+    }
+    let cs = exec(
+        sql,
+        "SELECT MIN(off) AS lo, MAX(end) AS hi FROM import_open \
+         WHERE push_id=? AND kind=1 AND end IS NOT NULL",
+        vec![V::from(push)],
+    )?
+    .one::<CS>()?;
+    Ok(PackMeta {
+        pack: pack.clone(),
+        push_id: None,
+        count: u32::try_from(n).unwrap_or(0),
+        bytes,
+        commit_lo: cs.lo.and_then(|v| u64::try_from(v).ok()).unwrap_or(u64::MAX),
+        commit_hi: cs.hi.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
+        created_at: platform::now_ms(),
+    })
 }
 
 // ---- pass A: entry table -> import_toc ----
@@ -636,9 +735,13 @@ async fn resume_drain<'a>(
         struct TN {
             n: i64,
         }
+        // completions inside the tail region: `end` in (durable, durable+tail] —
+        // `end>durable` not `off>durable`, or a sealed straddler (started below
+        // the boundary, finished in the tail) is counted nowhere and the
+        // writer's total comes up one short at finish
         let n = exec(
             sql,
-            "SELECT COUNT(*) AS n FROM import_open WHERE push_id=? AND off>? AND end<=?",
+            "SELECT COUNT(*) AS n FROM import_open WHERE push_id=? AND end>? AND end<=?",
             vec![
                 V::from(p.push.as_str()),
                 i64v(durable)?,
@@ -655,7 +758,7 @@ async fn resume_drain<'a>(
         let cs = exec(
             sql,
             "SELECT MIN(off) AS lo, MAX(end) AS hi FROM import_open \
-             WHERE push_id=? AND off>? AND end<=? AND kind=1",
+             WHERE push_id=? AND end>? AND end<=? AND kind=1",
             vec![
                 V::from(p.push.as_str()),
                 i64v(durable)?,
@@ -730,6 +833,7 @@ async fn resume_drain<'a>(
                 V::from(p.push.as_str()),
                 V::from(scan_after),
                 V::from(pack.0.as_str()),
+                V::from(p.push.as_str()),
                 i64v(durable.saturating_add(tail_len))?,
             ],
         )?
@@ -1083,8 +1187,23 @@ async fn commit_slice(
         return continue_(c);
     }
     let bucket = d.bucket()?;
+    // finish_resumable: a mid-finish failure keeps the MPU alive so the retry
+    // resumes and re-finishes — aborting here would force a full re-emit
+    let meta = dr.out.finish_resumable(&mut budget.req).await?;
+    commit_meta(d, sql, p, &bucket, meta).await
+}
+
+/// Terminal commit span: post the real pack meta, refresh the epoch guard, run
+/// commit_push, and drop every trace of staging. Shared by commit_slice and the
+/// already-durable recovery in recover_dead_upload.
+async fn commit_meta(
+    d: &RepoDo,
+    sql: &SqlStorage,
+    p: &Payload,
+    bucket: &Bucket,
+    meta: PackMeta,
+) -> Result<SliceOutcome, Error> {
     let pack = PackId(p.pack.clone());
-    let meta = dr.out.finish(&mut budget.req).await?;
     // post real pack meta over the 'ingesting' placeholder (push_index parity)
     exec(
         sql,
@@ -1135,7 +1254,8 @@ async fn commit_slice(
 
 #[cfg(test)]
 mod tests {
-    use super::Cursor;
+    use super::{dead_upload, Cursor};
+    use crate::error::Error;
 
     /// A cursor persisted before scan_after/tail existed must still load —
     /// serde defaults or a live import's saved state fails to deserialize and
@@ -1156,5 +1276,20 @@ mod tests {
         let c: Cursor = serde_json::from_str(new).unwrap();
         assert_eq!(c.scan_after, 337551);
         assert_eq!(c.tail, 6427865);
+    }
+
+    /// dead_upload gates the wipe-and-rebuild recovery — too narrow and a dead
+    /// MPU retries to dead-letter; too broad and an unrelated "not found"
+    /// wipes hours of valid output state.
+    #[test]
+    fn dead_upload_matching() {
+        assert!(dead_upload(&Error::Storage(
+            "Error: uploadPart: The specified multipart upload does not exist.".into()
+        )));
+        assert!(dead_upload(&Error::Storage("NoSuchUpload: The specified upload does not exist.".into())));
+        // a missing source object / key is not a dead upload — no rebuild
+        assert!(!dead_upload(&Error::Storage("Error: get: object does not exist".into())));
+        assert!(!dead_upload(&Error::Unpack("missing base aa".into())));
+        assert!(!dead_upload(&Error::Budget));
     }
 }

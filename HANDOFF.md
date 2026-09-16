@@ -113,10 +113,21 @@ on wrangler dev — including a real git 2.55 clone over the signed URI.
 the same span forever — `gc_tail` now persists the undrained buffer across
 yields with a scan/boundary-split cursor (A32). Import's durable-boundary
 snapshot didn't claim mid-slice `flush_if_full` uploads, so `st.pos` could
-freeze identically (same disease, second host). `import_stage` minted a
-fresh push per part — sibling `open` pushes timed out and the janitor
-swept their `pending/` keys out from under the running job; parts now
-share the import's push (`?push=&part=`), janitor sweeps by prefix.
+freeze identically (same disease, second host) — `import_tail` now mirrors
+`gc_tail`, restored after any boundary re-runs (a straddler re-run forces
+discard: its bytes would be overwritten). `import_stage` minted a fresh
+push per part — sibling `open` pushes timed out and the janitor swept
+their `pending/` keys out from under the running job; parts now share the
+import's push (`?push=&part=`), janitor sweeps by prefix. Three resumable-
+import losses found by the 462k re-run: `scan_after` advanced before the
+per-entry budget check, so each yield's boundary entry was scanned but
+never processed (158 lost roots → 893 parked on missing bases); the
+requeue probe ran FROM import_open so never-marked entries were invisible
+(now FROM import_toc); the parked re-attempt loop had no budget guard and
+drained c.parked via mem::take (now budget-gated with re-park). Job
+liveness: strands (isolate death mid-slice) now count separately from
+attempts (real errors) — strands reset per completed slice, cap 64, so
+rebuild/restart churn can't dead-letter a healthy multi-hour import.
 Undeltified normalization means the 1.12 GiB react pack lands ~6× bigger
 in R2 — `GE_QUOTA_MAX_BYTES` must be sized for the *stored* footprint.
 
