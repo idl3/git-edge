@@ -114,4 +114,19 @@ mod tests {
         assert_eq!(bad.len(), 64);
         assert!(!pack_sig_ok(K, "rid", "pid", 123, &bad));
     }
+
+    #[test]
+    fn lfs_round_trip_and_domain_split() {
+        let oid = "a".repeat(64);
+        let s = lfs_sig(K, "rid", &oid, 123, "get").unwrap();
+        assert_eq!(s.len(), 64);
+        assert!(lfs_sig_ok(K, "rid", &oid, 123, "get", &s));
+        // a get sig is not a put sig — op is inside the HMAC
+        assert!(!lfs_sig_ok(K, "rid", &oid, 123, "put", &s));
+        // and an lfs sig is not a pack sig — the lmsg domain separates them
+        assert!(!pack_sig_ok(K, "rid", &oid, 123, &s));
+        for (r, o, e) in [("other", oid.as_str(), 123), ("rid", "other", 123), ("rid", oid.as_str(), 124)] {
+            assert!(!lfs_sig_ok(K, r, o, e, "get", &s), "{r} {o} {e}");
+        }
+    }
 }

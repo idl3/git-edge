@@ -272,10 +272,14 @@ fn valid_ref(name: &str) -> Result<&str, Error> {
 /// (prefix glob). Rejects anything else so a malformed scope can't widen access.
 fn scope_pattern_ok(p: &str) -> bool {
     let p = p.strip_suffix('*').unwrap_or(p);
-    p.starts_with("refs/")
-        && !p.is_empty()
-        && !p.contains('*')
-        && gix_validate::reference::name_partial(p.as_bytes().as_bstr()).is_ok()
+    if !p.starts_with("refs/") || p.contains('*') {
+        return false;
+    }
+    // `ns/*` strips to `ns/` — validate the namespace prefix, not the
+    // trailing-slash form name_partial rejects
+    let name = p.strip_suffix('/').unwrap_or(p);
+    !name.is_empty()
+        && gix_validate::reference::name_partial(name.as_bytes().as_bstr()).is_ok()
 }
 
 /// A command ref matches a scope when any comma pattern covers it — exact match,
@@ -2246,4 +2250,61 @@ struct PackMetaDto {
     bytes: i64,
     commit_lo: i64,
     commit_hi: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scope_allows, scope_pattern_ok};
+
+    #[test]
+    fn scope_pattern_validation() {
+        for ok in [
+            "refs/heads/main",
+            "refs/heads/feature-*",
+            "refs/heads/x*", // trailing star on a partial name
+            "refs/*",
+            "refs/tags/v1*", // glob over "v1…" tag names
+            "refs/heads/",   // exact-match on a name no ref can have — useless, harmless
+        ] {
+            assert!(scope_pattern_ok(ok), "{ok}");
+        }
+        for bad in [
+            "main",             // not under refs/
+            "*",                // bare wildcard
+            "refs/heads/*-x",   // mid-pattern glob
+            "refs/heads/**",    // mid-pattern glob
+            "refs/../x",        // not a valid partial refname
+            "refs/heads/..",    // invalid refname
+            "refs/heads/lo..k", // invalid refname
+            "refs/tags/v1.*",   // stripped prefix "v1." isn't a partial refname — write v1*
+            "",                 // empty
+        ] {
+            assert!(!scope_pattern_ok(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn scope_matching() {
+        // unrestricted
+        assert!(scope_allows(None, "refs/heads/anything"));
+        assert!(scope_allows(Some(""), "refs/heads/anything"));
+        assert!(scope_allows(Some("  "), "refs/heads/anything"));
+        // exact
+        assert!(scope_allows(Some("refs/heads/main"), "refs/heads/main"));
+        assert!(!scope_allows(Some("refs/heads/main"), "refs/heads/main2"));
+        // prefix glob
+        let s = Some("refs/heads/scoped-*");
+        assert!(scope_allows(s, "refs/heads/scoped-ok"));
+        assert!(scope_allows(s, "refs/heads/scoped-"));
+        assert!(!scope_allows(s, "refs/heads/escape"));
+        assert!(!scope_allows(s, "refs/tags/scoped-x"));
+        // comma list: any pattern covers
+        let m = Some("refs/heads/a, refs/tags/v1.*");
+        assert!(scope_allows(m, "refs/heads/a"));
+        assert!(scope_allows(m, "refs/tags/v1.2.3"));
+        assert!(!scope_allows(m, "refs/heads/b"));
+        // full-repo wildcard
+        assert!(scope_allows(Some("refs/*"), "refs/heads/x"));
+        assert!(!scope_allows(Some("refs/*"), "not-refs"));
+    }
 }
