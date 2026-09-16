@@ -50,6 +50,33 @@ pub fn pack_sig_ok(key: &str, repo: &str, pack: &str, exp: i64, sig: &str) -> bo
         .unwrap_or(false)
 }
 
+/// LFS object URLs (#21): `lfs` domain-separates from pack URLs so a packfile
+/// sig never authorizes an LFS put/get. `op` is "get"|"put" — direction is part
+/// of the capability.
+fn lmsg(repo: &str, oid: &str, exp: i64, op: &str) -> Vec<u8> {
+    format!("v1\nlfs\n{repo}\n{oid}\n{exp}\n{op}").into_bytes()
+}
+pub fn lfs_sig(key: &str, repo: &str, oid: &str, exp: i64, op: &str) -> Result<String, Error> {
+    Ok(hex(&mac(key, &lmsg(repo, oid, exp, op))?.finalize().into_bytes()))
+}
+pub fn lfs_sig_ok(key: &str, repo: &str, oid: &str, exp: i64, op: &str, sig: &str) -> bool {
+    if sig.len() != 64 {
+        return false;
+    }
+    let Ok(sig) = sig
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|c| std::str::from_utf8(c).ok().and_then(|h| u8::from_str_radix(h, 16).ok()))
+        .collect::<Option<Vec<u8>>>()
+        .ok_or(())
+    else {
+        return false;
+    };
+    mac(key, &lmsg(repo, oid, exp, op))
+        .map(|m| m.verify_slice(&sig).is_ok())
+        .unwrap_or(false)
+}
+
 /// The feature switch: GE_URL_SIGNING_KEY unset or weak (<32 bytes) disables C1 —
 /// never minted, never served. Configure via `wrangler secret put`, not [vars].
 pub fn signing_key(env: &Env) -> Option<String> {

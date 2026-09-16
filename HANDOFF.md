@@ -1,4 +1,4 @@
-# git-edge handoff — 2026-09-15 (C2+C1 shipped)
+# git-edge handoff — 2026-09-16 (I1 import shipped; C2+C1 in PRs)
 
 Serverless Git smart-HTTP host: Rust/WASM Cloudflare Worker + per-repo SQLite
 Durable Object + R2 packfiles. Repo: `idl3/git-edge`. Main is at `257184b`,
@@ -6,8 +6,65 @@ clean tree, all work merged (PRs #7–#16).
 
 ## Where things stand
 
-All P0/P1 roadmap items are done except server-side import (#4b — deliberately
-deferred). **C2 (A29) and C1 (A30) are done** — see PR #17:
+All P0/P1 roadmap items are done. **C2 (A29), C1 (A30), and I1 (A31) are
+implemented** — C2/C1 are PRs #17/#18 (both OPEN/CLEAN, stacked); I1 sits
+uncommitted on the working branch pending the at-scale validation below:
+
+- **C2 verbatim consolidated-pack fast path** (`consolidated_pack` +
+  `VerbatimStream` in `repo_do/mod.rs`): plain-clone-shaped fetch + exactly
+  one live pack covering all wants → stream that R2 object verbatim, one
+  `bucket.get`, `x-ge-subrequests: 1`. **Re-benched on react: 263k-object
+  clone in 18.7 s at 1 subrequest** (was HTTP 413 at the old wall).
+- **C1 `packfile-uris`** (`pack_uri_response` + `sign.rs` + edge `pack_get`):
+  opted-in clients (`fetch.uriprotocols`, git >= 2.40) instead get a signed
+  `/_packs/<id>.pack?e=&r=&s=` URL — HMAC-SHA256 over `v1\nrepo_id\npack\nexp`
+  keyed by `GE_URL_SIGNING_KEY`, 1h TTL. Inline `packfile` section is a legal
+  empty pack; the `<hash>` token is the pack's real trailer SHA-1 (client
+  verifies). Bandwidth fully bypasses the Worker. **React via URI: 14.8 s.**
+- **I1 server-side resumable import** (`jobs/import.rs`, A31):
+  `POST /_admin/import/stage` streams a pack part into `pending/` and opens a
+  push; further parts reuse it via `?push=<id>&part=<n>` (idempotent re-begin —
+  required, since only the job's own push gets heartbeat protection from the
+  janitor's PUSH_TIMEOUT sweep); `POST /_admin/import {push, parts, commands}`
+  queues an `import_pack` job; `GET /_admin/import/<push>` reports
+  phase/objects. The job rides the
+  normal push lifecycle — pass A parses a persistent `import_toc` off the
+  staged parts, pass B normalizes entries into a resumable output MPU
+  (`import_parts` etags + `WriterCkpt`; `import_open` shadow rows name the
+  mid-entry resume point), 2.5 links live in `push_links` (no 1M cap), and the
+  final slice runs `commit_push` with atomic semantics. Kills the
+  single-commit ingest ceiling (TypeScript's 222k-object commit).
+
+**I1 correctness model, compressed**: durable = uploaded parts only.
+`objects`/`push_links` rows may run ahead inside a slice; every resume
+re-derives — delete objects rows past `WriterCkpt.pos`, restore fully-durable
+unposted rows from `import_open` shadow cols, frag-resume the one straddling
+writer (`skip = durable - off`), retry parked REF_DELTA entries rather than
+trusting cursor wake bookkeeping. `end <= durable` OR an objects row = done —
+covers dup-sha dedup and posted-but-durable cases.
+
+**Bugs the smoke run flushed out** (all fixed): TOC loop gated on the flushed
+counter so `count < TOC_FANOUT` packs over-parsed past the trailer; a
+checkpoint-time `DELETE >durable` killed just-posted rows every slice (resume
+owns that delete, not the checkpoint); the queue scan's `idx > 0` skipped
+entry 0; `PackWriter::resume` at `pos=0` dropped the 12-byte pack header
+(clone died on `pack signature mismatch`) — resume now re-emits it.
+
+**Bugs the 462k react run flushed out** (all fixed): the checkpoint reused a
+stale `c.st` instead of the live `out.snapshot()`, freezing the durable prefix
+while mid-slice `flush_if_full` uploads piled into `import_parts` — a
+zero-progress livelock; dead slices left stale etags past `pos/PART` that a
+resume would have assembled into the final MPU alongside the rewritten parts —
+resume now truncates the list to the live prefix and `flush_ckpt` prunes rows
+beyond it; each
+`import/stage` call minted its own `open` push, so 16 sibling part pushes hit
+PUSH_TIMEOUT mid-import and the janitor swept the source parts from under the
+running job — fixed by shared-push staging (`?push=&part=`) + a janitor
+prefix delete of `pending/<push>.`.
+
+**Verified live**: full conformance incl. `GE_CONFORMANCE_IMPORT=1` PASS
+(import → commit → clone → fsck). In flight at handoff: 462k-object react
+pack (1.1 GiB, 17 staged parts) — resolve phase crossing slices cleanly.
 
 - **C2 verbatim consolidated-pack fast path** (`consolidated_pack` +
   `VerbatimStream` in `repo_do/mod.rs`): plain-clone-shaped fetch + exactly
@@ -29,28 +86,23 @@ fix in `store/mod.rs`; `GE_CONFORMANCE_GC=1` is the regression check.
 Verified live: base suite + `GE_CONFORMANCE_GC=1 GE_CONFORMANCE_URIS=1` PASS
 on wrangler dev — including a real git 2.55 clone over the signed URI.
 
-## The two measured ceilings (next work)
+## Remaining ceilings (post-I1)
 
-| Wall | Evidence | Fix order |
+| Wall | Evidence | Status |
 |---|---|---|
-| **Clone** dies at `Error::Budget`→413 between 110k–263k objects (vite ✓ / react ✗ / rails ✗). `blob:none` doesn't help — spend is R2 entry reads, sqlite is free | benchmark round 10 | ~~C2~~ ~~C1~~ — **re-bench** |
-| **Import** can't stage a single commit with >ingest-budget objects (TypeScript: one commit = 222k objects) | `git-edge-import.sh` unsplittable-slice error | **I1 next** (I2 as interim) |
+| **Clone** 413 between 110k–263k objects | benchmark round 10 | **cleared** — react 263k in 18.7 s @ 1 subrequest (A29); URI-offloaded in 14.8 s (A30) |
+| **Import** single commit > ingest budget (TS: 222k objects) | unsplittable-slice error | **cleared by I1** — server-side job slices the staged pack; 462k-object react pack in flight |
+| **Multi-pack / pre-GC fetch** still walks the index | residual case neither A29 nor A30 covers | open — matters for the window between import and consolidation |
 
-**Design doc: `findings/scale-ceilings.md`**. Next implementation is **I1
-server-side import jobs**. Before that, re-bench react/rails post-C2: a
-consolidated repo should now clone in tens of subrequests — confirm the wall
-actually moved, and measure what pre-GC/multi-pack clones still cost (that's
-the residual case neither C1 nor C2 covers).
+## Next work
 
-### I1 pointers
-
-- `POST /_admin/import {r2_key}` + resumable `import_pack` job on the
-  alarm/jobs model (`jobs/mod.rs`, `purge_repo` is the proven shape); each
-  alarm slice gets a fresh request budget.
-- Client side: `tools/git-edge-import.sh` chunked `/_admin/import-part`
-  uploads under the 100 MB cap (or S3 multipart to R2 staging).
-- Reuse `pack/ingest.rs` resolve+normalize pipeline across slices —
-  checkpointed like `gc_consolidate`'s `WriterCkpt`/`Pos` machinery.
+- **Re-bench rails post-C2/C1** (787k objects — biggest cloneable repo) once
+  consolidated; confirm the react number generalizes.
+- **TypeScript via I1** — the original parity target: stage `ts-all.pack`,
+  `/_admin/import`, confirm the 222k-object commit lands, then clone.
+- P2 leftovers: #18 rename, #19 per-ref scopes, #20 domain/Access, #21 LFS,
+  #22 no-walk clone — all deliberate defers, see ROADMAP.
+- Then the WILD section (TTL repos, GitHub-URL import, synthetic-ref seeding).
 
 ## Environment / workflow
 

@@ -196,6 +196,16 @@ note "tag push + delete-only push (no PACK)"
 git tag v-test && git push -q "$URL/$REPO" v-test || fail "push tag"
 git push -q "$URL/$REPO" --delete v-test || fail "delete tag"
 
+note "--atomic: one failing command rejects the whole push"
+# `:main` is always refused (deletion of the current branch); under --atomic
+# the sibling create must not land either
+if git push --atomic "$URL/$REPO" :main HEAD:refs/heads/at-good 2>/dev/null; then
+  fail "atomic push with a bad command succeeded"
+fi
+git ls-remote "$URL/$REPO" refs/heads/at-good | grep -q . && fail "atomic push leaked a ref"
+git push -q --atomic "$URL/$REPO" HEAD:refs/heads/at-good HEAD:refs/heads/at-good2 || fail "atomic push"
+git push -q --atomic "$URL/$REPO" --delete refs/heads/at-good refs/heads/at-good2 || fail "atomic delete"
+
 note "clone back + fsck"
 git clone -q "$URL/$REPO" "$WORK/clone" || fail "clone"
 cd "$WORK/clone"
@@ -260,6 +270,62 @@ curl -sf -X POST "$URL/$ADMINREPO/_admin/unpin" \
   -d '{"ref":"refs/heads/main"}' | grep -q true || fail "unpin"
 git push -q "$URL/$ADMINREPO" HEAD:main || fail "push after unpin"
 ATIP=$(git rev-parse HEAD)
+
+note "scoped token (#19): in-scope push lands, out-of-scope rejected"
+SCJSON=$(curl -sf -X POST "$URL/$ADMINREPO/_admin/tokens" \
+  -d '{"name":"scoper","level":"write","scope":"refs/heads/scoped-*"}') || fail "token mint"
+SCTOK=$(echo "$SCJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+SCURL="$(echo "$URL" | sed -E "s|^(https?://)[^/@]*@|\1x:$SCTOK@|")"
+git push -q "$SCURL/$ADMINREPO" HEAD:refs/heads/scoped-ok 2>"$WORK/scerr" \
+  || fail "in-scope push rejected: $(cat "$WORK/scerr")"
+if git push "$SCURL/$ADMINREPO" HEAD:refs/heads/escape 2>"$WORK/scerr2"; then
+  fail "out-of-scope push succeeded"
+fi
+grep -q "outside token scope" "$WORK/scerr2" || fail "no scope reason: $(cat "$WORK/scerr2")"
+# a scoped token can't mint further credentials (still global-write gated)
+if curl -sf -X POST "$SCURL/$ADMINREPO/_admin/tokens" -d '{"name":"x","level":"write"}' 2>/dev/null; then
+  fail "scoped token minted a credential"
+fi
+
+note "lfs (#21): batch -> signed PUT -> batch -> signed GET round-trip"
+printf 'lfs test payload %s\n' "$(date +%s%N)" > "$WORK/lfs.bin"
+OID=$(shasum -a 256 "$WORK/lfs.bin" | cut -d' ' -f1)
+SIZE=$(stat -f%z "$WORK/lfs.bin" 2>/dev/null || stat -c%s "$WORK/lfs.bin")
+LFSJSON=$(curl -sf -X POST "$URL/$ADMINREPO/info/lfs/objects/batch" \
+  -H 'Content-Type: application/vnd.git-lfs+json' \
+  -d "{\"operation\":\"upload\",\"transfers\":[\"basic\"],\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}") \
+  || fail "lfs upload batch"
+HREF=$(echo "$LFSJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["objects"][0]["actions"]["upload"]["href"])')
+# the href carries no Authorization — the HMAC alone is the credential (A30 model)
+curl -sf -X PUT "$HREF" --data-binary @"$WORK/lfs.bin" || fail "lfs PUT"
+# second batch: object exists now -> no upload action
+LFSJSON2=$(curl -sf -X POST "$URL/$ADMINREPO/info/lfs/objects/batch" \
+  -H 'Content-Type: application/vnd.git-lfs+json' \
+  -d "{\"operation\":\"upload\",\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}") || fail "lfs re-batch"
+echo "$LFSJSON2" | grep -q '"upload"' && fail "re-batch offered upload for existing object"
+LFSGET=$(curl -sf -X POST "$URL/$ADMINREPO/info/lfs/objects/batch" \
+  -H 'Content-Type: application/vnd.git-lfs+json' \
+  -d "{\"operation\":\"download\",\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}") || fail "lfs dl batch"
+GHREF=$(echo "$LFSGET" | python3 -c 'import sys,json;print(json.load(sys.stdin)["objects"][0]["actions"]["download"]["href"])')
+curl -sf "$GHREF" -o "$WORK/lfs-dl.bin" || fail "lfs GET"
+cmp "$WORK/lfs.bin" "$WORK/lfs-dl.bin" || fail "lfs round-trip differs"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${GHREF%%s=*}s=deadbeef")
+[ "$code" = "403" ] || fail "bad-sig lfs GET -> $code, want 403"
+# a get sig is not a put sig — the op is inside the HMAC
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$WORK/lfs.bin" "$GHREF")
+[ "$code" = "403" ] || fail "get-sig lfs PUT -> $code, want 403"
+MISSING=$(printf 'never-uploaded' | shasum -a 256 | cut -d' ' -f1)
+curl -sf -X POST "$URL/$ADMINREPO/info/lfs/objects/batch" \
+  -H 'Content-Type: application/vnd.git-lfs+json' \
+  -d "{\"operation\":\"download\",\"objects\":[{\"oid\":\"$MISSING\",\"size\":1}]}" \
+  | grep -q '"code":404' || fail "missing lfs object not 404 in batch"
+# batch needs auth: anonymous gets 401
+LFSNOAUTH="$(echo "$URL" | sed -E 's|^(https?://)[^/@]*@|\1|')"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  "$LFSNOAUTH/$ADMINREPO/info/lfs/objects/batch" \
+  -H 'Content-Type: application/vnd.git-lfs+json' \
+  -d "{\"operation\":\"download\",\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}")
+[ "$code" = "401" ] || fail "anonymous lfs batch -> $code, want 401"
 
 note "public read: anonymous fetch, push still gated"
 NOAUTH="$(echo "$URL" | sed -E 's|^(https?://)[^/@]*@|\1|')"
@@ -379,6 +445,65 @@ if [ "${GE_CONFORMANCE_GC:-0}" = "1" ]; then
   git -C "$WORK/gcclone" fsck --strict || fail "post-GC fsck"
   [ "$(git -C "$WORK/gcclone" rev-parse main)" = "$(git rev-parse orphan)" ] || fail "post-GC tip"
   note "GC swept (objects before: $OBJ0)"
+fi
+
+# I1 server-side import: stage a pack -> import_pack job -> atomic commit.
+# Only runs with GE_CONFORMANCE_IMPORT=1 against a build with the _admin/import
+# routes. The staged pack uses REF deltas (pack-objects default) so the job's
+# forward-reference/wake path is exercised, not just verbatim copies.
+if [ "${GE_CONFORMANCE_IMPORT:-0}" = "1" ]; then
+  note "import: stage pack, job ingests, refs commit"
+  IREPO="$REPO-import"
+  cd "$WORK/seed"
+  git rev-list --objects HEAD | git pack-objects --stdout > "$WORK/stage.pack"
+  NEW=$(git rev-parse HEAD)
+  # split into two halves: exercises Source::Parts reads and the shared-push
+  # stage API (`?push=` + `?part=`) — every part must live on one open push or
+  # PUSH_TIMEOUT would sweep siblings mid-import
+  half=$(( ($(wc -c < "$WORK/stage.pack" | tr -d ' ') + 1) / 2 ))
+  split -b "$half" "$WORK/stage.pack" "$WORK/stage.part."
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import/stage" --data-binary @"$WORK/stage.part.aa")
+  PUSH=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["push"])')
+  KEY=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+  BYTES=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["bytes"])')
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import/stage?push=$PUSH&part=b" --data-binary @"$WORK/stage.part.ab")
+  KEY2=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+  BYTES2=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["bytes"])')
+  echo "$KEY2" | grep -q "\.part-b" || fail "part key shape: $KEY2"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$IREPO/_admin/import/stage?push=$PUSH" --data-binary @"$WORK/stage.part.ab")
+  [ "$code" = "400" ] || fail "reused push without ?part -> $code, want 400"
+  ZERO=0000000000000000000000000000000000000000
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import" -H 'Content-Type: application/json' \
+    -d "{\"push\":\"$PUSH\",\"parts\":[{\"key\":\"$KEY\",\"bytes\":$BYTES},{\"key\":\"$KEY2\",\"bytes\":$BYTES2}],\"commands\":[{\"old\":\"$ZERO\",\"new\":\"$NEW\",\"name\":\"refs/heads/main\"}]}")
+  echo "$st" | grep -q queued || fail "import start: $st"
+  deadline=$((SECONDS + 120))
+  while :; do
+    st=$(curl -sf "$URL/$IREPO/_admin/import/$PUSH")
+    ps=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("push_state"))')
+    [ "$ps" = "committed" ] && break
+    [ "$ps" = "rejected" ] && fail "import rejected: $st"
+    [ $SECONDS -lt $deadline ] || fail "import did not commit within 120s: $st"
+    sleep 2
+  done
+  git clone -q "$URL/$IREPO" "$WORK/iclone" || fail "post-import clone"
+  [ "$(git -C "$WORK/iclone" rev-parse main)" = "$NEW" ] || fail "import tip"
+  git -C "$WORK/iclone" fsck --strict || fail "post-import fsck"
+  # a part key outside this repo's pending namespace must be refused outright —
+  # needs a fresh open push (a committed one is refused earlier, on state)
+  st2=$(curl -sf -X POST "$URL/$IREPO/_admin/import/stage" --data-binary @"$WORK/stage.pack")
+  PUSH2=$(echo "$st2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["push"])')
+  code=$(curl -s -o "$WORK/ibad" -w '%{http_code}' -X POST "$URL/$IREPO/_admin/import" \
+    -H 'Content-Type: application/json' \
+    -d "{\"push\":\"$PUSH2\",\"parts\":[{\"key\":\"r/00000000000000000000000000000000/pending/x.pack\",\"bytes\":1}],\"commands\":[{\"old\":\"$ZERO\",\"new\":\"$NEW\",\"name\":\"refs/heads/x\"}]}")
+  [ "$code" = "400" ] || fail "cross-namespace part -> $code, want 400"
+  # a re-start on the committed push is refused (state check), not a dup job
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$IREPO/_admin/import" \
+    -H 'Content-Type: application/json' \
+    -d "{\"push\":\"$PUSH\",\"parts\":[{\"key\":\"$KEY\",\"bytes\":$BYTES}],\"commands\":[{\"old\":\"$ZERO\",\"new\":\"$NEW\",\"name\":\"refs/heads/main\"}]}")
+  [ "$code" = "409" ] || fail "re-start on committed push -> $code, want 409"
+  # and a stage that re-begins the now-committed push is refused the same way
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$IREPO/_admin/import/stage?push=$PUSH&part=c" --data-binary @"$WORK/stage.part.ab")
+  [ "$code" = "409" ] || fail "re-begin committed push -> $code, want 409"
 fi
 
 # purge_repo job: POST _admin/delete enqueues it; the repo converges to empty

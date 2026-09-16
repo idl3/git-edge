@@ -52,6 +52,12 @@ curl -u "edge:$GE_ADMIN_TOKEN" -X POST \
   https://<host>/<owner>/<repo>/_admin/tokens \
   -d '{"name":"ci","level":"write"}'        # level: read | write
 
+# deploy key — ref-scoped write: this token can only push matching refs
+# (scope = comma list of refs/… patterns; trailing * is a prefix glob)
+curl -u "edge:$GE_ADMIN_TOKEN" -X POST \
+  https://<host>/<owner>/<repo>/_admin/tokens \
+  -d '{"name":"release-bot","level":"write","scope":"refs/heads/release-*,refs/tags/v*"}'
+
 curl -u "edge:$GE_ADMIN_TOKEN" https://<host>/<owner>/<repo>/_admin/tokens   # list (ids, never secrets)
 curl -u "edge:$GE_ADMIN_TOKEN" -X DELETE \
   https://<host>/<owner>/<repo>/_admin/tokens/<id>                           # revoke
@@ -59,6 +65,12 @@ curl -u "edge:$GE_ADMIN_TOKEN" -X DELETE \
 
 Only the global write token can mint; a repo token cannot mint more tokens. A
 `read` token clones/fetches but gets 403 on push. Cap: 256 tokens per repo.
+
+A scoped `write` token's pushes land per-ref: commands outside the scope get
+`ng "ref outside token scope"` (in-scope siblings still land — same shape as a
+pin rejection). The scope is captured when the push begins, so editing the
+token mid-push can't widen it, and imports over `_admin/import` obey it too.
+Omit `scope` (or send null) for an unrestricted token.
 
 ## Repo lifecycle (global write token)
 
@@ -84,6 +96,21 @@ curl -u "edge:$GE_ADMIN_TOKEN" -X POST $R/_admin/unpin -d '{"ref":"refs/heads/ma
 # then wipes DO storage + R2 packs; the name is reusable once purge lands
 curl -u "edge:$GE_ADMIN_TOKEN" -X POST $R/_admin/delete
 ```
+
+## Rename / move (ROADMAP #18)
+
+A repo's Durable Object id is derived from `owner/repo` and can't be rebound —
+there is no server-side rename verb. The supported recipe is mirror-move:
+
+```bash
+git clone --bare https://x:$GE_TOKEN@<host>/<o>/<r> move.git
+git -C move.git push --mirror https://x:$GE_TOKEN@<host>/<new-o>/<new-r>
+curl -u "edge:$GE_ADMIN_TOKEN" -X POST https://<host>/<o>/<r>/_admin/delete
+```
+
+For >80 MiB repos run the staged-push/import path against the new name instead
+of `push --mirror`. Refs, reflog-credited principals, pins, and tokens are
+per-repo — re-create pins/tokens on the new name.
 
 ## Importing a repo larger than ~80 MiB — staged push
 
@@ -114,6 +141,32 @@ sideways and is rejected non-fast-forward.
 GE_TOKEN=<write-token> tools/git-edge-import.sh <local-repo-or-url> <edge-url>
 ```
 
+### Server-side import (unsplittable packs — e.g. one commit > ~50k objects)
+
+When no commit boundary gets a slice under the budget, stage the pack itself
+and let a DO job ingest it across slices — no per-request cap applies:
+
+```bash
+git -C src.git pack-objects --stdout --all > all.pack        # REF deltas fine
+split -b 64m all.pack part.                                  # one call per part
+# first part mints the push; every later part REUSES it (?push=&part=) so the
+# import job's heartbeat covers all staged keys — never stage parts on separate
+# pushes, their PUSH_TIMEOUT expiry sweeps sibling parts mid-import
+PUSH=$(curl -u "edge:$GE_TOKEN" -X POST "$REMOTE/_admin/import/stage" --data-binary @part.aa | jq -r .push)
+curl -u "edge:$GE_TOKEN" -X POST "$REMOTE/_admin/import/stage?push=$PUSH&part=1" --data-binary @part.ab
+#   -> {"push":"<id>","key":"r/<repo>/pending/<id>.part-1","bytes":N}
+curl -u "edge:$GE_TOKEN" -X POST "$REMOTE/_admin/import" -H 'Content-Type: application/json' -d '{
+  "push":"<id>", "parts":[{"key":"...","bytes":N}],
+  "commands":[{"old":"0000000000000000000000000000000000000000","new":"<tip>","name":"refs/heads/main"}]}'
+curl -u "edge:$GE_TOKEN" "$REMOTE/_admin/import/<push>"   # poll: phase, objects_done
+```
+
+The job runs `parse → resolve → check → commit` over alarm slices; the push
+commits atomically at the end (per-ref results land in `result`). A re-POST of
+the same push returns the running job's pack — safe to retry. Commands behave
+exactly like push ref updates: creates need `old` = 40 zeros, the ref must be
+a full `refs/…` name, and pinned/non-FF rules still apply.
+
 Then verify: clone back and `git fsck --strict`. Old repos may carry
 pre-existing fsck findings (e.g. `zeroPaddedFilemode`) — compare against fsck
 of the source, not against empty output.
@@ -140,17 +193,31 @@ wedged. Pushes are CAS; a stale push is rejected — refetch and retry, don't
 | Per-request budget | 9,000 subrequests / 240 s | `unpack request budget exhausted` → smaller slices |
 | Inflated non-blob object / delta result | 16 MiB | `object too large (16 MiB max)` / `delta base <oid> exceeds 16 MiB` → `git -c core.bigFileThreshold=1 push` sends it as a full blob. **`git push --no-thin` does NOT prevent REF_DELTA on git 2.54** |
 | Full blob (pushed whole) | ~2 GiB | streamed verbatim — fine |
-| Fetch walk | 200k commits / 1M objects | `ERR fetch too large for this server; clone instead` |
-| Push links (tree edges) per push | 1,000,000 | `push references too many objects` → smaller slices (seen on repos with giant trees) |
+| Fetch walk (non-clone fetches with haves) | 200k commits / 1M objects | `ERR fetch too large for this server; clone instead` — incremental fetches only |
+| Push links (tree edges) per push | 1,000,000 (8M via `_admin/import`) | `push references too many objects` → smaller slices, or import the pack server-side |
 | Push rate | 30/min per credential per repo (`GE_RATE_PUSHES_PER_MIN`) | HTTP 429 + `Retry-After` → wait and retry |
-| Quotas | 2M objects / 4 GiB stored per repo, 50 repos/owner (`GE_QUOTA_MAX_*`) | `unpack objects N > GE_QUOTA_MAX_OBJECTS=M` etc. — the message names the cap |
-| Full clone scale | ~110k objects verified on the walking path; A29/A30 lift it | When `packs_live: 1` (post-GC consolidation): plain clone streams the live pack verbatim (~1 subrequest); clients with `fetch.uriprotocols` set get a signed `/_packs/…` URL instead (bandwidth bypasses the Worker entirely, needs `GE_URL_SIGNING_KEY`). Otherwise index reads spend the 9,000 budget → HTTP 413 mid-walk between ~110k–263k objects; `--filter=blob:none` does NOT help |
+| Quotas | 2M objects / 4 GiB stored per repo, 50 repos/owner (`GE_QUOTA_MAX_*`) | `unpack objects N > GE_QUOTA_MAX_OBJECTS=M` etc. — the message names the cap. LFS objects count toward the byte quota |
+| Full clone scale | verified ≥700k objects; no walk bound | Plain clones take the no-walk path (all live objects streamed in pack order) — the 200k-commit walk cap applies only to haves-ful fetches. When `packs_live: 1` (post-GC consolidation) the live pack streams verbatim (~1 subrequest); clients with `fetch.uriprotocols` set get a signed `/_packs/…` URL instead (bandwidth bypasses the Worker entirely, needs `GE_URL_SIGNING_KEY`) |
+| LFS objects | basic transfer only, sha256 oids | No `verify` callback, no locking API, no custom transfers — plain upload/download via signed URLs |
 | Client floor | git ≥ 2.26 | v0/v1 fetch → `ERR protocol v2 required` |
 
 Each push lands as its own pack; GC consolidates after a ~10 min quiet window
 (`GE_GC_QUIET_MS`). Give a fresh staged import a few minutes before cloning.
 
-No LFS, no `--atomic`, no push-options, no hooks, no rename. GC is automatic
+## Git LFS (basic transfer)
+
+`POST /{owner}/{repo}/info/lfs/objects/batch` implements the LFS batch API.
+Upload needs a write credential, download a read one (or `public`). Response
+actions are HMAC-signed `/{owner}/{repo}/_lfs/<oid>?e=&r=&s=` URLs (same model
+as `/_packs/`): PUT the object bytes to upload, GET to download. Objects land
+in R2 under `r/<id>/lfs/` — inside the repo's delete/purge prefix — and count
+toward `GE_QUOTA_MAX_BYTES`. Already-present uploads return no action; missing
+downloads get a per-object `{"error":{"code":404}}`. Requires
+`GE_URL_SIGNING_KEY` — without it the batch route 403s. No `verify` callback,
+locking, or custom transfer adapters.
+
+No push-options, no hooks, no rename. `--atomic` is supported (the
+whole push rejects on any failing ref). GC is automatic
 (mark→consolidate→sweep via DO alarms, 1 h grace before R2 deletion).
 
 Full reference: `COMPATIBILITY.md`; evidence: `findings/implementation.md`;

@@ -73,7 +73,7 @@ object-format=sha1`
 | `report-status` | ✅ | ✅ | |
 | `report-status-v2` | ✅ | accepted, not advertised | option lines not supported |
 | `delete-refs`, `side-band-64k`, `quiet` | ✅ | ✅ | |
-| `atomic` | ✅ | — | not advertised → client-side refusal |
+| `atomic` | ✅ | ✅ | advertised; dry-run validation rejects the whole push on any failure |
 | `push-options` (`-o`) | ✅ | — | not advertised → client-side refusal |
 | Signed pushes (`push-cert`) | ✅ | — | |
 | `shallow` lines from a shallow client | ✅ | parsed, ignored | push proceeds; see caveats |

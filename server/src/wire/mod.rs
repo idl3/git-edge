@@ -131,6 +131,7 @@ pub struct ReceiveCaps {
     pub delete_refs: bool,
     pub quiet: bool,
     pub ofs_delta: bool,
+    pub atomic: bool,
     pub agent: Option<BString>,
 }
 pub struct ReceiveHeader {
@@ -157,6 +158,7 @@ pub fn parse_receive_header(r: &mut PktReader) -> Result<Option<ReceiveHeader>, 
         delete_refs: false,
         quiet: false,
         ofs_delta: false,
+        atomic: false,
         agent: None,
     };
     let mut first_command = true;
@@ -193,6 +195,7 @@ pub fn parse_receive_header(r: &mut PktReader) -> Result<Option<ReceiveHeader>, 
                     b"delete-refs" => caps.delete_refs = true,
                     b"quiet" => caps.quiet = true,
                     b"ofs-delta" => caps.ofs_delta = true,
+                    b"atomic" => caps.atomic = true,
                     b"no-thin" => {}
                     c if c.starts_with(b"agent=") => caps.agent = Some(c.into()),
                     c if c.starts_with(b"object-format=") => {
@@ -476,7 +479,7 @@ pub fn write_advertisement_v0(w: &mut PktWriter, service: Service, head: Option<
             // report-status-v2 is deliberately not advertised: its extra option-line
             // section is a strict superset of v1 and every client falls back cleanly.
             format!(
-                "report-status delete-refs side-band-64k quiet ofs-delta object-format=sha1 {AGENT}"
+                "report-status delete-refs side-band-64k quiet ofs-delta atomic object-format=sha1 {AGENT}"
             ),
         ),
     };

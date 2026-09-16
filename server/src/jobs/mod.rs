@@ -2,6 +2,7 @@
 //! `rearm` is the sole `set_alarm` caller; `enqueue` is sync and only writes a row.
 
 pub mod gc;
+pub mod import;
 pub mod janitor;
 pub mod purge;
 
@@ -19,6 +20,7 @@ pub enum JobKind {
     GcConsolidate,
     GcSweep,
     PurgeRepo,
+    ImportPack,
 }
 impl JobKind {
     pub fn as_str(&self) -> &'static str {
@@ -28,6 +30,7 @@ impl JobKind {
             JobKind::GcConsolidate => "gc_consolidate",
             JobKind::GcSweep => "gc_sweep",
             JobKind::PurgeRepo => "purge_repo",
+            JobKind::ImportPack => "import_pack",
         }
     }
     fn of(s: &str) -> Result<Self, Error> {
@@ -37,6 +40,7 @@ impl JobKind {
             "gc_consolidate" => Ok(JobKind::GcConsolidate),
             "gc_sweep" => Ok(JobKind::GcSweep),
             "purge_repo" => Ok(JobKind::PurgeRepo),
+            "import_pack" => Ok(JobKind::ImportPack),
             k => Err(Error::Internal(format!("unknown job kind {k}"))),
         }
     }
@@ -433,5 +437,6 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         JobKind::GcConsolidate => gc::gc_consolidate(d, job, budget).await,
         JobKind::GcSweep => gc::gc_sweep(d).await,
         JobKind::PurgeRepo => purge::run_slice(d, job, budget).await,
+        JobKind::ImportPack => import::run_slice(d, job, budget).await,
     }
 }

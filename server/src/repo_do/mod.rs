@@ -42,7 +42,7 @@ struct RefsMemo {
     ls: RefCell<Vec<(Vec<u8>, Vec<u8>)>>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 pub struct CmdDto {
     old: String,
     new: String,
@@ -55,6 +55,9 @@ pub struct CommitRequest {
     pub pack_id: Option<String>,
     pub principal: String,
     pub commands: Vec<CmdDto>,
+    /// `--atomic`: all commands land or none do (capability advertised).
+    #[serde(default)]
+    pub atomic: bool,
 }
 #[derive(serde::Serialize)]
 pub struct CommitResponse {
@@ -69,6 +72,13 @@ struct BeginDto {
     key: String,
 }
 #[derive(serde::Deserialize)]
+struct ImportStartDto {
+    push: String,
+    pack: String,
+    parts: Vec<serde_json::Value>,
+    commands: Vec<serde_json::Value>,
+}
+#[derive(serde::Deserialize)]
 struct AuthDto {
     hash: String,
 }
@@ -76,6 +86,10 @@ struct AuthDto {
 struct NewToken {
     name: String,
     level: String,
+    /// #19: optional ref scope — a comma list of ref patterns, `*` allowed only
+    /// as a trailing wildcard (e.g. `refs/heads/release-*`, `refs/heads/dev/*`).
+    /// NULL/empty = all refs.
+    scope: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct RevokeDto {
@@ -104,6 +118,7 @@ struct N {
 struct PushRow {
     state: String,
     gc_epoch: i64,
+    scope: Option<String>,
 }
 struct Cmd {
     old: ObjectId,
@@ -169,6 +184,8 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/push/commit") => {
                     self.commit_push(&parse::<CommitRequest>(&body)?).and_then(|r| json(serde_json::to_value(&r)?))
                 }
+                (Method::Post, "/_do/import/start") => self.import_start(&meta, &parse::<ImportStartDto>(&body)?),
+                (Method::Post, "/_do/import/status") => self.import_status(&parse(&body)?),
                 (Method::Post, "/_do/ls-refs") => self.ls_refs(&meta, &body),
                 (Method::Post, "/_do/auth") => self.auth_lookup(&parse(&body)?),
                 (Method::Post, "/_do/tokens") => self.token_create(&parse(&body)?),
@@ -197,6 +214,11 @@ impl DurableObject for RepoDo {
                 }
                 (Method::Post, "/_do/export") => {
                     let r = self.export_bundle().await;
+                    let _ = jobs::rearm(self).await;
+                    return r;
+                }
+                (Method::Post, "/_do/lfs/batch") => {
+                    let r = self.lfs_batch(&body, &hdr).await;
                     let _ = jobs::rearm(self).await;
                     return r;
                 }
@@ -244,6 +266,31 @@ fn valid_ref(name: &str) -> Result<&str, Error> {
         return Err(Error::Protocol("bad ref name".into()));
     }
     Ok(name)
+}
+
+/// #19 token scope: one pattern is `refs/…` text, `*` allowed only trailing
+/// (prefix glob). Rejects anything else so a malformed scope can't widen access.
+fn scope_pattern_ok(p: &str) -> bool {
+    let p = p.strip_suffix('*').unwrap_or(p);
+    p.starts_with("refs/")
+        && !p.is_empty()
+        && !p.contains('*')
+        && gix_validate::reference::name_partial(p.as_bytes().as_bstr()).is_ok()
+}
+
+/// A command ref matches a scope when any comma pattern covers it — exact match,
+/// or prefix when the pattern ends in `*`. Empty scope = unrestricted.
+fn scope_allows(scope: Option<&str>, name: &str) -> bool {
+    match scope.map(str::trim).filter(|s| !s.is_empty()) {
+        None => true,
+        Some(s) => s.split(',').map(str::trim).any(|p| {
+            if let Some(prefix) = p.strip_suffix('*') {
+                name.starts_with(prefix)
+            } else {
+                name == p
+            }
+        }),
+    }
 }
 /// The /_do/refs DTO body — built once per refs_version and memoized (A28).
 fn refs_value(head: &Option<BString>, refs: &[RefRow]) -> serde_json::Value {
@@ -530,17 +577,18 @@ impl RepoDo {
         struct R {
             level: String,
             name: String,
+            scope: Option<String>,
         }
         let row = self
-            .q("SELECT level, name FROM tokens WHERE hash=?", vec![V::from(b.hash.as_str())])?
+            .q("SELECT level, name, scope FROM tokens WHERE hash=?", vec![V::from(b.hash.as_str())])?
             .to_array::<R>()?
             .into_iter()
             .next()
             .ok_or(Error::Auth)?;
-        json(serde_json::json!({ "level": row.level, "name": row.name }))
+        json(serde_json::json!({ "level": row.level, "name": row.name, "scope": row.scope }))
     }
 
-    /// POST /_do/tokens {name, level} — the edge has already gated this on the global
+    /// POST /_do/tokens {name, level, scope?} — the edge has already gated this on the global
     /// write token. Returns the token value once; only its sha1 hash is stored.
     fn token_create(&self, b: &NewToken) -> Result<Response, Error> {
         if !matches!(b.level.as_str(), "read" | "write") {
@@ -549,6 +597,18 @@ impl RepoDo {
         if b.name.is_empty() || b.name.len() > 128 {
             return Err(Error::Protocol("name must be 1-128 bytes".into()));
         }
+        let scope = b.scope.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(s) = scope {
+            if s.len() > 256
+                || s.split(',')
+                    .map(str::trim)
+                    .any(|p| !scope_pattern_ok(p))
+            {
+                return Err(Error::Protocol(
+                    "scope must be <=256 bytes of refs/… patterns (trailing * only)".into(),
+                ));
+            }
+        }
         let n = self.q("SELECT COUNT(*) AS n FROM tokens", vec![])?.one::<N>()?.n;
         if n >= 256 {
             return Err(Error::Limit("too many tokens (256 max)".into()));
@@ -556,16 +616,17 @@ impl RepoDo {
         let token = format!("ge_{}{}", platform::hex16()?, platform::hex16()?);
         let id = platform::hex16()?;
         self.q(
-            "INSERT INTO tokens(id,hash,level,name,created_at) VALUES(?,?,?,?,?)",
+            "INSERT INTO tokens(id,hash,level,name,created_at,scope) VALUES(?,?,?,?,?,?)",
             vec![
                 V::from(id.as_str()),
                 V::from(crate::auth::token_hash(&token)?),
                 V::from(b.level.as_str()),
                 V::from(b.name.as_str()),
                 V::from(platform::now_ms()),
+                scope.map(V::from).unwrap_or(V::Null),
             ],
         )?;
-        json(serde_json::json!({ "id": id, "token": token, "level": b.level, "name": b.name }))
+        json(serde_json::json!({ "id": id, "token": token, "level": b.level, "name": b.name, "scope": scope }))
     }
 
     /// GET /_do/tokens — id/name/level only; hashes and token values never leave.
@@ -576,15 +637,17 @@ impl RepoDo {
             name: String,
             level: String,
             created_at: i64,
+            scope: Option<String>,
         }
         let rows = self
-            .q("SELECT id, name, level, created_at FROM tokens ORDER BY created_at", vec![])?
+            .q("SELECT id, name, level, created_at, scope FROM tokens ORDER BY created_at", vec![])?
             .to_array::<T>()?;
         json(serde_json::json!({
             "tokens": rows
                 .iter()
                 .map(|t| serde_json::json!({
                     "id": t.id, "name": t.name, "level": t.level, "created_at": t.created_at,
+                    "scope": t.scope,
                 }))
                 .collect::<Vec<_>>()
         }))
@@ -768,21 +831,64 @@ impl RepoDo {
     /// Section 3 step 0: the push row carrying the gc_epoch the whole push validates against.
     fn push_begin(&self, meta: &Meta, b: &BeginDto) -> Result<Response, Error> {
         self.rate_check(&b.key)?; // A27: before the row exists — throttled pushes hold nothing
-        // an 'open' push owns a pending/ key and eventually a packs row; bound how many
-        // a client may hold at once (expired ones are reaped by the janitor)
-        let open = self.q("SELECT COUNT(*) AS n FROM pushes WHERE state='open'", vec![])?.one::<N>()?.n;
-        if open >= 64 {
-            return Err(Error::Limit("too many open pushes".into()));
+        // I1 multi-part staging reuses ONE open push for every part key so the import
+        // job's began_at heartbeat covers them all: re-beginning an existing open push
+        // under the same principal is a no-op; any other state or owner is an error.
+        #[derive(serde::Deserialize)]
+        struct Existing {
+            state: String,
+            principal: String,
         }
-        self.q(
-            "INSERT INTO pushes(id,state,principal,began_at,gc_epoch) VALUES(?,'open',?,?,?)",
-            vec![
-                V::from(b.push_id.as_str()),
-                V::from(b.principal.as_str()),
-                V::from(platform::now_ms()),
-                V::from(meta.gc_epoch),
-            ],
-        )?;
+        let existing = self
+            .q(
+                "SELECT state, principal FROM pushes WHERE id=?",
+                vec![V::from(b.push_id.as_str())],
+            )?
+            .to_array::<Existing>()?
+            .into_iter()
+            .next();
+        match existing {
+            Some(e) if e.state == "open" && e.principal == b.principal => {}
+            Some(e) if e.state == "open" => return Err(Error::Forbidden),
+            Some(e) => return Err(Error::Conflict(format!("push is {}", e.state))),
+            None => {
+                // an 'open' push owns pending/ keys and eventually a packs row; bound
+                // how many a client may hold at once (expired ones are reaped)
+                let open = self
+                    .q("SELECT COUNT(*) AS n FROM pushes WHERE state='open'", vec![])?
+                    .one::<N>()?
+                    .n;
+                if open >= 64 {
+                    return Err(Error::Limit("too many open pushes".into()));
+                }
+                // #19: capture the presenting token's ref scope on the push row —
+                // commit_push/import enforce it per command, and a mid-push token
+                // edit can't retroactively widen an open push
+                #[derive(serde::Deserialize)]
+                struct Sc {
+                    scope: Option<String>,
+                }
+                let scope = if b.key.is_empty() {
+                    None
+                } else {
+                    self.q("SELECT scope FROM tokens WHERE hash=?", vec![V::from(b.key.as_str())])?
+                        .to_array::<Sc>()?
+                        .into_iter()
+                        .next()
+                        .and_then(|s| s.scope)
+                };
+                self.q(
+                    "INSERT INTO pushes(id,state,principal,began_at,gc_epoch,scope) VALUES(?,'open',?,?,?,?)",
+                    vec![
+                        V::from(b.push_id.as_str()),
+                        V::from(b.principal.as_str()),
+                        V::from(platform::now_ms()),
+                        V::from(meta.gc_epoch),
+                        scope.map(V::from).unwrap_or(V::Null),
+                    ],
+                )?;
+            }
+        }
         // A26: a repo counts against GE_QUOTA_MAX_REPOS_PER_OWNER until its first
         // committed pack lands (live, or dead after sweep). `claimed=false` tells the
         // edge to take the registry hop; a repo that once committed keeps pushing even
@@ -917,6 +1023,189 @@ impl RepoDo {
         json(serde_json::json!({}))
     }
 
+    /// I1: POST /_do/import/start — open the pushes row, plant the 'ingesting'
+    /// packs row the job will write into, and queue the import_pack job. One sync
+    /// span; a second start for the same push updates payload + run_at instead of
+    /// queueing a duplicate row (the generic enqueue dedup is per-kind, which
+    /// would silently swallow a distinct push's job).
+    fn import_start(&self, meta: &Meta, b: &ImportStartDto) -> Result<Response, Error> {
+        #[derive(serde::Deserialize)]
+        struct S {
+            state: String,
+            principal: String,
+            scope: Option<String>,
+        }
+        let st = self
+            .q("SELECT state, principal, scope FROM pushes WHERE id=?", vec![V::from(b.push.as_str())])?
+            .to_array::<S>()?
+            .into_iter()
+            .next();
+        let Some(st) = st else {
+            return Err(Error::Conflict("unknown push".into()));
+        };
+        if st.state != "open" {
+            return Err(Error::Conflict(format!("import push is {}", st.state)));
+        }
+        if b.parts.is_empty() || b.commands.is_empty() {
+            return Err(Error::Protocol("import needs parts and commands".into()));
+        }
+        // #19: an import obeys the push's captured token scope — every command's
+        // ref must be covered, or the whole import 400s before a job exists
+        if let Some(scope) = st.scope.as_deref() {
+            for c in &b.commands {
+                let name = c.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                if !scope_allows(Some(scope), name) {
+                    return Err(Error::Protocol(format!("ref {name} outside token scope")));
+                }
+            }
+        }
+        // part keys must stay inside this repo's pending namespace — the R2 bucket
+        // is shared across repos, so an unchecked key would read across tenancy
+        let pending_ns = format!("r/{}/pending/", self.repo_id()?.0);
+        for part in &b.parts {
+            let key = part
+                .get("key")
+                .and_then(|k| k.as_str())
+                .ok_or_else(|| Error::Protocol("part key".into()))?;
+            if !key.starts_with(&pending_ns) {
+                return Err(Error::Protocol("part outside pending namespace".into()));
+            }
+            if part.get("bytes").and_then(|n| n.as_u64()).is_none() {
+                return Err(Error::Protocol("part bytes".into()));
+            }
+        }
+        // malformed commands should 400 here, not kill the job mid-import
+        serde_json::from_value::<Vec<CmdDto>>(serde_json::Value::Array(b.commands.clone()))
+            .map_err(|e| Error::Protocol(format!("commands: {e}")))?;
+        // same-push start is idempotent: a live job for it already owns a pack —
+        // hand that pack id back rather than planting a second ingesting row
+        #[derive(serde::Deserialize)]
+        struct J {
+            payload: String,
+        }
+        let existing = self
+            .q(
+                "SELECT payload FROM jobs WHERE kind='import_pack' AND state IN ('queued','running')",
+                vec![],
+            )?
+            .to_array::<J>()?
+            .into_iter()
+            .find(|j| {
+                serde_json::from_str::<serde_json::Value>(&j.payload)
+                    .ok()
+                    .and_then(|v| v.get("push").and_then(|p| p.as_str()).map(String::from))
+                    .as_deref()
+                    == Some(b.push.as_str())
+            });
+        if let Some(j) = existing {
+            let pack = serde_json::from_str::<serde_json::Value>(&j.payload)
+                .ok()
+                .and_then(|v| v.get("pack").and_then(|p| p.as_str()).map(String::from))
+                .unwrap_or_default();
+            return json(serde_json::json!({ "queued": true, "push": b.push, "pack": pack }));
+        }
+        self.q(
+            "INSERT INTO packs(id,state,count,bytes,commit_lo,commit_hi,push_id,created_at) \
+             VALUES(?,'ingesting',0,0,0,0,?,?) ON CONFLICT(id) DO NOTHING",
+            vec![
+                V::from(b.pack.as_str()),
+                V::from(b.push.as_str()),
+                V::from(platform::now_ms()),
+            ],
+        )?;
+        // the begin-time principal is authoritative — the client-supplied one is
+        // ignored so a replayed start can't rewrite who the reflog credits
+        let payload = serde_json::json!({
+            "push": b.push, "pack": b.pack, "parts": b.parts,
+            "principal": st.principal, "commands": b.commands,
+        })
+        .to_string();
+        self.q(
+            "INSERT INTO jobs(kind,run_at,payload) VALUES('import_pack',?,?)",
+            vec![V::from(platform::now_ms()), V::from(payload.as_str())],
+        )?;
+        let _ = meta;
+        json(serde_json::json!({ "queued": true, "push": b.push }))
+    }
+
+    /// GET-style status for the edge's /_admin/import/<push>: push state, job
+    /// state/phase, and how much of the staged pack is ingested so far.
+    fn import_status(&self, b: &serde_json::Value) -> Result<Response, Error> {
+        let push = b.get("push").and_then(|v| v.as_str()).ok_or_else(|| Error::Protocol("push".into()))?;
+        #[derive(serde::Deserialize)]
+        struct P {
+            state: String,
+            result: Option<String>,
+        }
+        let prow = self
+            .q("SELECT state, result FROM pushes WHERE id=?", vec![V::from(push)])?
+            .to_array::<P>()?
+            .into_iter()
+            .next();
+        #[derive(serde::Deserialize)]
+        struct J {
+            state: String,
+            attempts: i64,
+            cursor: Option<String>,
+            last_error: Option<String>,
+            payload: String,
+        }
+        let job = self
+            .q(
+                "SELECT state, attempts, cursor, last_error, payload FROM jobs \
+                 WHERE kind='import_pack' ORDER BY id DESC LIMIT 8",
+                vec![],
+            )?
+            .to_array::<J>()?
+            .into_iter()
+            .find(|j| {
+                serde_json::from_str::<serde_json::Value>(&j.payload)
+                    .ok()
+                    .and_then(|v| v.get("push").and_then(|p| p.as_str()).map(String::from))
+                    .as_deref()
+                    == Some(push)
+            });
+        #[derive(serde::Deserialize)]
+        struct N2 {
+            n: i64,
+        }
+        let pack = job.as_ref().and_then(|j| {
+            serde_json::from_str::<serde_json::Value>(&j.payload)
+                .ok()
+                .and_then(|v| v.get("pack").and_then(|p| p.as_str()).map(String::from))
+        });
+        let done = pack.as_ref().map_or(Ok(0), |pk| {
+            self.q("SELECT COUNT(*) AS n FROM objects WHERE pack_id=?", vec![V::from(pk.as_str())])?
+                .one::<N2>()
+                .map(|r| r.n)
+        })?;
+        let total = job.as_ref().and_then(|j| {
+            j.cursor.as_deref().and_then(|c| {
+                serde_json::from_str::<serde_json::Value>(c)
+                    .ok()
+                    .and_then(|v| v.get("count").and_then(|n| n.as_u64()))
+            })
+        });
+        let phase = job.as_ref().and_then(|j| {
+            j.cursor.as_deref().and_then(|c| {
+                serde_json::from_str::<serde_json::Value>(c)
+                    .ok()
+                    .and_then(|v| v.get("phase").and_then(|p| p.as_str()).map(String::from))
+            })
+        });
+        json(serde_json::json!({
+            "push": push,
+            "push_state": prow.as_ref().map(|p| p.state.as_str()),
+            "result": prow.as_ref().and_then(|p| p.result.clone()),
+            "job_state": job.as_ref().map(|j| j.state.as_str()),
+            "job_phase": phase,
+            "attempts": job.as_ref().map(|j| j.attempts),
+            "last_error": job.as_ref().and_then(|j| j.last_error.clone()),
+            "objects_done": done,
+            "objects_total": total,
+        }))
+    }
+
     /// Section 3, steps 1-7. One sync span: no await, no R2, no stub between first SELECT and return.
     pub fn commit_push(&self, req: &CommitRequest) -> Result<CommitResponse, Error> {
         let cmds = req
@@ -933,7 +1222,7 @@ impl RepoDo {
             .collect::<Result<Vec<_>, Error>>()?;
         let now = platform::now_ms();
         let push = self
-            .q("SELECT state, gc_epoch FROM pushes WHERE id=?", vec![V::from(req.push_id.as_str())])?
+            .q("SELECT state, gc_epoch, scope FROM pushes WHERE id=?", vec![V::from(req.push_id.as_str())])?
             .to_array::<PushRow>()?
             .into_iter()
             .next()
@@ -990,11 +1279,38 @@ impl RepoDo {
         let head = self.meta("head")?;
         let sql = self.sql();
         let idx = Index(&sql);
+        if req.atomic {
+            // --atomic (capability): validate every command before any write —
+            // a dry-run inside this same span is deterministic. Any failure
+            // rejects the whole push; failing refs keep their reason and the
+            // rest get git's stock atomic message.
+            let mut results = Vec::with_capacity(cmds.len());
+            let mut any_fail = false;
+            for c in &cmds {
+                let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now, false, push.scope.as_deref())?;
+                any_fail |= r.is_some();
+                results.push((c.name.clone(), r));
+            }
+            if any_fail {
+                if let Some(pack) = &req.pack_id {
+                    // step 3 promoted it; demote so 'rejected' lets the janitor reap
+                    self.q(
+                        "UPDATE packs SET state='ingesting' WHERE id=? AND push_id=?",
+                        vec![V::from(pack.as_str()), V::from(req.push_id.as_str())],
+                    )?;
+                }
+                let results = results
+                    .into_iter()
+                    .map(|(n, r)| (n, r.or(Some("atomic push failed"))))
+                    .collect();
+                return self.finish_push(req, "rejected", now, results);
+            }
+        }
         let mut results = Vec::with_capacity(cmds.len());
         let mut any_ok = false;
         for c in &cmds {
             // step 4
-            let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now)?;
+            let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now, true, push.scope.as_deref())?;
             any_ok |= r.is_none();
             results.push((c.name.clone(), r));
         }
@@ -1014,7 +1330,10 @@ impl RepoDo {
         self.finish_push(req, "committed", now, results) // step 6
     }
 
-    /// One RefCommand, independent of its siblings (git default; `atomic` is not advertised).
+    /// One RefCommand, independent of its siblings unless `atomic` was requested.
+    /// `write=false` is the --atomic dry run: every check runs but the ref table
+    /// is only read — the CAS predicate becomes a SELECT so a multi-command push
+    /// can validate fully before any sibling writes.
     fn apply_one(
         &self,
         idx: &Index<'_>,
@@ -1023,12 +1342,19 @@ impl RepoDo {
         push: &str,
         who: &str,
         now: i64,
+        write: bool,
+        scope: Option<&str>,
     ) -> Result<Option<&'static str>, Error> {
         // refs live under refs/ only — a full valid refname, never HEAD or a bare word
         if !c.name.as_bytes().starts_with(b"refs/")
             || gix_validate::reference::name(c.name.as_bytes().as_bstr()).is_err()
         {
             return Ok(Some("funny refname"));
+        }
+        // #19 deploy-key scope: the push row carries the token's ref patterns —
+        // a scoped token can only touch its refs (per-command `ng`, like a pin)
+        if !scope_allows(scope, &c.name) {
+            return Ok(Some("ref outside token scope"));
         }
         if c.old.is_null() && c.new.is_null() {
             return Ok(Some("funny refname"));
@@ -1053,6 +1379,25 @@ impl RepoDo {
             }
         }
         let (o, n, name) = (c.old.to_string(), c.new.to_string(), c.name.as_str());
+        if !write {
+            // the CAS predicates, read-only: a create lands iff the ref is
+            // absent; update/delete land iff target equals the expected old.
+            #[derive(serde::Deserialize)]
+            struct T {
+                target: String,
+            }
+            let cur = self
+                .q("SELECT target FROM refs WHERE name=?", vec![V::from(name)])?
+                .to_array::<T>()?
+                .into_iter()
+                .next();
+            let ok = match (&cur, c.old.is_null()) {
+                (None, true) => true,
+                (Some(t), false) => t.target == o,
+                _ => false,
+            };
+            return Ok(if ok { None } else { Some("failed to update ref") });
+        }
         let peeled = c.peeled.clone().map_or(V::Null, |p| V::from(p));
         if c.old.is_null() {
             self.q(
@@ -1325,22 +1670,49 @@ impl RepoDo {
                 return Ok(resp);
             }
         }
-        // steps 3-5: the send set
-        let set = generate::send_set(
-            self,
-            &bucket,
-            &wants,
-            &args.haves,
-            args.filter.as_ref(),
-            args.deepen,
-            args.deepen_since,
-            &deepen_not,
-            args.deepen_relative,
-            args.include_tag,
-            &args.shallow,
-            &mut budget,
-        )
-        .await?;
+        // steps 3-5: the send set — or, for a plain clone over multiple live
+        // packs, the all-live-objects set (#22): the same verbatim-copy wire
+        // shape with no commit walk, so MAX_COMMITS never binds a big import
+        // that hasn't consolidated yet. Emitted objects are a superset of the
+        // wanted closure — wire-legal exactly as A29 argues.
+        let set = if plain_clone {
+            match self.no_walk_set(&idx, &budget)? {
+                Some(s) => s,
+                None => {
+                    generate::send_set(
+                        self,
+                        &bucket,
+                        &wants,
+                        &args.haves,
+                        args.filter.as_ref(),
+                        args.deepen,
+                        args.deepen_since,
+                        &deepen_not,
+                        args.deepen_relative,
+                        args.include_tag,
+                        &args.shallow,
+                        &mut budget,
+                    )
+                    .await?
+                }
+            }
+        } else {
+            generate::send_set(
+                self,
+                &bucket,
+                &wants,
+                &args.haves,
+                args.filter.as_ref(),
+                args.deepen,
+                args.deepen_since,
+                &deepen_not,
+                args.deepen_relative,
+                args.include_tag,
+                &args.shallow,
+                &mut budget,
+            )
+            .await?
+        };
         // step 6: stream header + chunks + trailer + flush as band-1 sideband frames
         wire::write_fetch_prelude(&mut w, &args, &acks, &wanted_refs, &set.shallow, &set.unshallow, &[])?;
         let prelude = w.out;
@@ -1401,6 +1773,41 @@ impl RepoDo {
             return Ok(None);
         };
         Ok(Some((pack, bytes)))
+    }
+
+    /// #22 no-walk clone: every live pack marked whole — `plan_reads` then
+    /// coalesces contiguous entries into 8 MiB reads exactly like the walked
+    /// path, and `pack_chunk` copies each verbatim. Duplicate shas across packs
+    /// emit twice (legal — index-pack dedups) rather than paying a seen-set.
+    /// None when <2 live packs: single-pack clones take the A29/C1 path.
+    fn no_walk_set(&self, idx: &Index<'_>, budget: &ReqBudget) -> Result<Option<generate::SendSet>, Error> {
+        #[derive(serde::Deserialize)]
+        struct P {
+            id: String,
+            count: i64,
+            bytes: i64,
+        }
+        let live = self
+            .q("SELECT id, count, bytes FROM packs WHERE state='live'", vec![])?
+            .to_array::<P>()?;
+        if live.len() < 2 {
+            return Ok(None);
+        }
+        let mut set = generate::SendSet::default();
+        for p in live {
+            let count = u32::try_from(p.count).map_err(|_| Error::Internal("count".into()))?;
+            let bytes = u64::try_from(p.bytes).map_err(|_| Error::Internal("bytes".into()))?;
+            let bits = usize::try_from(count).map_err(|_| Error::Internal("count".into()))?.div_ceil(8);
+            let mut bitmap = vec![0xFFu8; bits];
+            if count % 8 != 0 {
+                if let Some(last) = bitmap.last_mut() {
+                    *last &= (1u8 << (count % 8)) - 1;
+                }
+            }
+            set.packs.push(generate::PackSlice { pack: PackId(p.id), count, bytes, bitmap });
+        }
+        generate::plan_reads(idx, &mut set, budget)?;
+        Ok(Some(set))
     }
 
     /// C1 (A30): when the client sent `packfile-uris` naming our public scheme,
@@ -1541,6 +1948,134 @@ impl RepoDo {
             .set("x-ge-subrequests", &format!("{projected}/{max_sub}"))
             .map_err(|e| Error::Internal(e.to_string()))?;
         Ok(resp)
+    }
+
+    /// POST /_do/lfs/batch — Git LFS batch API (#21, basic transfer). The edge
+    /// authenticated already (read for download, write for upload); this does
+    /// the per-object existence check against R2 and mints signed `/_lfs/`
+    /// hrefs with the A30 key (domain-separated `lfs` op). Upload side checks
+    /// the A26 byte quota against packs + lfs + newly-declared bytes.
+    async fn lfs_batch(&self, body: &[u8], hdr: &RepoHeaders) -> worker::Result<Response> {
+        let spend: Spend = Rc::new(Cell::new(0));
+        match self.lfs_batch_inner(body, hdr, &spend).await {
+            Ok(r) => Ok(r),
+            Err(e @ (Error::Storage(_) | Error::Internal(_))) => {
+                Err(worker::Error::RustError(e.message()))
+            }
+            Err(e) => {
+                worker::console_log!("lfs batch: {e}");
+                do_error_response(&e, spend.get()).map_err(worker::Error::from)
+            }
+        }
+    }
+
+    async fn lfs_batch_inner(
+        &self,
+        body: &[u8],
+        hdr: &RepoHeaders,
+        spend: &Spend,
+    ) -> Result<Response, Error> {
+        #[derive(serde::Deserialize)]
+        struct LfsObj {
+            oid: String,
+            #[serde(default)]
+            size: u64,
+        }
+        #[derive(serde::Deserialize)]
+        struct LfsDto {
+            operation: String,
+            #[serde(default)]
+            objects: Vec<LfsObj>,
+        }
+        let d: LfsDto = parse(body)?;
+        let upload = match d.operation.as_str() {
+            "upload" => true,
+            "download" => false,
+            _ => return Err(Error::Protocol("lfs operation must be upload or download".into())),
+        };
+        let (Some(base), Some(owner), Some(repo)) =
+            (hdr.base.as_deref(), hdr.owner.as_deref(), hdr.repo.as_deref())
+        else {
+            return Err(Error::Internal("lfs batch missing base".into()));
+        };
+        // the hrefs are capability URLs — no key configured means LFS is off
+        let signing = crate::sign::signing_key(&self.env).ok_or(Error::Forbidden)?;
+        let bucket = self.bucket()?;
+        let mut budget = ReqBudget::paid().reporting(spend);
+        // bound like _packs/: below the janitor's dead-pack grace (A30)
+        const TTL: i64 = 3600;
+        let exp = platform::now_ms() / 1000 + TTL;
+        let repo_id = bucket.repo.0.clone();
+        let mut out = Vec::with_capacity(d.objects.len());
+        let mut new_bytes = 0i64;
+        for o in &d.objects {
+            if o.oid.len() != 64 || !o.oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                out.push(serde_json::json!({"oid": o.oid, "size": o.size,
+                    "error": {"code": 422, "message": "oid must be 64 hex chars"}}));
+                continue;
+            }
+            let key = keys::lfs(&bucket.repo, &o.oid);
+            budget.charge(1)?;
+            let present = bucket.inner.head(&key).await?.is_some();
+            if upload {
+                if present {
+                    // already stored — per spec the object needs no action
+                    out.push(serde_json::json!({"oid": o.oid, "size": o.size}));
+                } else {
+                    new_bytes = new_bytes.saturating_add(o.size as i64);
+                    let sig = crate::sign::lfs_sig(&signing, &repo_id, &o.oid, exp, "put")?;
+                    out.push(serde_json::json!({"oid": o.oid, "size": o.size, "actions":
+                        {"upload": {"href": format!("{base}/{owner}/{repo}/_lfs/{}?e={exp}&r={repo_id}&s={sig}", o.oid)}}}));
+                }
+            } else if present {
+                let sig = crate::sign::lfs_sig(&signing, &repo_id, &o.oid, exp, "get")?;
+                out.push(serde_json::json!({"oid": o.oid, "size": o.size, "actions":
+                    {"download": {"href": format!("{base}/{owner}/{repo}/_lfs/{}?e={exp}&r={repo_id}&s={sig}", o.oid)}}}));
+            } else {
+                out.push(serde_json::json!({"oid": o.oid, "size": o.size,
+                    "error": {"code": 404, "message": "object not found"}}));
+            }
+        }
+        // A26 quota, lfs side: packs + stored lfs + newly-declared must fit —
+        // the same bound commit_push enforces on the pack side
+        if upload && new_bytes > 0 {
+            let (_, pack_bytes) = self.storage_totals("")?;
+            let lfs_bytes = self.lfs_bytes(&bucket, &mut budget).await?;
+            let max = self.env_i64("GE_QUOTA_MAX_BYTES", DEFAULT_MAX_BYTES);
+            if pack_bytes.saturating_add(lfs_bytes).saturating_add(new_bytes) > max {
+                return Err(Error::Limit(format!(
+                    "repo quota exceeded: packs {pack_bytes} + lfs {lfs_bytes} + upload {new_bytes} > GE_QUOTA_MAX_BYTES={max}"
+                )));
+            }
+        }
+        json(serde_json::json!({"transfer": "basic", "hash_algo": "sha256", "objects": out}))
+    }
+
+    /// Sum of stored lfs bytes — one `list` page per 1k objects under the
+    /// repo's lfs/ prefix. Charged like any other R2 op.
+    async fn lfs_bytes(&self, bucket: &Bucket, budget: &mut ReqBudget) -> Result<i64, Error> {
+        let mut total = 0i64;
+        let mut cursor: Option<String> = None;
+        loop {
+            budget.charge(1)?;
+            let mut q = bucket
+                .inner
+                .list()
+                .prefix(format!("r/{}/lfs/", bucket.repo.0))
+                .limit(1_000);
+            if let Some(c) = cursor.take() {
+                q = q.cursor(c);
+            }
+            let page = q.execute().await?;
+            for o in page.objects() {
+                total = total.saturating_add(o.size() as i64);
+            }
+            match (page.truncated(), page.cursor()) {
+                (true, Some(c)) => cursor = Some(c),
+                _ => break,
+            }
+        }
+        Ok(total)
     }
 }
 

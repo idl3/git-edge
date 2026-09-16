@@ -111,7 +111,29 @@ rejection, malformed-pack `ERR`, GC mark/consolidate/sweep cycle.
 | Auth model | global + per-repo tokens, no per-user identity | name tokens per principal | ☐ |
 | Paid plan only | 10k subrequests vs 9k budget | — | ☐ |
 
-## 11. Rollback & DR
+## 11. Custom domain + Cloudflare Access (optional, ROADMAP #20)
+
+Zero-code auth upgrade when the worker sits in a Cloudflare zone.
+
+- [ ] Custom domain: `wrangler.jsonc` →
+      `"routes": [{ "pattern": "git.example.com", "custom_domain": true }]`, or
+      dashboard → Workers → git-edge → Domains. `*.workers.dev` can be disabled
+      (Workers → Settings) once the custom domain answers.
+- [ ] Access in front: dashboard → Access → Applications → self-hosted,
+      `git.example.com` — but note the split:
+  - `_admin/*` + `_state` browser/API use → Access IdP works end to end.
+  - git clients (clone/push/fetch) cannot complete an Access browser flow —
+      they need `cf-access-client-id` / `cf-access-client-secret` service-token
+      headers via `git config http.https://git.example.com/.extraHeader`, or
+      leave the git endpoints on token auth and gate only `_admin/*` with
+      Access (recommended: one Access policy whose `include` list matches
+      `/_admin/` and `/_state` paths; service tokens for CI).
+- [ ] Access does not replace `GE_*_TOKEN`: keep bearer auth on — Access is an
+      outer gate, the token model still authorizes per-repo inside the worker.
+- [ ] Verify: `curl https://git.example.com/healthz` → 200; anonymous
+      `/_admin/tokens` → Access login page or 403 with service-token only.
+
+## 12. Rollback & DR
 
 - [ ] Rollback: `wrangler rollback` or redeploy previous version id; DO schema
       migrations are additive-only — verify old code tolerates `tokens` table
