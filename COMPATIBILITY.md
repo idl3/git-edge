@@ -122,8 +122,9 @@ server adopts an existing branch — clones check out like a GitHub import.
 | Delta chain depth | 64 (git default: 50) | unbounded-ish |
 | Aggregate delta-chain bytes | 64 MiB compressed / 128 MiB live | none |
 | Refs per repo | 65,536 | none |
-| Fetch commit-walk bound | 200,000 commits or 64 MiB mem → `ERR fetch too large` | none |
+| Fetch commit-walk bound (haves-ful fetches) | 200,000 commits or 64 MiB mem → `ERR fetch too large` | none |
 | Reachable objects per fetch | 1,000,000 | none |
+| Clone object bound | none — plain clones stream all live objects in pack order (no walk); verified ≥718k objects | n/a |
 | Push links (tree edges) per push | 1,000,000 | none |
 | upload-pack request body | 1 MiB | ~unbounded |
 | ls-refs prefixes | 32 | unbounded |
@@ -143,9 +144,11 @@ truncation, or corrupted ref state.
    responses carry full objects only. Legal per protocol; fetch bodies are
    larger than a deltifying server's. This is what makes constant-memory
    streaming possible.
-4. **`--atomic` and `-o <push-option>` refuse client-side.** Capabilities are
-   not advertised, so the client errors before the request — clean, but these
-   workflows are unavailable.
+4. **`-o <push-option>` refuses client-side; `--atomic` works.** Push options
+   are not advertised, so the client errors before the request — clean.
+   `--atomic` is advertised and honored: `commit_push` dry-runs every
+   command's CAS predicate before any write and rejects the whole push on
+   any failure.
 5. **Shallow-push tracking is not maintained.** `shallow` lines from a shallow
    client are parsed and ignored; the server does not remember that a pushed
    history was truncated. Consequence is benign (objects are stored; the
@@ -161,16 +164,27 @@ truncation, or corrupted ref state.
    are stored; a token is shown once at creation. Read tokens get 403 on push.
    `POST /_admin/public {enabled}` opens a repo to anonymous reads (ls-refs,
    fetch, export) — a request with no credential is admitted; a presented bad
-   token still gets a 401. Still no per-branch permissions or user accounts.
-8. **No LFS.** Full objects now stream verbatim up to the 2 GiB pending-pack
-   bound, so ordinary large blobs are fine — but anything pushed *as a delta*
-   whose result exceeds 16 MiB is still rejected (`unpack object too large`),
-   and a REF_DELTA whose *base* is a streamed >16 MiB object is rejected with
-   `delta base <oid> exceeds 16 MiB`. Note `git push --no-thin` does **not**
-   prevent a client from sending REF_DELTA (verified on git 2.54) — the
-   reliable workaround is pushing the object undeltified, e.g.
+   token still gets a 401. Tokens accept an optional `scope`: a comma list
+   of `refs/…` patterns (a trailing `*` makes the pattern a prefix glob),
+   enforced on every ref update a push or import attempts — e.g.
+   `refs/heads/scoped-*` lets a deploy key push only matching branches.
+   No user accounts.
+8. **Git LFS: basic transfer only.** The batch endpoint
+   `POST /:owner/:repo/info/lfs/objects/batch` answers the spec and mints
+   HMAC-signed `GET|PUT /_lfs/<oid>` URLs (same capability model as
+   `/_packs/`; the sig binds repo+oid+expiry+op). Objects live in R2 under
+   `r/<id>/lfs/` — inside the repo's purge prefix — and count toward
+   `GE_QUOTA_MAX_BYTES`. Requires `GE_URL_SIGNING_KEY`; without it the
+   batch route 403s. No `verify` callback, locking API, or custom
+   transfers. Without LFS, full objects stream verbatim up to the 2 GiB
+   pending-pack bound, but anything pushed *as a delta* whose result
+   exceeds 16 MiB is still rejected (`unpack object too large`), and a
+   REF_DELTA whose *base* is a streamed >16 MiB object is rejected with
+   `delta base <oid> exceeds 16 MiB`. Note `git push --no-thin` does
+   **not** prevent a client from sending REF_DELTA (verified on git 2.54)
+   — the reliable workaround is pushing the object undeltified, e.g.
    `git -c core.bigFileThreshold=1 push`. The ~100 MB platform body cap
-   applies per request. Very large assets should still live outside git.
+   applies per request.
 9. **No hooks, repo rename, or web UI.** A repo is created by pushing to it and
    deleted by `POST /_admin/delete` (write-auth): the repo tombstones to 410
    immediately and a `purge_repo` job reclaims R2 packs and DO storage in the

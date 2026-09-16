@@ -474,7 +474,7 @@ async fn lfs_batch(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend
     auth::authenticate(&req, env, level, route, spend).await?;
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let base = req.url().ok().map(|u| u.origin().ascii_serialization());
-    let mut resp = stub_raw(&stub, route, "/_do/lfs/batch", body.to_vec(), &mut budget, base.as_deref()).await?;
+    let mut resp = stub_raw(&stub, route, "/_do/lfs/batch", body, &mut budget, base.as_deref()).await?;
     let out = resp.bytes().await.map_err(|e| Error::Internal(e.to_string()))?;
     if resp.status_code() != 200 {
         return Err(Error::from_do_response(resp, &budget).await);

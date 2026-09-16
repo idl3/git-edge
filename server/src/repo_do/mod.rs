@@ -558,6 +558,10 @@ impl RepoDo {
             "jobs_dead": count("SELECT COUNT(*) AS n FROM jobs WHERE state='dead'")?,
             "pushes": count("SELECT COUNT(*) AS n FROM pushes")?,
             "marked": count("SELECT COUNT(*) AS n FROM marked")?,
+            // A32: rows in the GC yield-persisted tail — >0 only while a
+            // consolidate holds undrained buffered bytes between slices;
+            // a nonzero count that never moves is the livelock tell
+            "gc_tail": count("SELECT COUNT(*) AS n FROM gc_tail")?,
             "tokens": count("SELECT COUNT(*) AS n FROM tokens")?,
             "pins": pins
                 .iter()

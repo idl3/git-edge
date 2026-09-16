@@ -92,17 +92,33 @@ on wrangler dev — including a real git 2.55 clone over the signed URI.
 |---|---|---|
 | **Clone** 413 between 110k–263k objects | benchmark round 10 | **cleared** — react 263k in 18.7 s @ 1 subrequest (A29); URI-offloaded in 14.8 s (A30) |
 | **Import** single commit > ingest budget (TS: 222k objects) | unsplittable-slice error | **cleared by I1** — server-side job slices the staged pack; 462k-object react pack in flight |
-| **Multi-pack / pre-GC fetch** still walks the index | residual case neither A29 nor A30 covers | open — matters for the window between import and consolidation |
+| **Multi-pack / pre-GC fetch** still walks the index | residual case neither A29 nor A30 covers | **cleared by #22** — `no_walk_set` marks all live packs and streams every live object in (pack,idx) order; the 200k walk bound now applies only to haves-ful incremental fetches |
 
 ## Next work
 
 - **Re-bench rails post-C2/C1** (787k objects — biggest cloneable repo) once
-  consolidated; confirm the react number generalizes.
+  consolidated; confirm the react number generalizes. ✅ done — 718,383
+  objects consolidated 23→1 pack, clone + `fsck --strict` clean.
 - **TypeScript via I1** — the original parity target: stage `ts-all.pack`,
   `/_admin/import`, confirm the 222k-object commit lands, then clone.
-- P2 leftovers: #18 rename, #19 per-ref scopes, #20 domain/Access, #21 LFS,
-  #22 no-walk clone — all deliberate defers, see ROADMAP.
+- P2 sweep — all done: #18 rename (resolved-wontfix, delete+repush
+  documented), #19 per-ref token scopes (`scope` on mint, enforced in
+  `apply_one` + `import_start`), #20 domain/Access docs, #21 LFS basic
+  transfer (A33), #22 no-walk clone.
 - Then the WILD section (TTL repos, GitHub-URL import, synthetic-ref seeding).
+
+**Bugs the rails GC + react 462k re-run flushed out** (all fixed): GC's
+`gc.pos` only persisted at 8 MiB part boundaries, so a sparse-mark slice
+(~1 R2 read/entry → ~6.4 MiB buffered inside the request budget) replayed
+the same span forever — `gc_tail` now persists the undrained buffer across
+yields with a scan/boundary-split cursor (A32). Import's durable-boundary
+snapshot didn't claim mid-slice `flush_if_full` uploads, so `st.pos` could
+freeze identically (same disease, second host). `import_stage` minted a
+fresh push per part — sibling `open` pushes timed out and the janitor
+swept their `pending/` keys out from under the running job; parts now
+share the import's push (`?push=&part=`), janitor sweeps by prefix.
+Undeltified normalization means the 1.12 GiB react pack lands ~6× bigger
+in R2 — `GE_QUOTA_MAX_BYTES` must be sized for the *stored* footprint.
 
 ## Environment / workflow
 

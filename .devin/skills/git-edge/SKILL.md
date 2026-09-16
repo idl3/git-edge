@@ -181,7 +181,9 @@ Write-gated (a repo `write` token suffices; `_admin/*` routes do not — they
 want the global write token). Returns `refs`, `objects`, `packs_live`/`packs_ingesting`/
 `packs_dead`, `pushes`, `jobs_queued`/`jobs_running`/`jobs_dead`, `marked`,
 `tokens`, `pins` (list of `{ref,sha}`), `public`, `deleted`, `rate_rows`,
-`refs_memo_hits`/`refs_memo_misses`. `jobs_dead > 0` means a maintenance job
+`refs_memo_hits`/`refs_memo_misses`, `gc_tail` (rows in the GC
+yield-persisted buffer — nonzero only mid-consolidate; a count that never
+moves is a wedged GC). `jobs_dead > 0` means a maintenance job
 wedged. Pushes are CAS; a stale push is rejected — refetch and retry, don't
 `--force` blindly.
 
