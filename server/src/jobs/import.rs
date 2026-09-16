@@ -227,6 +227,7 @@ fn wipe_output(sql: &SqlStorage, push: &str, pack: &PackId, c: &mut Cursor) -> R
     c.st = None;
     c.tail = 0;
     c.scan_after = -1;
+    c.check_after.clear(); // a mid-check wipe must re-verify the whole link set
     c.phase = "resolve".into();
     Ok(())
 }
