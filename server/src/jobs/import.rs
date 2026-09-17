@@ -32,9 +32,12 @@ use crate::pack::ingest::{
     MAX_ENTRY_WIRE, MAX_OBJ, MAX_STREAM_BLOB,
 };
 use crate::platform;
-use crate::repo_do::{CmdDto, CommitRequest, RepoDo};
-use crate::store::{keys, Bucket, Index, ObjRow, PackId, PackMeta, PackWriter, WriterCkpt, PART};
+use crate::remote;
+use crate::repo_do::{scope_allows, CmdDto, CommitRequest, RepoDo};
+use crate::store::{keys, Bucket, Index, ObjRow, PackId, PackMeta, PackWriter, PushId, RawWriter, WriterCkpt, PART};
+use crate::wire::{Pkt, PktReader};
 use crate::ReqBudget;
+use futures_util::StreamExt;
 
 /// Fresh queue rows per resolve pass — 20k small entries ≈ 40 R2 reads worst case,
 /// well inside a 400-subrequest slice even with delta-base lookups.
@@ -47,7 +50,7 @@ const CHECK_PAGE: i64 = 1_000;
 /// ~128 rows.
 const TAIL_CHUNK: usize = 64 << 10;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct Part {
     key: String,
     bytes: u64,
@@ -58,9 +61,20 @@ pub struct Payload {
     push: String,
     /// output pack id — minted at /_do/import/start
     pack: String,
+    /// staged client parts — empty for a url import until the fetch phase
+    /// streams the remote's pack into pending/ and rewrites this payload
+    #[serde(default)]
     parts: Vec<Part>,
     principal: String,
+    #[serde(default)]
     commands: Vec<CmdDto>,
+    /// WILD url import: the remote smart-HTTP base the fetch phase clones
+    #[serde(default)]
+    url: Option<String>,
+    /// the remote's HEAD symref — adopted at commit so clones check out the
+    /// same default branch the source advertises
+    #[serde(default)]
+    head: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,6 +179,10 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         vec![V::from(platform::now_ms()), V::from(p.push.as_str())],
     )?;
     let out = match c.phase.as_str() {
+        // a url import's first slice: the worker is the git client — ls-refs
+        // mints the commands, one v2 fetch streams the pack into pending/ and
+        // rewrites this job's payload into the staged shape the phases below own
+        "fetch" => fetch_slice(d, job, &sql, &p, &mut c, budget).await,
         "" => toc_slice(d, job, &sql, &p, &mut c, budget).await,
         "resolve" => resolve_slice(d, job, &sql, &p, &mut c, budget).await,
         "check" => check_slice(d, job, &sql, &p, &mut c, budget).await,
@@ -179,6 +197,186 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         Err(e) if dead_upload(&e) => recover_dead_upload(d, &sql, &p, &mut c, budget).await,
         out => out,
     }
+}
+
+// ── url import: fetch phase ───────────────────────────────────────────────
+
+/// Deterministic fetch-side failure — close the push so status surfaces the
+/// reason and Done retires the job. Retrying a 404 or a scope miss forever
+/// would just burn attempts.
+async fn reject_push(sql: &SqlStorage, push: &str, why: &str) -> Result<SliceOutcome, Error> {
+    worker::console_log!("import {push} rejected: {why}");
+    exec(
+        sql,
+        "UPDATE pushes SET state='rejected', result=?, ended_at=? WHERE id=? AND state='open'",
+        vec![
+            V::from(serde_json::json!([["remote", why]]).to_string().as_str()),
+            V::from(platform::now_ms()),
+            V::from(push),
+        ],
+    )?;
+    Ok(SliceOutcome::Done)
+}
+
+/// A fetch answer that can never succeed — protocol/remote rejection — versus
+/// a transport blip a re-fetch might beat. Only the first kind rejects the push.
+fn deterministic(e: &Error) -> bool {
+    matches!(e, Error::Protocol(_) | Error::Limit(_))
+}
+
+/// payload.url set: clone the remote ourselves. ls-refs mints the command set
+/// (every advertised ref becomes a create — a url import mirrors the source's
+/// tips), the push's captured token scope vets each, then one v2 fetch streams
+/// the whole-history pack through a sha1-lagged hasher into a pending/ part.
+/// The slice cannot yield mid-response, so a dead isolate restarts the whole
+/// download — bounded by the remote's pack size. Success rewrites this job's
+/// payload into the staged shape and falls into "" (pass A) next slice.
+async fn fetch_slice(
+    d: &RepoDo,
+    job: &Job,
+    sql: &SqlStorage,
+    p: &Payload,
+    c: &mut Cursor,
+    budget: &mut SliceBudget,
+) -> Result<SliceOutcome, Error> {
+    let url = p
+        .url
+        .as_deref()
+        .ok_or_else(|| Error::Internal("fetch phase without url".into()))?;
+    let adv = match remote::ls_refs(url).await {
+        Ok(a) => a,
+        Err(e) if deterministic(&e) => return reject_push(sql, &p.push, &e.message()).await,
+        Err(e) => return Err(e),
+    };
+    if adv.refs.is_empty() {
+        return reject_push(sql, &p.push, "remote advertises no refs").await;
+    }
+    // every advertised ref becomes a command row — cap so a hostile or spammed
+    // remote can't write an unbounded command list into the job payload
+    if adv.refs.len() > 100_000 {
+        return reject_push(sql, &p.push, &format!("remote advertises {} refs (cap 100k)", adv.refs.len())).await;
+    }
+    // same gate import_start applies to client commands — the token scope a
+    // url import runs under covers every derived ref or the import refuses
+    #[derive(Deserialize)]
+    struct PS {
+        scope: Option<String>,
+    }
+    let scope = exec(sql, "SELECT scope FROM pushes WHERE id=?", vec![V::from(p.push.as_str())])?
+        .to_array::<PS>()?
+        .into_iter()
+        .next()
+        .and_then(|s| s.scope);
+    let mut commands = Vec::with_capacity(adv.refs.len());
+    let mut wants: Vec<ObjectId> = Vec::with_capacity(adv.refs.len());
+    for r in &adv.refs {
+        if !scope_allows(scope.as_deref(), &r.name) {
+            return reject_push(sql, &p.push, &format!("ref {} outside token scope", r.name)).await;
+        }
+        commands.push(serde_json::json!({
+            "old": "0000000000000000000000000000000000000000",
+            "new": r.oid.to_string(),
+            "name": r.name,
+            "peeled": r.peeled.map(|o| o.to_string()),
+        }));
+        if !wants.contains(&r.oid) {
+            wants.push(r.oid);
+        }
+    }
+    let mut resp = match remote::fetch_open(url, &wants).await {
+        Ok(r) => r,
+        Err(e) if deterministic(&e) => return reject_push(sql, &p.push, &e.message()).await,
+        Err(e) => return Err(e),
+    };
+    let mut stream = resp.stream().map_err(Error::from)?;
+    let mut rdr = PktReader::default();
+    let bucket = d.bucket()?;
+    let key = keys::pending_part(&bucket.repo, &PushId(p.push.clone()), "remote");
+    let mut out = RawWriter::create(&bucket, key.clone(), &mut budget.req).await?;
+    // sha1 over all-but-the-trailer: `hold` lags the hash input by 20 bytes so
+    // the trailer lands in the ring, not the digest — then digest == trailer
+    // proves the whole pack arrived intact before the payload trusts it
+    let mut h = gix_hash::hasher(H::Sha1);
+    let mut hold: Vec<u8> = Vec::with_capacity(64);
+    let mut in_pack = false;
+    let mut total = 0u64;
+    let mut fatal: Option<Error> = None;
+    'stream: while fatal.is_none() {
+        loop {
+            match rdr.next() {
+                Err(e) => {
+                    fatal = Some(e);
+                    break 'stream;
+                }
+                Ok(None) => break,
+                Ok(Some(Pkt::Flush)) if in_pack => break 'stream,
+                Ok(Some(Pkt::Data(d))) => {
+                    if !in_pack {
+                        in_pack = *d == b"packfile\n"[..];
+                        continue;
+                    }
+                    let (Some(band), data) = (d.first(), &d[1..]) else { continue };
+                    match *band {
+                        1 => {
+                            out.append(data);
+                            hold.extend_from_slice(data);
+                            if hold.len() > 20 {
+                                let n = hold.len() - 20;
+                                h.update(&hold[..n]);
+                                hold.drain(..n);
+                            }
+                            total += data.len() as u64;
+                            if let Err(e) = out.flush_if_full(&mut budget.req).await {
+                                fatal = Some(e);
+                                break 'stream;
+                            }
+                        }
+                        2 => {}
+                        _ => {
+                            fatal = Some(Error::Protocol(format!(
+                                "remote ERR: {}",
+                                String::from_utf8_lossy(data)
+                            )));
+                            break 'stream;
+                        }
+                    }
+                }
+                Ok(Some(_)) => {}
+            }
+        }
+        match stream.next().await {
+            Some(Ok(chunk)) => rdr.push(&chunk),
+            Some(Err(e)) => fatal = Some(Error::Internal(format!("remote stream: {e}"))),
+            None => fatal = Some(Error::Protocol("remote stream ended mid-pack".into())),
+        }
+    }
+    if let Some(e) = fatal {
+        out.abort().await;
+        return if deterministic(&e) { reject_push(sql, &p.push, &e.message()).await } else { Err(e) };
+    }
+    let ok = hold.len() == 20
+        && matches!(h.try_finalize(), Ok(id) if id.as_bytes() == hold.as_slice());
+    if !ok {
+        out.abort().await;
+        return reject_push(sql, &p.push, "remote pack trailer mismatch").await;
+    }
+    out.finish(&mut budget.req).await?;
+    // verified pack staged — rewrite the payload into the staged shape so the
+    // ordinary phases own it from here; the fetch phase never runs again
+    let payload = serde_json::json!({
+        "push": p.push, "pack": p.pack, "principal": p.principal,
+        "parts": [{ "key": key, "bytes": total }],
+        "commands": commands,
+        "url": p.url,
+        "head": adv.head,
+    });
+    exec(
+        sql,
+        "UPDATE jobs SET payload=? WHERE id=?",
+        vec![V::from(payload.to_string().as_str()), V::from(job.id)],
+    )?;
+    c.phase = String::new();
+    continue_(c)
 }
 
 /// upload_part/complete errors against a dead MPU. `resume_multipart_upload`
@@ -1242,6 +1440,21 @@ async fn commit_meta(
             }
         }
         Err(e) => worker::console_log!("import {} commit error: {e}", p.push),
+    }
+    // a url import adopts the remote's HEAD symref when that ref landed —
+    // clones then default to the same branch the source advertises
+    if let (Ok(_), Some(head)) = (&r, &p.head) {
+        #[derive(Deserialize)]
+        struct N {
+            n: i64,
+        }
+        let exists = exec(sql, "SELECT COUNT(*) AS n FROM refs WHERE name=?", vec![V::from(head.as_str())])?
+            .one::<N>()?
+            .n
+            > 0;
+        if exists {
+            exec(sql, "UPDATE meta SET value=? WHERE key='head'", vec![V::from(head.as_str())])?;
+        }
     }
     // staging tables + the staged pack itself are garbage now
     for t in ["push_links", "import_toc", "import_parts", "import_open", "import_tail"] {

@@ -834,6 +834,51 @@ async fn import_body(req: &mut Request) -> Result<serde_json::Value, Error> {
 async fn import_begin(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     let principal = auth::authenticate(&req, env, Level::Write, route, spend).await?;
     let v = import_body(&mut req).await?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    // WILD url import — {url} instead of {push,parts,commands}: the job's fetch
+    // phase acts as the git client, stages the remote's pack in pending/, and
+    // mints the ref commands itself. Same push lifecycle: begin → claim → start.
+    if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
+        let url = crate::remote::normalize(url)?; // 400 here beats a rejected push later
+        let rate_key = auth::presented_hash(&req)?;
+        let (push, pack) = (PushId::random()?, PackId::random()?);
+        #[derive(serde::Deserialize)]
+        struct Begin {
+            #[serde(default)]
+            claimed: bool,
+        }
+        let begin: Begin = stub_json(
+            &stub,
+            route,
+            "/_do/push/begin",
+            &serde_json::json!({ "push_id": push.0, "principal": principal, "key": rate_key }),
+            &mut budget,
+        )
+        .await?;
+        if !begin.claimed {
+            if let Err(e) = owner_claim(env, route, &mut budget).await {
+                let _: serde_json::Value = stub_json(
+                    &stub,
+                    route,
+                    "/_do/push/abort",
+                    &serde_json::json!({ "push_id": push.0 }),
+                    &mut budget,
+                )
+                .await
+                .unwrap_or_default();
+                return Err(e);
+            }
+        }
+        let out: serde_json::Value = stub_json(
+            &stub,
+            route,
+            "/_do/import/start",
+            &serde_json::json!({ "push": push.0, "pack": pack.0, "url": url }),
+            &mut budget,
+        )
+        .await?;
+        return git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json");
+    }
     let ok_id = |s: &str| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     let push = v
         .get("push")
@@ -861,7 +906,6 @@ async fn import_begin(mut req: Request, env: &Env, route: &RepoRoute, spend: &Sp
         }
     }
     let pack = PackId::random()?;
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let out: serde_json::Value = stub_json(
         &stub,
         route,

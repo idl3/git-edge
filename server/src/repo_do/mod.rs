@@ -76,8 +76,14 @@ struct BeginDto {
 struct ImportStartDto {
     push: String,
     pack: String,
+    #[serde(default)]
     parts: Vec<serde_json::Value>,
+    #[serde(default)]
     commands: Vec<serde_json::Value>,
+    /// WILD url import: no client parts — the job's fetch phase clones the
+    /// remote and rewrites this payload with the staged shape
+    #[serde(default)]
+    url: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct AuthDto {
@@ -285,7 +291,7 @@ fn scope_pattern_ok(p: &str) -> bool {
 
 /// A command ref matches a scope when any comma pattern covers it — exact match,
 /// or prefix when the pattern ends in `*`. Empty scope = unrestricted.
-fn scope_allows(scope: Option<&str>, name: &str) -> bool {
+pub(crate) fn scope_allows(scope: Option<&str>, name: &str) -> bool {
     match scope.map(str::trim).filter(|s| !s.is_empty()) {
         None => true,
         Some(s) => s.split(',').map(str::trim).any(|p| {
@@ -1055,37 +1061,43 @@ impl RepoDo {
         if st.state != "open" {
             return Err(Error::Conflict(format!("import push is {}", st.state)));
         }
-        if b.parts.is_empty() || b.commands.is_empty() {
+        // a url import stages nothing up front — the fetch phase derives
+        // parts+commands (and re-checks scope against the advertised refs), so
+        // the staged-payload validation below only applies without one
+        let url = b.url.as_deref();
+        if url.is_none() && (b.parts.is_empty() || b.commands.is_empty()) {
             return Err(Error::Protocol("import needs parts and commands".into()));
         }
-        // #19: an import obeys the push's captured token scope — every command's
-        // ref must be covered, or the whole import 400s before a job exists
-        if let Some(scope) = st.scope.as_deref() {
-            for c in &b.commands {
-                let name = c.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-                if !scope_allows(Some(scope), name) {
-                    return Err(Error::Protocol(format!("ref {name} outside token scope")));
+        if url.is_none() {
+            // #19: an import obeys the push's captured token scope — every command's
+            // ref must be covered, or the whole import 400s before a job exists
+            if let Some(scope) = st.scope.as_deref() {
+                for c in &b.commands {
+                    let name = c.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                    if !scope_allows(Some(scope), name) {
+                        return Err(Error::Protocol(format!("ref {name} outside token scope")));
+                    }
                 }
             }
-        }
-        // part keys must stay inside this repo's pending namespace — the R2 bucket
-        // is shared across repos, so an unchecked key would read across tenancy
-        let pending_ns = format!("r/{}/pending/", self.repo_id()?.0);
-        for part in &b.parts {
-            let key = part
-                .get("key")
-                .and_then(|k| k.as_str())
-                .ok_or_else(|| Error::Protocol("part key".into()))?;
-            if !key.starts_with(&pending_ns) {
-                return Err(Error::Protocol("part outside pending namespace".into()));
+            // part keys must stay inside this repo's pending namespace — the R2 bucket
+            // is shared across repos, so an unchecked key would read across tenancy
+            let pending_ns = format!("r/{}/pending/", self.repo_id()?.0);
+            for part in &b.parts {
+                let key = part
+                    .get("key")
+                    .and_then(|k| k.as_str())
+                    .ok_or_else(|| Error::Protocol("part key".into()))?;
+                if !key.starts_with(&pending_ns) {
+                    return Err(Error::Protocol("part outside pending namespace".into()));
+                }
+                if part.get("bytes").and_then(|n| n.as_u64()).is_none() {
+                    return Err(Error::Protocol("part bytes".into()));
+                }
             }
-            if part.get("bytes").and_then(|n| n.as_u64()).is_none() {
-                return Err(Error::Protocol("part bytes".into()));
-            }
+            // malformed commands should 400 here, not kill the job mid-import
+            serde_json::from_value::<Vec<CmdDto>>(serde_json::Value::Array(b.commands.clone()))
+                .map_err(|e| Error::Protocol(format!("commands: {e}")))?;
         }
-        // malformed commands should 400 here, not kill the job mid-import
-        serde_json::from_value::<Vec<CmdDto>>(serde_json::Value::Array(b.commands.clone()))
-            .map_err(|e| Error::Protocol(format!("commands: {e}")))?;
         // same-push start is idempotent: a live job for it already owns a pack —
         // hand that pack id back rather than planting a second ingesting row
         #[derive(serde::Deserialize)]
@@ -1124,14 +1136,28 @@ impl RepoDo {
         )?;
         // the begin-time principal is authoritative — the client-supplied one is
         // ignored so a replayed start can't rewrite who the reflog credits
-        let payload = serde_json::json!({
-            "push": b.push, "pack": b.pack, "parts": b.parts,
-            "principal": st.principal, "commands": b.commands,
-        })
-        .to_string();
+        let payload = if let Some(u) = url {
+            serde_json::json!({
+                "push": b.push, "pack": b.pack,
+                "principal": st.principal, "url": u,
+            })
+            .to_string()
+        } else {
+            serde_json::json!({
+                "push": b.push, "pack": b.pack, "parts": b.parts,
+                "principal": st.principal, "commands": b.commands,
+            })
+            .to_string()
+        };
+        // url mode starts in the fetch phase — the cursor seeds it, the job
+        // row's payload gets rewritten once the remote's pack is staged
         self.q(
-            "INSERT INTO jobs(kind,run_at,payload) VALUES('import_pack',?,?)",
-            vec![V::from(platform::now_ms()), V::from(payload.as_str())],
+            "INSERT INTO jobs(kind,run_at,payload,cursor) VALUES('import_pack',?,?,?)",
+            vec![
+                V::from(platform::now_ms()),
+                V::from(payload.as_str()),
+                if url.is_some() { V::from("{\"phase\":\"fetch\"}") } else { V::Null },
+            ],
         )?;
         let _ = meta;
         json(serde_json::json!({ "queued": true, "push": b.push }))

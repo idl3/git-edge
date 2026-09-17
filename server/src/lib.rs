@@ -7,6 +7,7 @@ pub mod error;
 pub mod jobs;
 pub mod pack;
 pub mod platform;
+pub mod remote;
 pub mod repo_do;
 pub mod sign;
 pub mod store;
