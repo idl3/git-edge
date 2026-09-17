@@ -22,6 +22,8 @@ use crate::wire::{
 };
 use crate::{ReqBudget, Spend};
 
+pub mod assess;
+
 const CMD_CAP: usize = 1 << 20; // section 6.3: command section cap
 const FILL_STEP: usize = 64 << 10; // 6.3: fill in 64 KiB steps
 
@@ -173,6 +175,7 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
             import_status(&req, &env, &route, &p["_admin/import/".len()..], &spend).await
         }
         (Method::Get, "_admin/export") => export_bundle(&req, &env, &route, &spend).await,
+        (Method::Get, "_admin/assess") => assess::assess(&req, &env, &route, &spend).await,
         _ => Err(Error::NotFound),
     };
     let resp = respond(r, git_pkt, spend.get());

@@ -31,11 +31,11 @@ adopted-patterns:
 
 | Task | Status |
 |---|---|
-| A1 | todo |
-| A2 | todo |
-| A3 | todo |
-| A4 | todo |
-| A5 | todo |
+| A1 | done |
+| A2 | done |
+| A3 | done |
+| A4 | done |
+| A5 | done |
 | — done | — |
 
 ## Audit item coverage
