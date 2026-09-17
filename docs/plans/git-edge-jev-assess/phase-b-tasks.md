@@ -29,7 +29,7 @@ adopted-patterns:
 | Task | Status |
 |---|---|
 | B1 | done |
-| B2 | todo |
+| B2 | done |
 | B3 | todo |
 | — done | — |
 
