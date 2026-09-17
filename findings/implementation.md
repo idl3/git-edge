@@ -216,7 +216,7 @@ abandoned-MPU semantics and plan-limit enforcement require a real Cloudflare
 account; `packfile-uris`/`sideband-all`/`no-done`/sha256/non-blob filters/v0-v1
 negotiation remain deliberately unadvertised with clean protocol errors.
 
-## Round 6 — real Cloudflare deploy (git-edge.grain.workers.dev)
+## Round 6 — real Cloudflare deploy (git-edge.<acct>.workers.dev)
 
 Deployed 2026-09-15. Measured on the real platform:
 
@@ -241,7 +241,7 @@ Deployed 2026-09-15. Measured on the real platform:
 ## Round 7 — pass-through ingest, per-repo tokens, metrics, error UX
 
 Follow-up feature round, verified on local workerd and re-verified on
-production (`git-edge.grain.workers.dev`):
+production (`git-edge.<acct>.workers.dev`):
 
 - **Pass-through ingest for large full objects**: blobs over 16 MiB no longer
   inflate in isolate memory. Pass A relaxes the object cap for `Header::Blob`

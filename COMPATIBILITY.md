@@ -5,7 +5,7 @@ Worker. One SQLite Durable Object per repository holds refs, the object index,
 and job state; R2 holds normalized packfiles. There is no always-on machine and
 no upstream Git service in the request path. All claims below are verified
 against a real stock `git` client on local workerd **and** against a live
-Cloudflare deployment (`git-edge.grain.workers.dev`, Paid plan); see
+Cloudflare deployment (`git-edge.<acct>.workers.dev`, Paid plan); see
 `findings/implementation.md` for the test evidence.
 
 ## Transport & protocol versions
@@ -198,7 +198,7 @@ truncation, or corrupted ref state.
    repo) are emitted to Analytics Engine when the `GE_METRICS` binding exists.
 10. **Real-deploy verified:** R2 multipart semantics, DO alarms, and Paid-plan
     subrequest limits are all confirmed against a live deployment
-    (`git-edge.grain.workers.dev`); the ~100 MB body cap is real.
+    (`git-edge.<acct>.workers.dev`); the ~100 MB body cap is real.
 
 ## Verified performance envelope (local workerd)
 

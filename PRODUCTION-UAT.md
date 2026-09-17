@@ -5,7 +5,7 @@ command or observation with an explicit pass condition. Run the full battery
 after any deploy that touches ingest, fetch, GC, auth, or the job dispatcher;
 run §3 smoke on config-only changes.
 
-Terminology: `$BASE` = worker URL (production: `https://git-edge.grain.workers.dev`),
+Terminology: `$BASE` = worker URL (production: `https://git-edge.<acct>.workers.dev`),
 `$RW` = `GE_WRITE_TOKEN`, `RO` = `GE_READ_TOKEN`. Local equivalent: `wrangler
 dev` on `http://localhost:8787` with tokens from `server/.dev.vars`.
 

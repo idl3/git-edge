@@ -722,7 +722,7 @@ produced these corrections, all verified against git 2.54:
   client-derived strings in `ERR`/`unpack`/`ng` lines are sanitized (non-graphic -> `?`)
   and `x-ge-subrequests: <used+planned>/<max>` rides fetch responses (contract 406).
 
-## Amendments from the production-hardening pass (8d9017a, live on git-edge.grain.workers.dev)
+## Amendments from the production-hardening pass (8d9017a, verified on the live deployment)
 
 - **A8. Streamed blob pass-through (overrides A7 for full blobs).** A `blob`
   entry over 16 MiB is no longer materialized: pass B copies its pending-pack
