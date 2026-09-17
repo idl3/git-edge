@@ -385,7 +385,8 @@ done
 # and the dev server started with small caps, e.g. .dev.vars:
 #   GE_QUOTA_MAX_OBJECTS=25 GE_QUOTA_MAX_REPOS_PER_OWNER=5 GE_RATE_PUSHES_PER_MIN=12
 # (25 stays above the main suite's ~12 objects/repo; 12 stays above its 9 pushes;
-# the owner cap must exceed the suite's peak live claims — run+admin+gc+import+uimport = 5.)
+# the owner cap must exceed the suite's peak live claims — run+admin+gc+import
+# +uimport+sha256+f256 = 7, so the cap is exactly GE_QUOTA_MAX_REPOS_PER_OWNER=7 — the quota owner then trips it on its 8th claim.)
 if [ "${GE_CONFORMANCE_LIMITS:-0}" = "1" ]; then
   O="quota-$SECONDS-$$"
   post() { # one canned receive-pack POST (bad pack body is fine — it reaches begin)
@@ -574,6 +575,47 @@ if [ "${GE_CONFORMANCE_IMPORT:-0}" = "1" ]; then
   [ "$code" = "400" ] || fail "non-loopback http url -> $code, want 400"
   code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$UREPO/_admin/import" -d '{"url":"gopher://x"}')
   [ "$code" = "400" ] || fail "bad scheme -> $code, want 400"
+fi
+
+# SHA-256 object format: a sha256 client's first push pins an unpinned repo;
+# after that the repo answers only sha256. Needs git >= 2.29 for
+# `init --object-format`. Push is always v0 wire — the client picks its algo
+# out of the advertised object-format caps, so this exercises the both-formats
+# advertisement + the cap-driven pin in push_begin.
+note "sha256: push pins, clone negotiates, fsck clean, sha1 refused"
+if git init -q --object-format=sha256 "$WORK/s256src" 2>/dev/null; then
+  S256="$REPO-sha256"
+  cd "$WORK/s256src" && git config user.email t@t && git config user.name t
+  echo sha256 > f && mkdir sub && echo n > sub/g && git add -A && git commit -qm c
+  git tag -a v1 -m t
+  S256TIP=$(git rev-parse HEAD)
+  [ ${#S256TIP} -eq 64 ] || fail "sha256 tip width: ${#S256TIP}"
+  git push -q "$URL/$S256" HEAD:refs/heads/main || fail "sha256 push (pin-on-first)"
+  git push -q "$URL/$S256" v1 || fail "sha256 tag push"
+  git ls-remote "$URL/$S256" | grep -q "^$S256TIP	refs/heads/main$" || fail "sha256 ls-remote"
+  git ls-remote "$URL/$S256" | grep -q "refs/tags/v1\\^{}" || fail "sha256 peel"
+  git clone -q "$URL/$S256" "$WORK/s256clone" || fail "sha256 clone"
+  [ "$(git -C "$WORK/s256clone" rev-parse HEAD)" = "$S256TIP" ] || fail "sha256 clone tip"
+  git -C "$WORK/s256clone" fsck --strict || fail "sha256 fsck"
+  # format is pinned: a sha1 push is refused (client aborts on the caps)
+  mkdir "$WORK/s1src" && cd "$WORK/s1src" && git init -q && git config user.email t@t && git config user.name t
+  echo x > x && git add x && git commit -qm x
+  if git push -q "$URL/$S256" HEAD:refs/heads/x 2>/dev/null; then
+    fail "sha1 push into sha256 repo must fail"
+  fi
+  # _admin/format pins explicitly and rejects junk; a sha256 pin + push also works
+  F256="$REPO-f256"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$F256/_admin/format" -d '{"object_format":"sha256"}')
+  [ "$code" -lt 300 ] || fail "_admin/format sha256 -> $code"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$F256/_admin/format" -d '{"object_format":"sha1"}')
+  [ "$code" = "409" ] || fail "format re-pin conflict -> $code, want 409"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$F256/_admin/format" -d '{"object_format":"md5"}')
+  [ "$code" = "400" ] || fail "format junk -> $code, want 400"
+  cd "$WORK/s256src" && git push -q "$URL/$F256" HEAD:refs/heads/main || fail "sha256 push to pinned repo"
+  git clone -q "$URL/$F256" "$WORK/f256clone" || fail "pinned sha256 clone"
+  git -C "$WORK/f256clone" fsck --strict || fail "pinned sha256 fsck"
+else
+  note "sha256: this git lacks init --object-format — skipped"
 fi
 
 # purge_repo job: POST _admin/delete enqueues it; the repo converges to empty

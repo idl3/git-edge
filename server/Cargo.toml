@@ -19,11 +19,11 @@ js-sys = "0.3"
 wasm-streams = "0.6"
 web-sys = { version = "0.3", default-features = false, features = ["Crypto", "CompressionFormat", "DecompressionStream", "ReadableStream", "WritableStream", "ReadableWritablePair"] }
 
-gix-hash        = { version = "0.26.2", default-features = false, features = ["sha1", "serde"] }
-gix-object      = { version = "0.64.1", default-features = false, features = ["sha1"] }
+gix-hash        = { version = "0.26.2", default-features = false, features = ["sha1", "sha256", "serde"] }
+gix-object      = { version = "0.64.1", default-features = false, features = ["sha1", "sha256"] }
 gix-packetline  = { version = "0.22.2", default-features = false, features = ["blocking-io"] }
-gix-pack        = { version = "0.74.2", default-features = false, features = ["sha1", "streaming-input", "wasm"] }
-gix-traverse    = { version = "0.61.0", default-features = false, features = ["sha1"] }
+gix-pack        = { version = "0.74.2", default-features = false, features = ["sha1", "sha256", "streaming-input", "wasm"] }
+gix-traverse    = { version = "0.61.0", default-features = false, features = ["sha1", "sha256"] }
 gix-zlib        = { version = "0.1.0", default-features = false }
 gix-validate    = { version = "0.11.4", default-features = false }
 serde_bytes = "0.11"

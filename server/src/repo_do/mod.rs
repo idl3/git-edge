@@ -37,6 +37,10 @@ const DEFAULT_PUSHES_PER_MIN: i64 = 30;
 /// repeating an identical ls-refs skips the parse+render too.
 struct RefsMemo {
     version: i64,
+    /// object format + pin state at memo build — a pin can land without a
+    /// refs_version bump, so validity is (version, kind, pinned)
+    kind: gix_hash::Kind,
+    pinned: bool,
     head: Option<BString>,
     refs: Vec<RefRow>,
     json: Vec<u8>, // the /_do/refs response body
@@ -71,6 +75,11 @@ struct BeginDto {
     /// sha1 of the presented token — the A27 rate-limit bucket key.
     #[serde(default)]
     key: String,
+    /// the client's negotiated `object-format` — a v0 push carries it; the
+    /// staging pushes import_begin makes leave it unset (format is pinned at
+    /// import_start / url-fetch time instead)
+    #[serde(default)]
+    object_format: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct ImportStartDto {
@@ -84,6 +93,10 @@ struct ImportStartDto {
     /// remote and rewrites this payload with the staged shape
     #[serde(default)]
     url: Option<String>,
+    /// 'sha1'|'sha256' — the staged pack's object format; a url import leaves
+    /// it unset and the fetch phase pins whatever the remote advertises
+    #[serde(default)]
+    format: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct AuthDto {
@@ -200,6 +213,7 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/tokens/revoke") => self.token_revoke(&parse(&body)?),
                 (Method::Post, "/_do/delete") => self.delete_repo(),
                 (Method::Post, "/_do/public") => self.set_public(&parse::<PublicDto>(&body)?),
+                (Method::Post, "/_do/format") => self.set_format(&body),
                 (Method::Post, "/_do/pin") => self.pin(&parse::<PinDto>(&body)?),
                 (Method::Post, "/_do/unpin") => self.unpin(&parse::<UnpinDto>(&body)?),
                 _ => return Ok(None),
@@ -304,9 +318,12 @@ pub(crate) fn scope_allows(scope: Option<&str>, name: &str) -> bool {
     }
 }
 /// The /_do/refs DTO body — built once per refs_version and memoized (A28).
-fn refs_value(head: &Option<BString>, refs: &[RefRow]) -> serde_json::Value {
+/// `obj_format` lets the edge advertise the right `object-format=` capability.
+fn refs_value(head: &Option<BString>, refs: &[RefRow], kind: gix_hash::Kind, pinned: bool) -> serde_json::Value {
     serde_json::json!({
         "head": head.as_ref().map(|h| h.to_string()),
+        "obj_format": if kind == gix_hash::Kind::Sha256 { "sha256" } else { "sha1" },
+        "obj_format_pinned": pinned,
         "refs": refs.iter().map(|r| serde_json::json!({
             "name": r.name.to_string(), "target": r.target.to_string(),
             "peeled": r.peeled.map(|p| p.to_string()) })).collect::<Vec<_>>()
@@ -357,6 +374,67 @@ impl RepoDo {
     }
     pub fn repo_id(&self) -> Result<RepoId, Error> {
         Ok(RepoId(self.meta("repo_id")?))
+    }
+    /// The repo's object format — `meta.obj_format` pins it ('sha1'|'sha256');
+    /// unset means sha1 (every repo predating the feature is sha1).
+    pub fn obj_kind(&self) -> Result<gix_hash::Kind, Error> {
+        Ok(match self.meta_opt("obj_format")?.as_deref() {
+            Some("sha256") => gix_hash::Kind::Sha256,
+            _ => gix_hash::Kind::Sha1,
+        })
+    }
+    /// 'sha1'|'sha256' ↔ gix_hash::Kind, shared by every DTO that names a format.
+    /// Kind is #[non_exhaustive] upstream — an unknown variant falls back to sha1.
+    pub fn kind_name(kind: gix_hash::Kind) -> &'static str {
+        match kind {
+            gix_hash::Kind::Sha256 => "sha256",
+            _ => "sha1",
+        }
+    }
+    pub fn parse_kind(s: Option<&str>) -> Result<Option<gix_hash::Kind>, Error> {
+        match s {
+            None => Ok(None),
+            Some("sha1") => Ok(Some(gix_hash::Kind::Sha1)),
+            Some("sha256") => Ok(Some(gix_hash::Kind::Sha256)),
+            Some(other) => Err(Error::Protocol(format!("object-format {other} unsupported"))),
+        }
+    }
+    /// Whether the format has been pinned — unpinned repos advertise both
+    /// formats and the first write locks the client's choice in.
+    pub fn obj_format_pinned(&self) -> Result<bool, Error> {
+        Ok(self.meta_opt("obj_format")?.is_some())
+    }
+    /// v2 negotiation check: a pinned repo only answers for its own format.
+    /// Unpinned repos accept either — there are no objects to contradict yet —
+    /// and the effective kind is the client's, so e.g. an empty pack's trailer
+    /// is the width a sha256 client expects.
+    pub fn check_object_format(&self, client: gix_hash::Kind) -> Result<gix_hash::Kind, Error> {
+        let repo = self.obj_kind()?;
+        if !self.obj_format_pinned()? {
+            return Ok(client);
+        }
+        if client != repo {
+            let (r, c) = (Self::kind_name(repo), Self::kind_name(client));
+            return Err(Error::Protocol(format!("object-format {c} does not match repo {r}")));
+        }
+        Ok(repo)
+    }
+    /// Pin the object format. CAS: only the first writer sets it; a later
+    /// writer with the same kind is a no-op, a different kind is a conflict
+    /// the caller turns into a protocol error.
+    pub fn pin_obj_format(&self, kind: gix_hash::Kind) -> Result<(), Error> {
+        let name = Self::kind_name(kind);
+        self.q(
+            "INSERT INTO meta(key,value) VALUES('obj_format',?) ON CONFLICT(key) DO NOTHING",
+            vec![V::from(name)],
+        )?;
+        if self.obj_kind()? != kind {
+            return Err(Error::Conflict(format!(
+                "repo is {} — cannot accept {name} objects",
+                if kind == gix_hash::Kind::Sha1 { "sha256" } else { "sha1" }
+            )));
+        }
+        Ok(())
     }
     /// GC quiet period in ms — GE_GC_QUIET_MS overrides the 10-minute contract default so
     /// the chain can be exercised in tests and dev without waiting.
@@ -706,6 +784,26 @@ impl RepoDo {
         json(serde_json::json!({ "public": self.meta_opt("public")?.is_some() }))
     }
 
+    /// POST /_do/format {object_format} — pin the repo's hash algorithm before the
+    /// first write. A v0 client can't create a sha256 repo unaided (its push needs
+    /// the cap advertised first), so creating one goes through here, then the push.
+    /// Re-pinning the same value is a no-op; a different one once pinned 409s.
+    fn set_format(&self, body: &[u8]) -> Result<Response, Error> {
+        #[derive(serde::Deserialize)]
+        struct F {
+            object_format: Option<String>,
+        }
+        let b: F = parse(body)?;
+        let Some(kind) = Self::parse_kind(b.object_format.as_deref())? else {
+            return Err(Error::Protocol("object_format required".into()));
+        };
+        self.pin_obj_format(kind)?;
+        json(serde_json::json!({
+            "obj_format": Self::kind_name(self.obj_kind()?),
+            "pinned": self.obj_format_pinned()?,
+        }))
+    }
+
     /// POST /_do/pin {ref, sha} — freeze a ref at exactly sha. The ref must already
     /// resolve to it: a pin asserts the current value, it never moves a ref.
     fn pin(&self, b: &PinDto) -> Result<Response, Error> {
@@ -769,15 +867,25 @@ impl RepoDo {
     /// routes share the snapshot — the edge still does auth and the protocol-version
     /// branch per request.
     fn refs_snapshot(&self, meta: &Meta) -> Result<Rc<RefsMemo>, Error> {
+        let (kind, pinned) = (self.obj_kind()?, self.obj_format_pinned()?);
         if let Some(m) = self.refs_memo.borrow().as_ref() {
-            if m.version == meta.refs_version {
+            if m.version == meta.refs_version && m.kind == kind && m.pinned == pinned {
                 self.memo_hits.set(self.memo_hits.get() + 1);
                 return Ok(Rc::clone(m));
             }
         }
         let (head, refs) = self.list_refs()?;
-        let json = serde_json::to_vec(&refs_value(&head, &refs)).map_err(|e| Error::Internal(e.to_string()))?;
-        let m = Rc::new(RefsMemo { version: meta.refs_version, head, refs, json, ls: RefCell::new(Vec::new()) });
+        let json =
+            serde_json::to_vec(&refs_value(&head, &refs, kind, pinned)).map_err(|e| Error::Internal(e.to_string()))?;
+        let m = Rc::new(RefsMemo {
+            version: meta.refs_version,
+            kind,
+            pinned,
+            head,
+            refs,
+            json,
+            ls: RefCell::new(Vec::new()),
+        });
         self.memo_misses.set(self.memo_misses.get() + 1);
         *self.refs_memo.borrow_mut() = Some(Rc::clone(&m));
         Ok(m)
@@ -832,6 +940,7 @@ impl RepoDo {
             V2Command::LsRefs(a) => a,
             _ => return Err(Error::Protocol("not ls-refs".into())),
         };
+        self.check_object_format(args.object_format)?;
         let mut w = PktWriter::default();
         wire::write_ls_refs(&mut w, &args, m.head.as_deref().map(|v| bstr::ByteSlice::as_bstr(v.as_slice())), &m.refs);
         let mut ls = m.ls.borrow_mut();
@@ -846,6 +955,11 @@ impl RepoDo {
     /// Section 3 step 0: the push row carrying the gc_epoch the whole push validates against.
     fn push_begin(&self, meta: &Meta, b: &BeginDto) -> Result<Response, Error> {
         self.rate_check(&b.key)?; // A27: before the row exists — throttled pushes hold nothing
+        // object-format negotiation lands here: a v0 push's declared format pins
+        // an unpinned repo, and a conflicting one is refused before ingest sees bytes
+        if let Some(kind) = Self::parse_kind(b.object_format.as_deref())? {
+            self.pin_obj_format(kind)?;
+        }
         // I1 multi-part staging reuses ONE open push for every part key so the import
         // job's began_at heartbeat covers them all: re-beginning an existing open push
         // under the same principal is a no-op; any other state or owner is an error.
@@ -1068,6 +1182,16 @@ impl RepoDo {
         if url.is_none() && (b.parts.is_empty() || b.commands.is_empty()) {
             return Err(Error::Protocol("import needs parts and commands".into()));
         }
+        // staged imports declare the pack's format (default: the repo's own) and
+        // pin it before the job exists; a url import pins the remote's format at
+        // fetch time
+        let format = if url.is_none() {
+            let kind = Self::parse_kind(b.format.as_deref())?.unwrap_or(self.obj_kind()?);
+            self.pin_obj_format(kind)?;
+            Some(Self::kind_name(kind))
+        } else {
+            None
+        };
         if url.is_none() {
             // #19: an import obeys the push's captured token scope — every command's
             // ref must be covered, or the whole import 400s before a job exists
@@ -1145,7 +1269,7 @@ impl RepoDo {
         } else {
             serde_json::json!({
                 "push": b.push, "pack": b.pack, "parts": b.parts,
-                "principal": st.principal, "commands": b.commands,
+                "principal": st.principal, "commands": b.commands, "format": format,
             })
             .to_string()
         };
@@ -1527,6 +1651,7 @@ impl RepoDo {
             V2Command::Fetch(a) => a,
             _ => return Err(Error::Protocol("not fetch".into())),
         };
+        let repo_kind = self.check_object_format(args.object_format)?;
         let mut budget = ReqBudget::paid().reporting(spend);
         let bucket = self.bucket()?;
         let sql = self.sql();
@@ -1757,7 +1882,16 @@ impl RepoDo {
             .used
             .saturating_add(u32::try_from(set.reads.len()).unwrap_or(u32::MAX));
         let max_sub = budget.max_subrequests;
-        let st = FetchStream { budget, bucket, set, next: 0, hasher: gix_hash::hasher(gix_hash::Kind::Sha1), prelude: Some(prelude), _args: args };
+        let st = FetchStream {
+            budget,
+            bucket,
+            set,
+            next: 0,
+            hasher: gix_hash::hasher(repo_kind),
+            kind: repo_kind,
+            prelude: Some(prelude),
+            _args: args,
+        };
         let s = stream::unfold(st, |mut st| async move {
             match st.step().await {
                 Ok(Some(chunk)) => Some((Ok::<Vec<u8>, Error>(chunk), st)),
@@ -1889,8 +2023,11 @@ impl RepoDo {
         acks: &[ObjectId],
         wanted_refs: &[(ObjectId, BString)],
     ) -> Result<Option<Response>, Error> {
+        let kind = self.obj_kind()?;
+        let ds = u64::try_from(kind.len_in_bytes()).unwrap_or(20);
+        // minimum pack = 12-byte header + trailer
         let (Some(base), Some(owner), Some(repo), true) =
-            (hdr.base.as_deref(), hdr.owner.as_deref(), hdr.repo.as_deref(), pack_bytes >= 32)
+            (hdr.base.as_deref(), hdr.owner.as_deref(), hdr.repo.as_deref(), pack_bytes >= 12 + ds)
         else {
             return Ok(None);
         };
@@ -1910,9 +2047,10 @@ impl RepoDo {
         // the route name: a deleted+recreated repo gets a fresh id, so old sigs die
         let repo_id = bucket.repo.0.clone();
         // a transient trailer-read failure degrades to the A29 verbatim stream
-        // rather than failing a fetch that could still be served
+        // rather than failing a fetch that could still be served. The trailer is
+        // one object-id digest wide — 20 bytes for sha1, 32 for sha256.
         let Ok(trailer) = bucket
-            .read_range(&keys::pack(&bucket.repo, pack), pack_bytes - 20, 20, budget)
+            .read_range(&keys::pack(&bucket.repo, pack), pack_bytes - ds, ds, budget)
             .await
         else {
             return Ok(None);
@@ -1926,7 +2064,7 @@ impl RepoDo {
         if !wire::write_fetch_prelude(w, args, acks, wanted_refs, &[], &[], &[format!("{hash} {uri}")])? {
             return Err(Error::Internal("packfile-uris prelude".into()));
         }
-        wire::Sideband::new(w).data(&empty_pack()?);
+        wire::Sideband::new(w).data(&empty_pack(kind)?);
         w.flush();
         let resp = Response::from_bytes(std::mem::take(&mut w.out)).map_err(Error::from)?;
         resp.headers()
@@ -1963,9 +2101,15 @@ impl RepoDo {
             self, &bucket, &wants, &[], None, None, None, &[], false, false, &[], &mut budget,
         )
         .await?;
-        // v3 header: signature, no capabilities (sha1), no prerequisite lines, one
-        // `<sha> <ref>` line per ref (sorted), a HEAD line through meta.head, blank
+        // v3 header: signature, capabilities (`@`-lines — sha256 repos must
+        // declare @object-format or a sha256 client rejects the header), no
+        // prerequisite lines, one `<sha> <ref>` line per ref (sorted), a HEAD
+        // line through meta.head, blank
+        let kind = self.obj_kind()?;
         let mut hdr = b"# v3 git bundle\n".to_vec();
+        if kind == gix_hash::Kind::Sha256 {
+            hdr.extend_from_slice(b"@object-format=sha256\n");
+        }
         for r in &refs {
             hdr.extend_from_slice(r.target.to_string().as_bytes());
             hdr.push(b' ');
@@ -1988,7 +2132,8 @@ impl RepoDo {
             bucket,
             set,
             next: 0,
-            hasher: gix_hash::hasher(gix_hash::Kind::Sha1),
+            hasher: gix_hash::hasher(kind),
+            kind,
             prelude: Some(hdr),
         };
         let s = stream::unfold(st, |mut st| async move {
@@ -2181,6 +2326,7 @@ struct FetchStream {
     set: generate::SendSet,
     next: usize,
     hasher: gix_hash::Hasher,
+    kind: gix_hash::Kind,
     prelude: Option<Vec<u8>>,
     _args: FetchArgs,
 }
@@ -2218,7 +2364,7 @@ impl FetchStream {
             }
             i if i == n + 1 => {
                 // trailer + final flush, once
-                let h = std::mem::replace(&mut self.hasher, gix_hash::hasher(gix_hash::Kind::Sha1));
+                let h = std::mem::replace(&mut self.hasher, gix_hash::hasher(self.kind));
                 let trailer = h.try_finalize().map_err(|e| Error::Internal(e.to_string()))?;
                 let mut w = PktWriter::default();
                 wire::Sideband::new(&mut w).data(trailer.as_slice());
@@ -2233,9 +2379,9 @@ impl FetchStream {
 
 /// A legal zero-object pack (PACK header + trailer). C1's inline `packfile`
 /// section when every object moved to a URI — the client index-packs it anyway.
-fn empty_pack() -> Result<Vec<u8>, Error> {
+fn empty_pack(kind: gix_hash::Kind) -> Result<Vec<u8>, Error> {
     let head = gix_pack::data::header::encode(gix_pack::data::Version::V2, 0).to_vec();
-    let mut h = gix_hash::hasher(gix_hash::Kind::Sha1);
+    let mut h = gix_hash::hasher(kind);
     h.update(&head);
     let trailer = h
         .try_finalize()
@@ -2289,6 +2435,7 @@ struct ExportStream {
     set: generate::SendSet,
     next: usize,
     hasher: gix_hash::Hasher,
+    kind: gix_hash::Kind,
     prelude: Option<Vec<u8>>,
 }
 impl ExportStream {
@@ -2314,7 +2461,7 @@ impl ExportStream {
                 Ok(Some(chunk))
             }
             i if i == n + 1 => {
-                let h = std::mem::replace(&mut self.hasher, gix_hash::hasher(gix_hash::Kind::Sha1));
+                let h = std::mem::replace(&mut self.hasher, gix_hash::hasher(self.kind));
                 let trailer = h.try_finalize().map_err(|e| Error::Internal(e.to_string()))?;
                 self.next += 1;
                 Ok(Some(trailer.as_slice().to_vec()))

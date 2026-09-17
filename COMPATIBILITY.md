@@ -30,11 +30,13 @@ version 2
 agent=git-edge/0.1
 ls-refs=unborn
 fetch=shallow filter packfile-uris
-object-format=sha1
+object-format=sha1        # the repo's pinned format; unpinned repos list both
+object-format=sha256      #   sha1 and sha256 — first write pins the client's pick
 ```
 
-receive-pack: `report-status delete-refs side-band-64k quiet ofs-delta
-object-format=sha1`
+receive-pack: `report-status delete-refs side-band-64k quiet ofs-delta atomic
+object-format=sha1` — same pinning rule; `object-format=` appears once per
+supported format while the repo is unpinned.
 
 ## Fetch / clone (upload-pack)
 
@@ -90,7 +92,7 @@ object-format=sha1`
 | Unborn `HEAD` (`ls-refs=unborn`) | ✅ |
 | `ref-prefix` filtering (≤ 32 prefixes) | ✅ |
 | SHA-1 object format | ✅ |
-| SHA-256 repos | ❌ clean `object-format sha256 unsupported` error |
+| SHA-256 repos | ✅ | pin on first push (v0 cap) or `POST /_admin/format`; v2 `object-format` negotiated per request; clone/push/tag-peel/url-import/export/`fsck --strict` all verified on 64-hex repos; a mismatched client is refused (`ERR object-format sha256 does not match repo sha1`) |
 | `git fsck --strict` on clones | ✅ clean across all tests |
 
 `HEAD` defaults to `refs/heads/main` at repo creation; on the first push that
@@ -157,8 +159,11 @@ truncation, or corrupted ref state.
    history was truncated. Consequence is benign (objects are stored; the
    connectivity rule still requires referenced bases to exist).
 6. **v0/v1 fetch, `tree:`/`sparse:`/`combine:` filters, `sideband-all`,
-   `object-info`, `bundle-uri`, sha256** — deliberately unadvertised;
+   `object-info`, `bundle-uri`** — deliberately unadvertised;
    clients get a protocol error, never silent misbehavior.
+   (SHA-256 is supported — the repo's format is pinned by the first write or
+   `POST /_admin/format`, and every advertised `object-format=` line names an
+   algo the server actually honors.)
 7. **Auth is static tokens, but now per-repo too.** `GE_READ_TOKEN`/
    `GE_WRITE_TOKEN` remain the deployment-wide admin credentials (HTTP Basic or
    Bearer). Per-repo tokens are minted via `POST /:owner/:repo/_admin/tokens`

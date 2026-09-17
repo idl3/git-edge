@@ -301,7 +301,7 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
             let mut kids: Vec<String> = Vec::new();
             for (_id, entry) in bucket.read_entries_chunked(&chunk, &mut budget.req).await? {
                 let (kind, data) = codec::decode_entry(&entry)?; // A7 cap inside
-                for l in extract_links(kind, &data)? {
+                for l in extract_links(kind, &data, d.obj_kind()?)? {
                     kids.push(l.to_string());
                 }
                 // a giant tree can yield hundreds of thousands of links in one chunk —
@@ -440,7 +440,7 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
             pos.upload.clear();
         }
         let mut out = if pos.upload.is_empty() {
-            let w = PackWriter::create(&bucket, &key, pos.total, &mut budget.req).await?;
+            let w = PackWriter::create(&bucket, &key, pos.total, d.obj_kind()?, &mut budget.req).await?;
             pos.upload = w.upload_id().await;
             // persist immediately: a kill before the first checkpoint would otherwise
             // leave the id invisible, and the orphan MPU would sit in R2 (~7d) instead

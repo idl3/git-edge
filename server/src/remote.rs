@@ -25,6 +25,10 @@ pub struct Advertised {
     pub refs: Vec<AdvRef>,
     /// HEAD's symref target (e.g. "refs/heads/main"), when the remote says it.
     pub head: Option<String>,
+    /// the remote's object-format, parsed off its capability advertisement —
+    /// a sha256 source's refs name 64-hex ids and its pack carries a 32-byte
+    /// trailer; sha1 when the line is absent (v2's default)
+    pub format: gix_hash::Kind,
 }
 
 /// `https://host/owner/repo[.git][/]` → the base the git endpoints hang off.
@@ -94,19 +98,37 @@ pub async fn ls_refs(raw_url: &str) -> Result<Advertised, Error> {
     let mut r = PktReader::default();
     r.push(&caps);
     let (mut ls, mut fetch) = (false, false);
+    let mut format = None;
     while let Some(pkt) = r.next()? {
         if let Pkt::Data(d) = pkt {
             ls |= d.starts_with(b"ls-refs");
             fetch |= d.starts_with(b"fetch");
+            if format.is_none() {
+                format = d
+                    .strip_suffix(b"\n")
+                    .unwrap_or(d)
+                    .strip_prefix(b"object-format=")
+                    .map(|f| match f {
+                        b"sha256" => Ok(gix_hash::Kind::Sha256),
+                        b"sha1" => Ok(gix_hash::Kind::Sha1),
+                        other => Err(Error::Protocol(format!(
+                            "remote object-format {} unsupported",
+                            other.as_bstr()
+                        ))),
+                    })
+                    .transpose()?;
+            }
         }
     }
     if !(ls && fetch) {
         return Err(Error::Protocol("remote lacks protocol v2 ls-refs/fetch".into()));
     }
+    let format = format.unwrap_or(gix_hash::Kind::Sha1);
+    let fmt_name = if format == gix_hash::Kind::Sha256 { "sha256" } else { "sha1" };
     let mut w = PktWriter::default();
     w.text("command=ls-refs")?;
     w.text(AGENT)?;
-    w.text("object-format=sha1")?;
+    w.text(&format!("object-format={fmt_name}"))?;
     w.delim();
     w.text("peel")?;
     w.text("symrefs")?;
@@ -115,7 +137,7 @@ pub async fn ls_refs(raw_url: &str) -> Result<Advertised, Error> {
     let body = resp.bytes().await.map_err(|e| Error::Internal(format!("ls-refs body: {e}")))?;
     let mut r = PktReader::default();
     r.push(&body);
-    let mut adv = Advertised { refs: Vec::new(), head: None };
+    let mut adv = Advertised { refs: Vec::new(), head: None, format };
     while let Some(pkt) = r.next()? {
         let Pkt::Data(d) = pkt else { continue };
         let line = d.strip_suffix(b"\n").unwrap_or(d).as_bstr();
@@ -147,15 +169,16 @@ pub async fn ls_refs(raw_url: &str) -> Result<Advertised, Error> {
 }
 
 /// POST command=fetch for `wants` (no haves — a URL import is a full clone).
-/// `sideband-all` keeps progress/errors out of the pack bytes; the caller demuxes
-/// band 1. The returned Response's body is the live stream — it must be consumed
-/// inside this invocation; there is no resume across slices.
-pub async fn fetch_open(raw_url: &str, wants: &[ObjectId]) -> Result<Response, Error> {
+/// `kind` is the remote's advertised object-format — the pack it returns carries
+/// that digest's trailer width. The returned Response's body is the live stream
+/// — it must be consumed inside this invocation; there is no resume across slices.
+pub async fn fetch_open(raw_url: &str, wants: &[ObjectId], kind: gix_hash::Kind) -> Result<Response, Error> {
     let base = normalize(raw_url)?;
+    let fmt_name = if kind == gix_hash::Kind::Sha256 { "sha256" } else { "sha1" };
     let mut w = PktWriter::default();
     w.text("command=fetch")?;
     w.text(AGENT)?;
-    w.text("object-format=sha1")?;
+    w.text(&format!("object-format={fmt_name}"))?;
     w.delim();
     // git's minimal clone request: wants + done. Servers answer the pack as
     // band-1 sideband either way (github defaults so; we always emit it), so

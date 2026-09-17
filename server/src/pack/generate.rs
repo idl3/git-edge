@@ -115,7 +115,7 @@ pub async fn send_set(
     while !tags.is_empty() {
         load(&idx, bucket, &mut mem, &tags, budget).await?; // peel, one round per nesting level
         for t in std::mem::take(&mut tags) {
-            let tag = TagRef::from_bytes(find(&mem, &t, &mut buf)?, gix_hash::Kind::Sha1)
+            let tag = TagRef::from_bytes(find(&mem, &t, &mut buf)?, t.kind())
                 .map_err(|e| Error::Storage(e.to_string()))?;
             match (tag.target_kind, tag.target()) {
                 (Kind::Commit, x) => commits.push(x),
@@ -169,7 +169,7 @@ pub async fn send_set(
                     continue; // tag tips are already peeled by the client; ignore non-commits
                 }
                 let data = find(&mem, &c, &mut buf)?;
-                for p in CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1).parent_ids() {
+                for p in CommitRefIter::from_bytes(data, c.kind()).parent_ids() {
                     if !nots.contains(&p) {
                         nxt.push(p);
                     }
@@ -220,8 +220,8 @@ pub async fn send_set(
         for ((c, d, counted), loc) in std::mem::take(&mut queue).into_iter().zip(locs) {
             let data = find(&mem, &c, &mut buf)?;
             depth.insert(c, d);
-            let tree = CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1).tree_id().map_err(|e| Error::Storage(e.to_string()))?;
-            let parents: Vec<ObjectId> = CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1).parent_ids().collect();
+            let tree = CommitRefIter::from_bytes(data, c.kind()).tree_id().map_err(|e| Error::Storage(e.to_string()))?;
+            let parents: Vec<ObjectId> = CommitRefIter::from_bytes(data, c.kind()).parent_ids().collect();
             if shallow_mode {
                 parents_of.insert(c, parents.clone());
             }
@@ -324,7 +324,7 @@ pub async fn send_set(
     load(&idx, bucket, &mut mem, &edge, budget).await?;
     for e in &edge {
         bases.push(
-            CommitRefIter::from_bytes(find(&mem, e, &mut buf)?, gix_hash::Kind::Sha1)
+            CommitRefIter::from_bytes(find(&mem, e, &mut buf)?, e.kind())
                 .tree_id()
                 .map_err(|e| Error::Storage(e.to_string()))?,
         );
@@ -515,7 +515,7 @@ fn expand_tree(
 ) -> Result<(), Error> {
     let (mut had, mut by_name, mut buf) = (HashSet::new(), HashMap::<BString, ObjectId>::new(), Vec::new());
     for b in bases {
-        for e in TreeRefIter::from_bytes(find(mem, b, &mut buf)?, gix_hash::Kind::Sha1) {
+        for e in TreeRefIter::from_bytes(find(mem, b, &mut buf)?, b.kind()) {
             let e = e.map_err(|e| Error::Storage(e.to_string()))?;
             had.insert(e.oid.to_owned());
             if e.mode.is_tree() {
@@ -523,7 +523,7 @@ fn expand_tree(
             }
         }
     }
-    for e in TreeRefIter::from_bytes(find(mem, tree, &mut buf)?, gix_hash::Kind::Sha1) {
+    for e in TreeRefIter::from_bytes(find(mem, tree, &mut buf)?, tree.kind()) {
         let (e, oid) = {
             let e = e.map_err(|e| Error::Storage(e.to_string()))?;
             (e, e.oid.to_owned())

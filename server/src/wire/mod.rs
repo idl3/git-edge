@@ -133,6 +133,8 @@ pub struct ReceiveCaps {
     pub ofs_delta: bool,
     pub atomic: bool,
     pub agent: Option<BString>,
+    /// `object-format=` capability — the client's repo format, sha1 when absent
+    pub object_format: gix_hash::Kind,
 }
 pub struct ReceiveHeader {
     pub commands: Vec<RefCommand>,
@@ -160,6 +162,7 @@ pub fn parse_receive_header(r: &mut PktReader) -> Result<Option<ReceiveHeader>, 
         ofs_delta: false,
         atomic: false,
         agent: None,
+        object_format: gix_hash::Kind::Sha1,
     };
     let mut first_command = true;
     loop {
@@ -199,9 +202,16 @@ pub fn parse_receive_header(r: &mut PktReader) -> Result<Option<ReceiveHeader>, 
                     b"no-thin" => {}
                     c if c.starts_with(b"agent=") => caps.agent = Some(c.into()),
                     c if c.starts_with(b"object-format=") => {
-                        if c != b"object-format=sha1" {
-                            return Err(Error::Protocol("object-format sha256 unsupported".into()));
-                        }
+                        caps.object_format = match c.strip_prefix(b"object-format=").unwrap_or(&[]) {
+                            b"sha1" => gix_hash::Kind::Sha1,
+                            b"sha256" => gix_hash::Kind::Sha256,
+                            other => {
+                                return Err(Error::Protocol(format!(
+                                    "object-format {} unsupported",
+                                    other.as_bstr()
+                                )))
+                            }
+                        };
                     }
                     _ => {}
                 }
@@ -233,6 +243,9 @@ pub struct LsRefsArgs {
     pub peel: bool,
     pub unborn: bool,
     pub prefixes: Vec<BString>,
+    /// negotiated `object-format=` — the client asserts its repo's hash algo;
+    /// the DO rejects a mismatch against the repo's pinned format
+    pub object_format: gix_hash::Kind,
 }
 pub struct FetchArgs {
     pub wants: Vec<ObjectId>,
@@ -255,6 +268,8 @@ pub struct FetchArgs {
     /// `None` = arg absent; `Some([])` = client opted in but named no protocols
     /// (real git accepts an empty csv — it just means "never mint me a URI").
     pub packfile_uris: Option<Vec<BString>>,
+    /// negotiated `object-format=` — asserted against the repo's pinned format
+    pub object_format: gix_hash::Kind,
 }
 pub enum V2Command {
     LsRefs(LsRefsArgs),
@@ -273,6 +288,7 @@ pub fn parse_v2_command(body: &[u8]) -> Result<V2Command, Error> {
     let mut r = PktReader::default();
     r.push(body);
     let (mut cmd, mut args, mut in_args) = (None::<Vec<u8>>, Vec::<BString>::new(), false);
+    let mut object_format = gix_hash::Kind::Sha1;
     loop {
         match r.next()? {
             None | Some(Pkt::ResponseEnd) => return Err(Error::Protocol("truncated v2 command".into())),
@@ -287,12 +303,13 @@ pub fn parse_v2_command(body: &[u8]) -> Result<V2Command, Error> {
                         return Err(Error::Protocol("duplicate command line".into()));
                     }
                     cmd = Some(c.to_vec());
-                } else if d == b"object-format=sha256" {
-                    return Err(Error::Protocol("object-format sha256 unsupported".into()));
-                } else if !(d.starts_with(b"agent=")
-                    || d.starts_with(b"object-format=")
-                    || d.starts_with(b"session-id="))
-                {
+                } else if let Some(f) = d.strip_prefix(b"object-format=") {
+                    object_format = match f {
+                        b"sha1" => gix_hash::Kind::Sha1,
+                        b"sha256" => gix_hash::Kind::Sha256,
+                        _ => return Err(Error::Protocol(format!("object-format {} unsupported", f.as_bstr()))),
+                    };
+                } else if !(d.starts_with(b"agent=") || d.starts_with(b"session-id=")) {
                     // pre-delim lines are command + capabilities only; an argument line
                     // here means the request lost its delim — reject rather than drop it
                     return Err(Error::Protocol(format!("unexpected pre-delim line {}", d.as_bstr())));
@@ -301,14 +318,15 @@ pub fn parse_v2_command(body: &[u8]) -> Result<V2Command, Error> {
         }
     }
     match cmd.as_deref() {
-        Some(b"ls-refs") => Ok(V2Command::LsRefs(parse_ls_refs(&args)?)),
-        Some(b"fetch") => Ok(V2Command::Fetch(parse_fetch(&args)?)),
+        Some(b"ls-refs") => Ok(V2Command::LsRefs(parse_ls_refs(&args, object_format)?)),
+        Some(b"fetch") => Ok(V2Command::Fetch(parse_fetch(&args, object_format)?)),
         _ => Err(Error::Protocol("unknown command".into())),
     }
 }
 
-fn parse_ls_refs(args: &[BString]) -> Result<LsRefsArgs, Error> {
-    let mut a = LsRefsArgs { symrefs: false, peel: false, unborn: false, prefixes: Vec::new() };
+fn parse_ls_refs(args: &[BString], object_format: gix_hash::Kind) -> Result<LsRefsArgs, Error> {
+    let mut a =
+        LsRefsArgs { symrefs: false, peel: false, unborn: false, prefixes: Vec::new(), object_format };
     for l in args {
         match l.as_slice() {
             b"symrefs" => a.symrefs = true,
@@ -325,7 +343,7 @@ fn parse_ls_refs(args: &[BString]) -> Result<LsRefsArgs, Error> {
     Ok(a)
 }
 
-fn parse_fetch(args: &[BString]) -> Result<FetchArgs, Error> {
+fn parse_fetch(args: &[BString], object_format: gix_hash::Kind) -> Result<FetchArgs, Error> {
     let mut f = FetchArgs {
         wants: vec![],
         want_refs: vec![],
@@ -342,6 +360,7 @@ fn parse_fetch(args: &[BString]) -> Result<FetchArgs, Error> {
         shallow: vec![],
         filter: None,
         packfile_uris: None,
+        object_format,
     };
     for l in args {
         let (k, v) = l.split_once_str(" ").unwrap_or((l.as_slice(), b""));
@@ -421,16 +440,15 @@ pub struct RefRow {
     pub peeled: Option<ObjectId>,
 }
 
-/// Rule 6, byte-exact and static.
-pub fn write_capability_advertisement_v2(w: &mut PktWriter) {
-    for l in [
-        "version 2",
-        AGENT,
-        "ls-refs=unborn",
-        "fetch=shallow filter packfile-uris",
-        "object-format=sha1",
-    ] {
+/// Rule 6, byte-exact and static. `formats` = the repo's advertised object
+/// formats — the pinned one, or [sha1, sha256] while the repo is unpinned.
+pub fn write_capability_advertisement_v2(w: &mut PktWriter, formats: &[gix_hash::Kind]) {
+    for l in ["version 2", AGENT, "ls-refs=unborn", "fetch=shallow filter packfile-uris"] {
         line(w, format!("{l}\n").as_bytes());
+    }
+    for f in formats {
+        let name = if *f == gix_hash::Kind::Sha256 { "sha256" } else { "sha1" };
+        line(w, format!("object-format={name}\n").as_bytes());
     }
     w.flush();
 }
@@ -471,15 +489,29 @@ pub enum Service {
 }
 
 /// Rules 5, 7, 8: `# service=`, flush, [`version 1`], first ref with \0caps, the rest, peeled `^{}`, flush.
-pub fn write_advertisement_v0(w: &mut PktWriter, service: Service, head: Option<&BStr>, refs: &[RefRow]) {
+/// `formats` = the repo's advertised object formats — the pinned one, or
+/// [sha1, sha256] while unpinned so a sha256 client's first push can pin it.
+/// Each format is its own `object-format=` capability per the protocol.
+pub fn write_advertisement_v0(
+    w: &mut PktWriter,
+    service: Service,
+    head: Option<&BStr>,
+    refs: &[RefRow],
+    formats: &[gix_hash::Kind],
+) {
+    let fmt = formats
+        .iter()
+        .map(|f| format!("object-format={}", if *f == gix_hash::Kind::Sha256 { "sha256" } else { "sha1" }))
+        .collect::<Vec<_>>()
+        .join(" ");
     let (name, caps) = match service {
-        Service::UploadPack { .. } => ("git-upload-pack", format!("object-format=sha1 {AGENT}")),
+        Service::UploadPack { .. } => ("git-upload-pack", format!("{fmt} {AGENT}")),
         Service::ReceivePack => (
             "git-receive-pack",
             // report-status-v2 is deliberately not advertised: its extra option-line
             // section is a strict superset of v1 and every client falls back cleanly.
             format!(
-                "report-status delete-refs side-band-64k quiet ofs-delta atomic object-format=sha1 {AGENT}"
+                "report-status delete-refs side-band-64k quiet ofs-delta atomic {fmt} {AGENT}"
             ),
         ),
     };
@@ -506,7 +538,10 @@ pub fn write_advertisement_v0(w: &mut PktWriter, service: Service, head: Option<
         }
     }
     if first {
-        line(w, format!("{} capabilities^{{}}\0{caps}\n", ObjectId::null(gix_hash::Kind::Sha1)).as_bytes());
+        // empty-repo marker: the null oid is written in the first advertised
+        // format — sha1 while unpinned, so a v0 sha256 client that picked the
+        // sha256 cap still parses the line (git tolerates the shorter null).
+        line(w, format!("{} capabilities^{{}}\0{caps}\n", ObjectId::null(formats[0])).as_bytes());
     }
     w.flush();
 }
