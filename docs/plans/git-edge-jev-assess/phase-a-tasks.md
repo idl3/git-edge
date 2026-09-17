@@ -33,7 +33,7 @@ adopted-patterns:
 |---|---|
 | A1 | done |
 | A2 | done |
-| A3 | todo |
+| A3 | done |
 | A4 | todo |
 | A5 | todo |
 | — done | — |

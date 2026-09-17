@@ -22,6 +22,8 @@ use crate::wire::{
 };
 use crate::{ReqBudget, Spend};
 
+pub mod assess;
+
 const CMD_CAP: usize = 1 << 20; // section 6.3: command section cap
 const FILL_STEP: usize = 64 << 10; // 6.3: fill in 64 KiB steps
 

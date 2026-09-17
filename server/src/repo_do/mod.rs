@@ -270,10 +270,17 @@ pub fn oid(hex: &str) -> Result<ObjectId, Error> {
     ObjectId::from_hex(hex.as_bytes()).map_err(|e| Error::Protocol(e.to_string()))
 }
 
-/// Decode one commit object into (committer ts, subject line, parents) — pure,
-/// so the walk's only untested part is the IO. Malformed commits return None:
-/// a corrupt object in history shouldn't blank the whole log endpoint.
-fn commit_subject(data: &[u8]) -> Option<(i64, String, Vec<ObjectId>)> {
+struct CommitInfo {
+    ts: i64,
+    subject: String,
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+}
+
+/// Decode one commit object — pure, so the walk's only untested part is the IO.
+/// Malformed commits return None: a corrupt object in history shouldn't blank
+/// the whole log endpoint.
+fn commit_subject(data: &[u8]) -> Option<CommitInfo> {
     let c = gix_object::CommitRef::from_bytes(data, gix_hash::Kind::Sha1).ok()?;
     // committer is the raw `Name <mail> <unix> <tz>` signature — the timestamp
     // is the first whitespace token after the closing '>'
@@ -291,12 +298,52 @@ fn commit_subject(data: &[u8]) -> Option<(i64, String, Vec<ObjectId>)> {
         .next()
         .map(|l| String::from_utf8_lossy(l).into_owned())
         .unwrap_or_default();
+    let tree = ObjectId::from_hex(c.tree).ok()?;
     let parents = c
         .parents
         .iter()
         .map(|h| ObjectId::from_hex(*h).ok())
         .collect::<Option<Vec<_>>>()?;
-    Some((ts, subject, parents))
+    Some(CommitInfo { ts, subject, tree, parents })
+}
+
+/// One object read — the log route's unit of IO. Missing objects are Ok(None):
+/// a broken index entry shouldn't blank the whole endpoint.
+async fn read_object(
+    idx: &Index<'_>,
+    bucket: &Bucket,
+    id: ObjectId,
+    budget: &mut ReqBudget,
+) -> Result<Option<(gix_object::Kind, Vec<u8>)>, Error> {
+    let Some(loc) = idx.lookup(&[id])?.into_iter().next().flatten() else {
+        return Ok(None);
+    };
+    let entries = bucket.read_entries_chunked(&[(id, loc)], budget).await?;
+    match entries.into_iter().next() {
+        Some((_, raw)) => Ok(Some(crate::store::codec::decode_entry(&raw)?)),
+        None => Ok(None),
+    }
+}
+
+/// Root-tree filename-extension histogram — a hint for the evaluator, never a
+/// gate: any parse oddity degrades to fewer entries, not an error. Extensions
+/// are lowercase ASCII, 1..=10 chars, to bound the map's cardinality.
+fn ext_histogram(tree_data: &[u8]) -> serde_json::Value {
+    use gix_object::tree::EntryKind;
+    let mut counts = std::collections::BTreeMap::<String, u64>::new();
+    for e in gix_object::TreeRefIter::from_bytes(tree_data, gix_hash::Kind::Sha1).flatten() {
+        if !matches!(e.mode.kind(), EntryKind::Blob | EntryKind::BlobExecutable) {
+            continue;
+        }
+        let name: &[u8] = e.filename.as_ref();
+        if let Some(pos) = name.iter().rposition(|b| *b == b'.') {
+            let ext = &name[pos + 1..];
+            if pos > 0 && (1..=10).contains(&ext.len()) && ext.iter().all(|b| b.is_ascii_alphanumeric()) {
+                *counts.entry(String::from_utf8_lossy(ext).to_lowercase()).or_default() += 1;
+            }
+        }
+    }
+    serde_json::json!(counts)
 }
 
 /// A full valid refname under refs/ — the same gate apply_one uses on push commands.
@@ -2000,7 +2047,7 @@ impl RepoDo {
 
     async fn log_inner(&self, spend: &Spend) -> Result<Response, Error> {
         let cap = usize::try_from(self.env_i64("GE_LOG_MAX_SUBJECTS", 20).max(0)).unwrap_or(0);
-        let (_head, refs) = self.list_refs()?;
+        let (head, refs) = self.list_refs()?;
         let mut budget = ReqBudget::paid().reporting(spend);
         let bucket = self.bucket()?;
         let sql = self.sql();
@@ -2009,12 +2056,13 @@ impl RepoDo {
         // union walk over every refs/heads/* tip — HEAD alone can sit on a
         // stale/adopted line and miss the branch that carries the activity
         let mut seen: HashSet<ObjectId> = HashSet::new();
-        let mut frontier: Vec<ObjectId> = refs
+        let tips: Vec<ObjectId> = refs
             .iter()
             .filter(|r| r.name.as_slice().starts_with(b"refs/heads/"))
             .map(|r| r.target)
             .filter(|id| seen.insert(*id))
             .collect();
+        let mut frontier = tips.clone();
 
         let mut out: Vec<serde_json::Value> = Vec::new();
         while !frontier.is_empty() && out.len() < cap {
@@ -2031,16 +2079,16 @@ impl RepoDo {
                 if kind != gix_object::Kind::Commit {
                     continue;
                 }
-                if let Some((ts, subject, parents)) = commit_subject(&data) {
-                    for p in parents {
+                if let Some(c) = commit_subject(&data) {
+                    for p in c.parents {
                         if seen.insert(p) {
                             next.push(p);
                         }
                     }
                     out.push(serde_json::json!({
                         "sha": id.to_string(),
-                        "ts": ts,
-                        "subject": subject,
+                        "ts": c.ts,
+                        "subject": c.subject,
                     }));
                 }
             }
@@ -2048,7 +2096,34 @@ impl RepoDo {
         }
         // newest-first across branches; the walk's per-level order isn't
         out.sort_by(|a, b| b["ts"].as_i64().cmp(&a["ts"].as_i64()));
-        json(serde_json::json!({ "subjects": out }))
+
+        // Root-tree extension histogram of the head branch (first tip as
+        // fallback): ≤2 extra object reads, every failure degrades to {} —
+        // it is a hint for the evaluator, never a gate.
+        let tip = head
+            .as_ref()
+            .and_then(|h| refs.iter().find(|r| &r.name == h))
+            .map(|r| r.target)
+            .or_else(|| tips.first().copied());
+        let mut file_ext = serde_json::json!({});
+        if let Some(t) = tip {
+            if let Some((gix_object::Kind::Commit, data)) =
+                read_object(&idx, &bucket, t, &mut budget).await?
+            {
+                if let Some(c) = commit_subject(&data) {
+                    if let Some((gix_object::Kind::Tree, tree)) =
+                        read_object(&idx, &bucket, c.tree, &mut budget).await?
+                    {
+                        file_ext = ext_histogram(&tree);
+                    }
+                }
+            }
+        }
+
+        let mut body = refs_value(&head, &refs);
+        body["subjects"] = out.into();
+        body["file_ext"] = file_ext;
+        json(body)
     }
 
     async fn export_inner(&self, spend: &Spend) -> Result<Response, Error> {
@@ -2563,12 +2638,39 @@ mod tests {
             "tree {tree}\nparent {parent}\nauthor A <a@b.c> 1700000000 +0000\n\
              committer A <a@b.c> 1700000100 +0000\n\nsubject line\n\nbody text\n"
         );
-        let (ts, subject, parents) = commit_subject(data.as_bytes()).unwrap();
-        assert_eq!(ts, 1700000100);
-        assert_eq!(subject, "subject line");
-        assert_eq!(parents.len(), 1);
-        assert_eq!(parents[0].to_string(), parent);
+        let c = commit_subject(data.as_bytes()).unwrap();
+        assert_eq!(c.ts, 1700000100);
+        assert_eq!(c.subject, "subject line");
+        assert_eq!(c.tree.to_string(), tree);
+        assert_eq!(c.parents.len(), 1);
+        assert_eq!(c.parents[0].to_string(), parent);
         // malformed input degrades to None, not an error
         assert!(commit_subject(b"not a commit").is_none());
+    }
+
+    #[test]
+    fn ext_histogram_counts_blobs_only() {
+        use super::ext_histogram;
+        // hand-rolled tree: "100644 f.rs\0<oid>" + dir + no-ext file + dotfile
+        let oid = [0x11u8; 20];
+        let mut data = Vec::new();
+        let mut push = |mode: &str, name: &str| {
+            data.extend_from_slice(mode.as_bytes());
+            data.push(b' ');
+            data.extend_from_slice(name.as_bytes());
+            data.push(0);
+            data.extend_from_slice(&oid);
+        };
+        push("100644", "a.rs");
+        push("100644", "b.RS");
+        push("100755", "run.sh");
+        push("40000", "dir.with.dots"); // trees never count
+        push("100644", "noext");
+        push("100644", ".hidden"); // dot at position 0: no extension
+        let v = ext_histogram(&data);
+        assert_eq!(v["rs"], 2);
+        assert_eq!(v["sh"], 1);
+        assert_eq!(v.as_object().unwrap().len(), 2);
+        assert_eq!(ext_histogram(b""), serde_json::json!({}));
     }
 }
