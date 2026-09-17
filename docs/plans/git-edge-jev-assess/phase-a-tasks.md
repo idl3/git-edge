@@ -32,7 +32,7 @@ adopted-patterns:
 | Task | Status |
 |---|---|
 | A1 | done |
-| A2 | todo |
+| A2 | done |
 | A3 | todo |
 | A4 | todo |
 | A5 | todo |
