@@ -44,6 +44,14 @@ repo-delete releases them).
   mid-entry resume point), 2.5 links live in `push_links` (no 1M cap), and the
   final slice runs `commit_push` with atomic semantics. Kills the
   single-commit ingest ceiling (TypeScript's 222k-object commit).
+  **URL import** (`remote.rs` + the job's `fetch` phase): `POST /_admin/import
+  {url}` needs no staging — the DO runs the v2 client itself (`ls-refs` →
+  command mint, `fetch` → one RawWriter part under `pending/`, sha1 trailer
+  verified before the payload is rewritten into the staged shape). Deterministic
+  remote failures (404/401/no-v2/out-of-scope/no-refs) reject the push with the
+  reason instead of burning attempts; a mid-stream isolate death re-downloads
+  the whole pack (no mid-response resume exists). http is loopback-only,
+  remotes get no auth, refs cap at 100k.
 
 **I1 correctness model, compressed**: durable = uploaded parts only.
 `objects`/`push_links` rows may run ahead inside a slice; every resume

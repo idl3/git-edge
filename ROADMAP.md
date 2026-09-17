@@ -99,9 +99,13 @@ The original (private-repo) benchmark flushed out two real bugs, both long fixed
 - **Synthetic-ref object seeding** — split an oversize commit's objects across
   staging refs so the real push dedups against them; client-side fix for
   TypeScript-class imports, zero server changes (`findings/scale-ceilings.md` I2).
-- **GitHub URL import** — `POST /_admin/import {url}` server-side clones a
-  public GitHub repo. No client staging at all; Worker outbound fetch has no
-  body cap on the *response* side. Would obsolete item 4 for public sources.
+- ~~**GitHub URL import**~~ — done: `POST /_admin/import {url}` makes the
+  Worker the git client — v2 `ls-refs` mints the command set (capped at 100k
+  refs, gated by the push's token scope), one `fetch` streams the remote's
+  pack through a trailer-verifying hasher into `pending/`, then the ordinary
+  `import_pack` phases own it. Verified against github.com (octocat/Hello-World:
+  10,163 objects, 3,626 refs + HEAD adopted) and in conformance over loopback.
+  Public sources only — no credentials are sent; http is loopback-only.
 - **TTL repos** — `expires_at` on meta; janitor sweeps expired repos. The
   purest expression of "disposable".
 - **Bundle/PR-preview conventions** — `refs/pr/*` namespace with automatic

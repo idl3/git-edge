@@ -383,9 +383,9 @@ done
 
 # Quota + push rate-limit checks (A26/A27): only runs with GE_CONFORMANCE_LIMITS=1
 # and the dev server started with small caps, e.g. .dev.vars:
-#   GE_QUOTA_MAX_OBJECTS=25 GE_QUOTA_MAX_REPOS_PER_OWNER=4 GE_RATE_PUSHES_PER_MIN=12
+#   GE_QUOTA_MAX_OBJECTS=25 GE_QUOTA_MAX_REPOS_PER_OWNER=5 GE_RATE_PUSHES_PER_MIN=12
 # (25 stays above the main suite's ~12 objects/repo; 12 stays above its 9 pushes;
-# the owner cap must exceed the suite's peak live claims — run+admin+gc+import = 4.)
+# the owner cap must exceed the suite's peak live claims — run+admin+gc+import+uimport = 5.)
 if [ "${GE_CONFORMANCE_LIMITS:-0}" = "1" ]; then
   O="quota-$SECONDS-$$"
   post() { # one canned receive-pack POST (bad pack body is fine — it reaches begin)
@@ -539,6 +539,41 @@ if [ "${GE_CONFORMANCE_IMPORT:-0}" = "1" ]; then
   git clone -q "$URL/$IREPO" "$WORK/dclone" || fail "overlap-window clone"
   git -C "$WORK/dclone" fsck --strict || fail "overlap-window fsck"
   [ "$OVRLAP" -ge 2 ] && note "overlap clone exercised dedup (packs_live=$OVRLAP)" || note "sweep beat the clone — dedup path not exercised this run"
+
+  # WILD url import: the worker is the git client — v2 ls-refs + fetch streams
+  # the remote's pack into pending/, then the same parse→resolve→commit job
+  # owns it. Source is this same instance over loopback http — normalize()
+  # refuses plaintext http anywhere else.
+  note "url import: POST {url} fetches the remote and commits its refs"
+  NOAUTHURL="$(echo "$URL" | sed -E 's|^(https?://)[^/@]*@|\1|')"
+  curl -sf -X POST "$URL/$IREPO/_admin/public" -H 'Content-Type: application/json' \
+    -d '{"enabled":true}' | grep -q true || fail "url-import source public"
+  UREPO="$REPO-uimport"
+  st=$(curl -sf -X POST "$URL/$UREPO/_admin/import" -H 'Content-Type: application/json' \
+    -d "{\"url\":\"$NOAUTHURL/$IREPO\"}")
+  UPUSH=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("push",""))')
+  [ -n "$UPUSH" ] || fail "url import start: $st"
+  deadline=$((SECONDS + 120))
+  while :; do
+    st=$(curl -sf "$URL/$UREPO/_admin/import/$UPUSH")
+    ps=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("push_state"))')
+    [ "$ps" = "committed" ] && break
+    [ "$ps" = "rejected" ] && fail "url import rejected: $st"
+    [ $SECONDS -lt $deadline ] || fail "url import did not commit: $st"
+    sleep 1
+  done
+  git clone -q "$URL/$UREPO" "$WORK/uclone" || fail "url-import clone"
+  git -C "$WORK/uclone" fsck --strict || fail "url-import fsck"
+  [ "$(git -C "$WORK/uclone" rev-parse main)" = "$NEW" ] || fail "url-import tip"
+  # HEAD adopts the remote's symref target — the clone checks out main
+  [ "$(git -C "$WORK/uclone" symbolic-ref HEAD)" = "refs/heads/main" ] || fail "url-import HEAD"
+  # the url-imported repo carries every advertised ref, dup2 included
+  git ls-remote "$URL/$UREPO" | grep -q "refs/heads/dup2" || fail "url-import missing dup2"
+  # guards: plaintext http off-loopback and non-http(s) schemes 400 at the edge
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$UREPO/_admin/import" -d '{"url":"http://169.254.169.254/x"}')
+  [ "$code" = "400" ] || fail "non-loopback http url -> $code, want 400"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$UREPO/_admin/import" -d '{"url":"gopher://x"}')
+  [ "$code" = "400" ] || fail "bad scheme -> $code, want 400"
 fi
 
 # purge_repo job: POST _admin/delete enqueues it; the repo converges to empty

@@ -28,6 +28,8 @@ All of this is exercised by the conformance suite (`tests/conformance/run.sh`) a
 - **Ref pinning, delete, export.** Pin a ref to freeze it; `/_admin/delete` tombstones a repo and a purge job reclaims its bytes; `/_admin/export` streams a real `git bundle`.
 - **Git LFS (basic transfer).** The batch API answers `upload`/`download` with HMAC-signed URLs; objects live under the repo's purge prefix and count toward its byte quota.
 - **Server-side resumable import.** Stage a pack in parts, then `/_admin/import` runs a job that ingests it across slices — the path that survives a Worker isolate dying mid-history. Proven on a 462,299-object facebook/react pack (1,149 refs) and microsoft/TypeScript's 984,826 objects (324 refs, ~1h52m), whose single 222k-object commit cannot be pushed in slices at all.
+
+- **URL import.** `POST /_admin/import {"url": "https://github.com/owner/repo"}` — no staging at all. The Worker runs protocol v2 as the *client*: `ls-refs` mints the ref commands (scoped, 100k cap), one `fetch` streams the remote's pack through a trailer-verifying hasher into R2, and the ordinary import pipeline commits it atomically — HEAD included. Verified against github.com. Public remotes only; plaintext http is loopback-only.
 - **Quota + abuse limits.** Per-owner repo caps, per-repo object/byte caps, per-credential push rate limiting.
 - **Self-healing jobs.** GC (mark → consolidate → sweep), imports, and purges run as alarm-driven jobs with resumable cursors, lease fencing, and separate strand-vs-error accounting — a rebuild or isolate death can't kill a multi-hour job.
 

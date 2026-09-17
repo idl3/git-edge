@@ -96,6 +96,9 @@ object-format=sha1`
 `HEAD` defaults to `refs/heads/main` at repo creation; on the first push that
 lands a branch while `HEAD` is dangling (e.g. a `master`-first repo), the
 server adopts an existing branch — clones check out like a GitHub import.
+`POST /_admin/import {url}` imports a public remote directly (no staging): the
+fetch phase mints one create-command per advertised ref and adopts the remote's
+HEAD symref, so a url import lands exactly the source's tip set.
 
 ## Storage & maintenance model
 

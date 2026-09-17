@@ -143,8 +143,23 @@ GE_TOKEN=<write-token> tools/git-edge-import.sh <local-repo-or-url> <edge-url>
 
 ### Server-side import (unsplittable packs — e.g. one commit > ~50k objects)
 
-When no commit boundary gets a slice under the budget, stage the pack itself
-and let a DO job ingest it across slices — no per-request cap applies:
+For a **public** smart-HTTP remote there is no staging at all — the Worker
+clones it itself (v2 `ls-refs` + `fetch`, pack verified by trailer before the
+import pipeline owns it):
+
+```bash
+curl -u "edge:$GE_TOKEN" -X POST "$REMOTE/_admin/import" -H 'Content-Type: application/json' \
+  -d '{"url":"https://github.com/owner/repo"}'     # -> {"push":"<id>","queued":true}
+curl -u "edge:$GE_TOKEN" "$REMOTE/_admin/import/<push>"   # job_phase: fetch -> resolve -> ...
+```
+
+Every advertised ref lands as a create (100k cap, obeying the token's scope)
+and the remote's HEAD symref becomes the repo's default branch. Public sources
+only — no credentials are sent; http urls must be loopback. A rejected push's
+`result` names the reason (`remote answered HTTP 404`, `outside token scope`, …).
+
+When the source is not a public remote, stage the pack itself and let a DO job
+ingest it across slices — no per-request cap applies:
 
 ```bash
 git -C src.git pack-objects --stdout --all > all.pack        # REF deltas fine
