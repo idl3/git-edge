@@ -30,7 +30,7 @@ adopted-patterns:
 |---|---|
 | B1 | done |
 | B2 | done |
-| B3 | todo |
+| B3 | done |
 | — done | — |
 
 ## Audit item coverage

@@ -200,6 +200,47 @@ truncation, or corrupted ref state.
     subrequest limits are all confirmed against a live deployment
     (`git-edge.<acct>.workers.dev`); the ~100 MB body cap is real.
 
+## Operator assessment (read-only sidecar)
+
+`GET /:owner/:repo/_admin/assess` (global write token — Basic or Bearer, same
+gate as `/_admin/tokens`) composes the repo's `ge-snapshot/v1` state document,
+fans out a fixed question set to TypeSafe's System One model (`jev-latest`),
+and returns the typed answers plus a code-derived `disposition`:
+
+```json
+{
+  "schema": "ge-assess/v1",
+  "questions_version": "ge-questions/1",
+  "snapshot": { "schema": "ge-snapshot/v1", "...": "..." },
+  "answers": { "...": "..." },
+  "error": null,
+  "disposition": "ok"
+}
+```
+
+`ge-snapshot/v1` fields: `schema`, `repo{owner,name}`, `state` (the `/_state`
+counters verbatim, including `marked`, `deleted`, `packs_ingesting`), `head`,
+`refs` (`{name,target,peeled}`), `subjects` (`{sha,ts,subject}`, newest-first,
+unioned over every `refs/heads/*` tip — ≤ `GE_LOG_MAX_SUBJECTS`, default 20),
+and `file_ext` (a root-tree extension histogram of the head branch — a hint,
+empty on any read failure).
+
+Dispositions: `skip` (tombstoned/mid-import — never sent to the model),
+`investigate`, `page-operator`, `ttl-candidate`, `inconclusive`, `ok`. When Jev
+is unreachable or `TYPESAFE_API_KEY` is unset the response is still HTTP 200
+with `answers: null`, an `error` label, and disposition `unavailable` — the
+endpoint decides nothing, so no git path can ever be affected by vendor state.
+Call bound: `GE_JEV_TIMEOUT_MS` (default 8000), zero retries.
+
+**Egress:** the snapshot — commit subjects, ref names, state counters, and the
+extension histogram (no file contents, no blobs) — is POSTed to
+`api.typesafe.ai` only when `TYPESAFE_API_KEY` is configured. With no key,
+nothing leaves the deployment.
+
+`GET /<owner>/_admin/repos` (same auth) returns `{ "repos": [...] }` from the
+`owner!<owner>` registry — the enumeration step for `tools/ge-sweep.sh`, which
+sweeps an owner's repos and prints a severity-sorted triage table.
+
 ## Verified performance envelope (local workerd)
 
 | Workload | Result |
