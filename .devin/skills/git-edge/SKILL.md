@@ -202,6 +202,26 @@ moves is a wedged GC). `jobs_dead > 0` means a maintenance job
 wedged. Pushes are CAS; a stale push is rejected — refetch and retry, don't
 `--force` blindly.
 
+## Operator assessment (read-only sidecar)
+
+```bash
+curl -u "edge:$GE_ADMIN_TOKEN" https://<host>/<owner>/<repo>/_admin/assess
+GE_TOKEN=$GE_ADMIN_TOKEN tools/ge-sweep.sh <owner>   # whole fleet, sorted
+curl -u "edge:$GE_ADMIN_TOKEN" https://<host>/<owner>/_admin/repos   # {"repos":[...]}
+```
+
+`/_admin/assess` (global write token only) returns a `ge-assess/v1` envelope:
+a `ge-snapshot/v1` state document (`state` counters, `head`/`refs`, ≤20
+`subjects` unioned over every branch tip, `file_ext` root-tree histogram),
+typed answers from TypeSafe's Jev model, and a `disposition` (`skip` /
+`investigate` / `page-operator` / `ttl-candidate` / `inconclusive` / `ok`).
+With `TYPESAFE_API_KEY` unset the response is `answers: null`, `error:
+"unavailable"` — always HTTP 200, never a git-path dependency.
+
+**Egress:** with the key configured, snapshot metadata (commit subjects, ref
+names, counters — never file contents) is POSTed to api.typesafe.ai. Call
+bound: `GE_JEV_TIMEOUT_MS` (def 8000), zero retries.
+
 ## Known limits (clean errors, not corruption)
 
 | Limit | Value | Symptom / workaround |

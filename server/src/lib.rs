@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod edge;
 pub mod error;
+pub mod jev;
 pub mod jobs;
 pub mod pack;
 pub mod platform;

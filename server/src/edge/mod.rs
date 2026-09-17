@@ -22,6 +22,8 @@ use crate::wire::{
 };
 use crate::{ReqBudget, Spend};
 
+pub mod assess;
+
 const CMD_CAP: usize = 1 << 20; // section 6.3: command section cap
 const FILL_STEP: usize = 64 << 10; // 6.3: fill in 64 KiB steps
 
@@ -174,6 +176,12 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
             import_status(&req, &env, &route, &p["_admin/import/".len()..], &spend).await
         }
         (Method::Get, "_admin/export") => export_bundle(&req, &env, &route, &spend).await,
+        (Method::Get, "_admin/assess") => assess::assess(&req, &env, &route, &spend).await,
+        // /<owner>/_admin/repos parses as repo="_admin" — the owner-level
+        // sentinel; only the "repos" rest is shadowed for a repo so named
+        (Method::Get, "repos") if route.repo == "_admin" => {
+            owner_repos(&req, &env, &route, &spend).await
+        }
         _ => Err(Error::NotFound),
     };
     let resp = respond(r, git_pkt, spend.get());
@@ -1220,6 +1228,33 @@ fn env_i64(env: &Env, name: &str, default: i64) -> i64 {
 }
 
 /// A26: claim one of the owner's GE_QUOTA_MAX_REPOS_PER_OWNER slots in the
+/// GET /<owner>/_admin/repos — the owner's claimed repos from the `owner!<owner>`
+/// registry DO. Admin-gated: it's the sweep's enumeration step, and repo names
+/// are owner metadata, not public information.
+async fn owner_repos(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    auth::authenticate_admin(req, env)?;
+    let stub = env
+        .durable_object("REPO")
+        .map_err(|e| Error::Internal(e.to_string()))?
+        .id_from_name(&format!("owner!{}", route.owner))
+        .map_err(|e| Error::Internal(e.to_string()))?
+        .get_stub()
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    let mut budget = ReqBudget::paid().reporting(spend);
+    let mut init = worker::RequestInit::new();
+    init.with_method(Method::Get);
+    let mut r = worker::Request::new_with_init("https://do/_owner/list", &init)
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    route.apply_headers(&mut r)?;
+    budget.charge(1)?;
+    let mut resp = stub.fetch_with_request(r).await?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp, &budget).await);
+    }
+    let bytes = resp.bytes().await.map_err(|e| Error::Internal(e.to_string()))?;
+    git_resp(bytes, "application/json")
+}
+
 /// `owner!<owner>` registry DO — the same RepoDo class under a name no repo route
 /// can produce (`!` fails seg_ok), so no extra migration or binding is needed.
 /// `<= 0` disables the cap entirely (no registry hop). Over-cap -> Error::Limit,
