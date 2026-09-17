@@ -175,6 +175,7 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
             import_status(&req, &env, &route, &p["_admin/import/".len()..], &spend).await
         }
         (Method::Get, "_admin/export") => export_bundle(&req, &env, &route, &spend).await,
+        (Method::Get, "_admin/assess") => assess::assess(&req, &env, &route, &spend).await,
         _ => Err(Error::NotFound),
     };
     let resp = respond(r, git_pkt, spend.get());
