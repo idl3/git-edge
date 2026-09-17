@@ -125,7 +125,23 @@ on wrangler dev — including a real git 2.55 clone over the signed URI.
   transfer (A33), #22 no-walk clone (incl. the cross-pack dedup fix).
 - Push `p2-robustness` + open PR — carries C1's content (PR #18's merge never
   landed on main), so this merge resolves that anomaly.
-- Then the WILD section (TTL repos, GitHub-URL import, synthetic-ref seeding).
+- ~~Then the WILD section (TTL repos, GitHub-URL import, synthetic-ref seeding).~~
+  WILD is open — GitHub-URL import shipped (PR #20). SHA-256 object format is
+  now done too (was a COMPATIBILITY red row): `meta.obj_format` pins a repo,
+  unpinned repos advertise both formats and the first write pins the client's
+  pick; `POST /_admin/format {object_format}` pins explicitly; url-import
+  captures the remote's advertised format. Format threads through
+  ingest/resolve/generate/trailer widths (`kind.len_in_bytes()`), and the
+  resumable pack writer got a checkpointable `CkptSha256` beside `CkptSha1`
+  (`CkptHash` enum; old `sha:` checkpoint fields still deserialize — KAT +
+  resume tests in `store::tests`). v3 bundle export emits
+  `@object-format=sha256` when pinned — without it a sha256 client rejects the
+  header. Verified: v0 pin-on-first-push, explicit pin, push+clone+`fsck
+  --strict`+peel on 64-hex refs, sha1-into-sha256 refusal (client-side),
+  sha256 fetch on sha1 repo (`ERR object-format sha256 does not match repo
+  sha1`), loopback url-import of a sha256 repo, and the full conformance suite
+  (`sha256:` block runs unconditionally; LIMITS cap is now exactly 7 — the
+  suite peaks at 7 live repos/owner, the quota owner trips on its 8th claim).
 
 **Bugs the rails GC + react 462k re-run flushed out** (all fixed): GC's
 `gc.pos` only persisted at 8 MiB part boundaries, so a sparse-mark slice

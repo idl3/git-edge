@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gix_hash::{Kind as H, ObjectId};
+use gix_hash::ObjectId;
 use gix_pack::data::{entry::Header, Entry as PackEntry};
 use gix_zlib::{Decompress, FlushDecompress, Inflate, Status};
 use serde::{Deserialize, Serialize};
@@ -75,6 +75,18 @@ pub struct Payload {
     /// same default branch the source advertises
     #[serde(default)]
     head: Option<String>,
+    /// 'sha1'|'sha256' — set at import_start for staged pushes, discovered from
+    /// the remote's advertisement for url imports. Absent means sha1.
+    #[serde(default)]
+    format: Option<String>,
+}
+impl Payload {
+    fn kind(&self) -> gix_hash::Kind {
+        match self.format.as_deref() {
+            Some("sha256") => gix_hash::Kind::Sha256,
+            _ => gix_hash::Kind::Sha1,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -251,6 +263,12 @@ async fn fetch_slice(
     if adv.refs.is_empty() {
         return reject_push(sql, &p.push, "remote advertises no refs").await;
     }
+    // pin the repo to the remote's format before anything lands — a conflict
+    // means the repo was already written under the other algorithm
+    if let Err(e) = d.pin_obj_format(adv.format) {
+        return reject_push(sql, &p.push, &e.message()).await;
+    }
+    let zero = ObjectId::null(adv.format).to_string();
     // every advertised ref becomes a command row — cap so a hostile or spammed
     // remote can't write an unbounded command list into the job payload
     if adv.refs.len() > 100_000 {
@@ -274,7 +292,7 @@ async fn fetch_slice(
             return reject_push(sql, &p.push, &format!("ref {} outside token scope", r.name)).await;
         }
         commands.push(serde_json::json!({
-            "old": "0000000000000000000000000000000000000000",
+            "old": zero,
             "new": r.oid.to_string(),
             "name": r.name,
             "peeled": r.peeled.map(|o| o.to_string()),
@@ -283,7 +301,7 @@ async fn fetch_slice(
             wants.push(r.oid);
         }
     }
-    let mut resp = match remote::fetch_open(url, &wants).await {
+    let mut resp = match remote::fetch_open(url, &wants, adv.format).await {
         Ok(r) => r,
         Err(e) if deterministic(&e) => return reject_push(sql, &p.push, &e.message()).await,
         Err(e) => return Err(e),
@@ -293,10 +311,11 @@ async fn fetch_slice(
     let bucket = d.bucket()?;
     let key = keys::pending_part(&bucket.repo, &PushId(p.push.clone()), "remote");
     let mut out = RawWriter::create(&bucket, key.clone(), &mut budget.req).await?;
-    // sha1 over all-but-the-trailer: `hold` lags the hash input by 20 bytes so
+    // hash over all-but-the-trailer: `hold` lags the hash input by one digest so
     // the trailer lands in the ring, not the digest — then digest == trailer
     // proves the whole pack arrived intact before the payload trusts it
-    let mut h = gix_hash::hasher(H::Sha1);
+    let ds = adv.format.len_in_bytes();
+    let mut h = gix_hash::hasher(adv.format);
     let mut hold: Vec<u8> = Vec::with_capacity(64);
     let mut in_pack = false;
     let mut total = 0u64;
@@ -320,8 +339,8 @@ async fn fetch_slice(
                         1 => {
                             out.append(data);
                             hold.extend_from_slice(data);
-                            if hold.len() > 20 {
-                                let n = hold.len() - 20;
+                            if hold.len() > ds {
+                                let n = hold.len() - ds;
                                 h.update(&hold[..n]);
                                 hold.drain(..n);
                             }
@@ -354,7 +373,7 @@ async fn fetch_slice(
         out.abort().await;
         return if deterministic(&e) { reject_push(sql, &p.push, &e.message()).await } else { Err(e) };
     }
-    let ok = hold.len() == 20
+    let ok = hold.len() == ds
         && matches!(h.try_finalize(), Ok(id) if id.as_bytes() == hold.as_slice());
     if !ok {
         out.abort().await;
@@ -369,6 +388,7 @@ async fn fetch_slice(
         "commands": commands,
         "url": p.url,
         "head": adv.head,
+        "format": if adv.format == gix_hash::Kind::Sha256 { "sha256" } else { "sha1" },
     });
     exec(
         sql,
@@ -567,7 +587,7 @@ async fn toc_slice(
         }
         let entry_off = c.parse_pos;
         r.fill(30, &mut budget.req).await?;
-        let e = PackEntry::from_bytes(r.buffered(), entry_off, H::Sha1)
+        let e = PackEntry::from_bytes(r.buffered(), entry_off, p.kind())
             .map_err(|e| unpack(format!("entry at {entry_off}: {e}")))?;
         // same ceilings pass A on the edge enforces
         let streamable = e.header == Header::Blob;
@@ -645,7 +665,7 @@ async fn toc_slice(
     // trailer: the staged object ends with the pack hash. Per-entry adler32 already
     // vetted the bytes; a re-hash would need a second pass over GiBs — the trailer
     // is read for completeness but not re-verified here (documented in CONTRACTS).
-    if !r.fill(20, &mut budget.req).await? {
+    if !r.fill(p.kind().len_in_bytes(), &mut budget.req).await? {
         return Err(unpack("pack trailer truncated"));
     }
     c.phase = "resolve".into();
@@ -730,7 +750,7 @@ async fn resume_drain<'a>(
         c.tail = 0;
     }
     let mut out = if c.upload.is_empty() {
-        let w = PackWriter::create(&bucket, &key, c.count, &mut budget.req).await?;
+        let w = PackWriter::create(&bucket, &key, c.count, p.kind(), &mut budget.req).await?;
         c.upload = w.upload_id().await;
         w
     } else {
@@ -760,6 +780,7 @@ async fn resume_drain<'a>(
         z: Inflate::default(),
         by_id: IdMap::Sql { idx: &idx, pack: &pack.0, mem: HashMap::new() },
         externals: Externals::Idx(&idx),
+        obj_kind: p.kind(),
         res_depth: 0,
         chain_live: 0,
     };

@@ -112,8 +112,15 @@ The original (private-repo) benchmark flushed out two real bugs, both long fixed
   retention policy.
 - **Signed-push / commit-signature policy** — enforce `gpgsig` on push for
   release branches.
-- **SHA-256 object format**, **v0/v1 fetch** (pre-2.26 clients),
-  **`tree:`/`combine:` filters**, **`object-info`**, **`bundle-uri`** —
+- ~~**SHA-256 object format**~~ — done: `meta.obj_format` pins a repo
+  (`sha1`|`sha256`), unpinned repos advertise both formats and the first write
+  pins the client's pick; `POST /_admin/format` pins explicitly. The format
+  threads through negotiation, ingest, delta resolution, fetch traversal,
+  pack trailers, resumable writers (`CkptSha256` beside `CkptSha1`), exports,
+  and both import paths. Conformance covers push→clone→fsck on 64-hex repos
+  plus the sha1→sha256 mismatch refusal.
+- **v0/v1 fetch** (pre-2.26 clients), **`tree:`/`combine:` filters**,
+  **`object-info`**, **`bundle-uri`** —
   deliberately unadvertised; add when a client actually needs them.
 - **Jurisdiction-pinned DOs** — EU repos in EU DOs if compliance demands it.
 - **`git-edge mount` via artifact-fs** — Cloudflare's artifact-fs is a FUSE

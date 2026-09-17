@@ -106,6 +106,12 @@ curl -u "ops:$TOKEN" -X POST "$REMOTE/acme/app/_admin/public" -d '{"enabled":tru
 # seed from an existing public repo — no client staging:
 curl -u "ops:$TOKEN" -X POST "$REMOTE/acme/app/_admin/import" \
   -H 'Content-Type: application/json' -d '{"url":"https://github.com/org/repo"}'
+
+# a sha256 repo: pin the format BEFORE pushing (a v0 client that sees only
+# sha1 advertised aborts client-side), or just push — an unpinned repo
+# advertises both formats and the first write pins the client's pick
+curl -u "ops:$TOKEN" -X POST "$REMOTE/acme/app/_admin/format" \
+  -d '{"object_format":"sha256"}'
 ```
 
 Repo layout is `/:owner/:repo`; `owner` is the quota/claims namespace, not an

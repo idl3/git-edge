@@ -66,10 +66,11 @@ pub async fn stream_to_pending(
     body: &mut BodyReader,
     bucket: &Bucket,
     push: &PushId,
+    kind: gix_hash::Kind,
     budget: &mut ReqBudget,
 ) -> Result<(Vec<EntryRec>, u32), Error> {
     let mut out = RawWriter::create(bucket, keys::pending(&bucket.repo, push), budget).await?;
-    match stream_inner(body, &mut out, budget).await {
+    match stream_inner(body, &mut out, kind, budget).await {
         Ok(r) => match out.finish(budget).await {
             Ok(()) => Ok(r),
             Err(e) => Err(e), // finish aborts the MPU itself on failure
@@ -84,9 +85,11 @@ pub async fn stream_to_pending(
 async fn stream_inner(
     body: &mut BodyReader,
     out: &mut RawWriter,
+    kind: gix_hash::Kind,
     budget: &mut ReqBudget,
 ) -> Result<(Vec<EntryRec>, u32), Error> {
-    let mut hasher = gix_hash::hasher(H::Sha1);
+    let ds = kind.len_in_bytes();
+    let mut hasher = gix_hash::hasher(kind);
     if !body.fill(12).await? {
         return Err(unpack("pack header truncated"));
     }
@@ -107,7 +110,7 @@ async fn stream_inner(
             return Err(unpack("too many objects"));
         }
         body.fill(30).await?;
-        let e = PackEntry::from_bytes(body.buffered(), pos, H::Sha1)
+        let e = PackEntry::from_bytes(body.buffered(), pos, kind)
             .map_err(|e| unpack(format!("entry at {pos}: {e}")))?;
         // Blobs may exceed MAX_OBJ: pass B streams them verbatim (their compressed
         // bytes are already the normalized form) with a running sha1 — memory stays
@@ -156,15 +159,15 @@ async fn stream_inner(
         });
         pos = pos.saturating_add(hlen as u64).saturating_add(clen);
     }
-    if !body.fill(20).await? {
+    if !body.fill(ds).await? {
         return Err(unpack("pack trailer truncated"));
     }
-    let want = hasher.try_finalize().map_err(|_| unpack("sha1 collision in pack"))?;
-    if body.buffered().get(..20) != Some(want.as_slice()) {
+    let want = hasher.try_finalize().map_err(|_| unpack("hash collision in pack"))?;
+    if body.buffered().get(..ds) != Some(want.as_slice()) {
         return Err(unpack("bad pack checksum"));
     }
     out.append(want.as_slice());
-    body.consume(20);
+    body.consume(ds);
     if body.fill(1).await? {
         return Err(Error::Protocol("bytes after pack trailer".into()));
     }
@@ -570,6 +573,9 @@ pub struct Cx<'a> {
     pub z: Inflate,
     pub by_id: IdMap<'a>,
     pub externals: Externals<'a>,
+    /// the repo's object format — object hashing, ref-delta base widths, and
+    /// commit/tree/tag reference parsing all follow it
+    pub obj_kind: H,
     /// Nested `resolve_at` depth (ref-delta -> ref-delta hops). Each level keeps its
     /// `chain` alive across the inner await, so depth without a byte bound is an OOM.
     pub res_depth: u32,
@@ -578,8 +584,13 @@ pub struct Cx<'a> {
     pub chain_live: u64,
 }
 
-/// One decode_entry over `[PACK v2][base as a level-0 zlib full entry][delta re-headed as ofs-delta][20 zero bytes]`.
-pub fn decode_mini(z: &mut Inflate, base: Option<(Kind, &[u8])>, raw: &[u8]) -> Result<(Kind, Vec<u8>), Error> {
+/// One decode_entry over `[PACK v2][base as a level-0 zlib full entry][delta re-headed as ofs-delta][digest-width zero trailer]`.
+pub fn decode_mini(
+    z: &mut Inflate,
+    base: Option<(Kind, &[u8])>,
+    raw: &[u8],
+    obj_kind: H,
+) -> Result<(Kind, Vec<u8>), Error> {
     let mut mini = b"PACK\0\0\0\x02\0\0\0\x02".to_vec();
     if let Some((k, d)) = base {
         let hk = match k {
@@ -595,7 +606,7 @@ pub fn decode_mini(z: &mut Inflate, base: Option<(Kind, &[u8])>, raw: &[u8]) -> 
     }
     let (at, e) = (
         mini.len() as u64,
-        PackEntry::from_bytes(raw, 0, H::Sha1).map_err(|e| unpack(e.to_string()))?,
+        PackEntry::from_bytes(raw, 0, obj_kind).map_err(|e| unpack(e.to_string()))?,
     );
     let body = raw.get(e.header_size()..).ok_or_else(|| unpack("short entry"))?;
     let hdr = match (e.header.is_delta(), base) {
@@ -605,8 +616,8 @@ pub fn decode_mini(z: &mut Inflate, base: Option<(Kind, &[u8])>, raw: &[u8]) -> 
     };
     hdr.write_to(e.decompressed_size, &mut mini).map_err(internal)?;
     mini.extend_from_slice(body);
-    mini.extend_from_slice(&[0u8; 20]);
-    let file = File::<&[u8]>::from_data(&mini, "mini".into(), H::Sha1)
+    mini.resize(mini.len() + obj_kind.len_in_bytes(), 0);
+    let file = File::<&[u8]>::from_data(&mini, "mini".into(), obj_kind)
         .map_err(internal)?
         .with_alloc_limit_bytes(usize::try_from(MAX_OBJ).ok());
     let mut out = Vec::new();
@@ -740,13 +751,13 @@ pub async fn resolve_at(
                     // here rather than surfacing decode_mini's allocation-limit error
                     return Err(unpack("delta base exceeds 16 MiB and cannot be resolved"));
                 }
-                let (k, d) = decode_mini(&mut cx.z, None, &raw)?;
+                let (k, d) = decode_mini(&mut cx.z, None, &raw, cx.obj_kind)?;
                 break cx.cache.put(Key::Off(off), k, Rc::new(d));
             }
         }
     };
     while let Some((o, raw)) = chain.pop() {
-        let (_, d) = decode_mini(&mut cx.z, Some((kind, &data)), &raw)?;
+        let (_, d) = decode_mini(&mut cx.z, Some((kind, &data)), &raw, cx.obj_kind)?;
         data = cx.cache.put(Key::Off(o), kind, Rc::new(d)).1;
     }
     cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
@@ -763,14 +774,16 @@ pub async fn resolve_and_normalize(
     externals: Externals<'_>,
     out: &mut PackWriter,
     sink: &mut IndexSink<'_>,
+    obj_kind: gix_hash::Kind,
     budget: &mut ReqBudget,
 ) -> Result<Vec<ObjRow>, Error> {
     let mut sink = AnySink::Edge(sink);
-    let pack_len = entries.last().map_or(32, |r| {
+    let ds = u64::try_from(obj_kind.len_in_bytes()).map_err(internal)?;
+    let pack_len = entries.last().map_or(12 + ds, |r| {
         r.offset
             .saturating_add(u64::from(r.header_len))
             .saturating_add(u64::from(r.compressed_len))
-            .saturating_add(20)
+            .saturating_add(ds)
     });
     let mut cx = Cx {
         win: Window { bucket, src: Source::Key(pending_key), pack_len, start: 0, buf: Vec::new() },
@@ -778,6 +791,7 @@ pub async fn resolve_and_normalize(
         z: Inflate::default(),
         by_id: IdMap::Map(HashMap::new()),
         externals,
+        obj_kind,
         res_depth: 0,
         chain_live: 0,
     };
@@ -887,9 +901,9 @@ pub async fn one_entry(
     };
     let raw = cx.win.entry(&rec, budget).await?;
     let (kind, data) =
-        decode_mini(&mut cx.z, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw)?;
-    let id = gix_object::compute_hash(H::Sha1, kind, &data).map_err(|_| unpack("sha1 collision"))?;
-    let links = extract_links(kind, &data)?;
+        decode_mini(&mut cx.z, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw, cx.obj_kind)?;
+    let id = gix_object::compute_hash(cx.obj_kind, kind, &data).map_err(|_| unpack("hash collision"))?;
+    let links = extract_links(kind, &data, cx.obj_kind)?;
     if kind == Kind::Tag {
         if let Some(&t) = links.first() {
             sink.tags_mut().insert(id, t);
@@ -963,7 +977,7 @@ async fn stream_blob(
         out.raw_extend(&hdr[s..]);
         skip -= s as u64;
     }
-    let (mut z, mut h, mut sinkbuf) = (Decompress::new(), gix_hash::hasher(H::Sha1), vec![0u8; 1 << 20]);
+    let (mut z, mut h, mut sinkbuf) = (Decompress::new(), gix_hash::hasher(cx.obj_kind), vec![0u8; 1 << 20]);
     h.update(format!("blob {}\0", rec.size).as_bytes());
     let (mut pos, mut produced, mut st) = (body_start, 0u64, Status::Ok);
     while pos < end && st != Status::StreamEnd {
@@ -1026,19 +1040,20 @@ async fn stream_blob(
 }
 
 /// Object references for the 2.5 connectivity check (1.4): commit -> tree + parents,
-/// tree -> entries except gitlinks, tag -> target.
-pub fn extract_links(kind: Kind, data: &[u8]) -> Result<Vec<ObjectId>, Error> {
+/// tree -> entries except gitlinks, tag -> target. `obj_kind` sets the oid width
+/// embedded in commit/tree/tag bodies (sha256 writes 32-byte ids).
+pub fn extract_links(kind: Kind, data: &[u8], obj_kind: H) -> Result<Vec<ObjectId>, Error> {
     let mut out = Vec::new();
     match kind {
         Kind::Commit => {
-            let mut it = gix_object::CommitRefIter::from_bytes(data, gix_hash::Kind::Sha1);
+            let mut it = gix_object::CommitRefIter::from_bytes(data, obj_kind);
             // strict: a commit whose tree header doesn't parse is not a valid commit —
             // storing it would hard-fail every later fetch that walks it
             out.push(it.tree_id().map_err(|e| Error::Unpack(e.to_string()))?);
             out.extend(it.parent_ids());
         }
         Kind::Tree => {
-            for e in gix_object::TreeRefIter::from_bytes(data, gix_hash::Kind::Sha1) {
+            for e in gix_object::TreeRefIter::from_bytes(data, obj_kind) {
                 let e = e.map_err(|e| Error::Unpack(e.to_string()))?;
                 if !e.mode.is_commit() {
                     out.push(e.oid.to_owned());
@@ -1046,7 +1061,7 @@ pub fn extract_links(kind: Kind, data: &[u8]) -> Result<Vec<ObjectId>, Error> {
             }
         }
         Kind::Tag => {
-            let t = gix_object::TagRef::from_bytes(data, gix_hash::Kind::Sha1)
+            let t = gix_object::TagRef::from_bytes(data, obj_kind)
                 .map_err(|e| Error::Unpack(e.to_string()))?;
             out.push(t.target());
         }

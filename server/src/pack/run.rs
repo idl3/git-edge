@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use gix_hash::{Kind as H, ObjectId};
+use gix_hash::ObjectId;
 use gix_pack::data::entry::Header;
 use worker::Stub;
 
@@ -29,6 +29,7 @@ pub async fn run(
     stub: &Stub,
     repo: &RepoRoute,
     push: &PushId,
+    kind: gix_hash::Kind,
     budget: &mut ReqBudget,
 ) -> Result<(Option<PackId>, HashMap<ObjectId, ObjectId>), Error> {
     if !body.fill(12).await? {
@@ -44,20 +45,21 @@ pub async fn run(
         .and_then(|s| s.try_into().ok())
         .ok_or_else(|| unpack("pack header"))?;
     let (_, count) = gix_pack::data::header::decode(&head).map_err(|e| unpack(e.to_string()))?;
+    let ds = kind.len_in_bytes();
     if count == 0 {
         // new ref at an existing commit: header + trailer only
-        if !body.fill(32).await? || body.fill(33).await? {
+        if !body.fill(12 + ds).await? || body.fill(13 + ds).await? {
             return Err(unpack("bad empty pack"));
         }
-        let mut h = gix_hash::hasher(H::Sha1);
+        let mut h = gix_hash::hasher(kind);
         h.update(&head);
-        let want = h.try_finalize().map_err(|_| unpack("sha1 collision"))?;
-        if body.buffered().get(12..32) != Some(want.as_slice()) {
+        let want = h.try_finalize().map_err(|_| unpack("hash collision"))?;
+        if body.buffered().get(12..12 + ds) != Some(want.as_slice()) {
             return Err(unpack("bad pack checksum"));
         }
         return Ok((None, HashMap::new()));
     }
-    let (entries, _) = super::ingest::stream_to_pending(body, bucket, push, budget).await?;
+    let (entries, _) = super::ingest::stream_to_pending(body, bucket, push, kind, budget).await?;
     let mut bases: Vec<ObjectId> = entries
         .iter()
         .filter_map(|r| match r.kind_or_delta {
@@ -80,7 +82,7 @@ pub async fn run(
     let mut sink = IndexSink { stub, repo, pack: pack.clone(), push: push.clone(), links: Vec::new(), tags: HashMap::new() };
     sink.post_meta(&PackMeta::EMPTY, &[], budget).await?; // packs row 'ingesting' before any part is uploaded
     let key = keys::pack(&bucket.repo, &pack);
-    let mut out = match PackWriter::create(bucket, &key, u32::try_from(entries.len()).unwrap_or(u32::MAX), budget).await {
+    let mut out = match PackWriter::create(bucket, &key, u32::try_from(entries.len()).unwrap_or(u32::MAX), kind, budget).await {
         Ok(w) => w,
         Err(e) => return Err(e),
     };
@@ -92,6 +94,7 @@ pub async fn run(
         super::ingest::Externals::Map(&external),
         &mut out,
         &mut sink,
+        kind,
         budget,
     )
     .await

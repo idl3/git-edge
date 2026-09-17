@@ -185,6 +185,8 @@ pub mod codec {
     }
     /// (kind, inflated size, header length) of the entry at bytes[0]. A delta header breaks the
     /// normalized-pack invariant: Error::Internal, not a client error (section 10).
+    /// The hash kind is load-bearing only for delta base ids — which this
+    /// rejects anyway — so the parameter stays sha1 for both repo formats.
     pub fn entry_header(bytes: &[u8]) -> Result<(Kind, u64, usize), Error> {
         let e = Entry::from_bytes(bytes, 0, HashKind::Sha1)
             .map_err(|e| Error::Storage(format!("entry: {e}")))?;
@@ -242,11 +244,7 @@ impl gix_object::Find for MemFind {
             Some((kind, data)) => {
                 buffer.clear();
                 buffer.extend_from_slice(data);
-                Ok(Some(gix_object::Data {
-                    kind: *kind,
-                    object_hash: gix_hash::Kind::Sha1,
-                    data: buffer.as_slice(),
-                }))
+                Ok(Some(gix_object::Data { kind: *kind, object_hash: id.kind(), data: buffer.as_slice() }))
             }
             None => Ok(None),
         }
@@ -431,7 +429,8 @@ impl RawWriter {
     }
 }
 
-/// One normalized pack: one multipart upload, running SHA-1 for the trailer (1.2, 6.4).
+/// One normalized pack: one multipart upload, running hash for the trailer (1.2, 6.4).
+/// The hash follows the repo's object format — sha256 packs carry a 32-byte trailer.
 pub struct PackWriter {
     mpu: MultipartUpload,
     pack: PackId,
@@ -440,17 +439,20 @@ pub struct PackWriter {
     offset: u64,
     count: u32,
     expected: u32,
-    sha1: CkptSha1,
+    hash: CkptHash,
+    kind: gix_hash::Kind,
     commit_lo: u64,
     commit_hi: u64,
     created_at: i64,
 }
 impl PackWriter {
     /// `expected` is pass A's verified entry count (2.4); the header is final from byte 0.
+    /// `kind` is the repo's object format — it sizes the pack trailer.
     pub async fn create(
         bucket: &Bucket,
         key: &str,
         expected: u32,
+        kind: gix_hash::Kind,
         budget: &mut ReqBudget,
     ) -> Result<Self, Error> {
         let name = key
@@ -471,9 +473,9 @@ impl PackWriter {
         budget.charge(1)?;
         let mpu = bucket.inner.create_multipart_upload(key).custom_metadata(meta).execute().await?;
         let header = gix_pack::data::header::encode(gix_pack::data::Version::V2, expected);
-        // sha1 is fed only as bytes are uploaded (flush_if_full/checkpoint/finish), so a
-        // WriterCkpt's hasher covers exactly the durable prefix — never buffered bytes
-        let sha1 = CkptSha1::new();
+        // the hasher is fed only as bytes are uploaded (flush_if_full/checkpoint/finish),
+        // so a WriterCkpt covers exactly the durable prefix — never buffered bytes
+        let hash = CkptHash::new(kind);
         Ok(Self {
             mpu,
             pack: PackId(name.to_string()),
@@ -482,7 +484,8 @@ impl PackWriter {
             offset: 12,
             count: 0,
             expected,
-            sha1,
+            hash,
+            kind,
             commit_lo: u64::MAX,
             commit_hi: 0,
             created_at,
@@ -557,7 +560,7 @@ impl PackWriter {
             let n = u16::try_from(self.parts.len().saturating_add(1))
                 .map_err(|_| Error::Limit("too many parts".into()))?;
             budget.charge(1)?;
-            self.sha1.update(&chunk);
+            self.hash.update(&chunk);
             self.parts.push(self.mpu.upload_part(n, chunk).await?);
         }
         Ok(())
@@ -582,7 +585,9 @@ impl PackWriter {
         self.seal(budget).await
     }
     async fn seal(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
-        let bytes = self.offset.saturating_add(20);
+        let bytes = self
+            .offset
+            .saturating_add(u64::try_from(self.kind.len_in_bytes()).map_err(|_| Error::Internal("ds".into()))?);
         budget.charge(1)?;
         let obj = self
             .mpu
@@ -609,10 +614,10 @@ impl PackWriter {
                 self.count, self.expected
             )));
         }
-        // the trailer hashes header+entries: self.sha1 covers only uploaded bytes, so
+        // the trailer hashes header+entries: self.hash covers only uploaded bytes, so
         // clone it and feed the still-buffered tail before sealing
         let trailer = {
-            let mut h = self.sha1.clone();
+            let mut h = self.hash.clone();
             h.update(&self.part);
             h.fin()
         };
@@ -670,22 +675,21 @@ impl PackWriter {
         let n = u16::try_from(self.parts.len().saturating_add(1))
             .map_err(|_| Error::Limit("too many parts".into()))?;
         budget.charge(1)?;
-        self.sha1.update(&chunk);
+        self.hash.update(&chunk);
         let part = self.mpu.upload_part(n, chunk).await?;
         let rec = (part.part_number(), part.etag());
         self.parts.push(part);
-        Ok(Some((
-            rec.0,
-            rec.1,
-            WriterCkpt {
-                pos: self.offset.saturating_sub(self.part.len() as u64),
-                sha: self.sha1.clone(),
-                count: self.count,
-                expected: self.expected,
-                commit_lo: self.commit_lo,
-                commit_hi: self.commit_hi,
-            },
-        )))
+        let mut ckpt = WriterCkpt {
+            pos: self.offset.saturating_sub(self.part.len() as u64),
+            sha: None,
+            sha256: None,
+            count: self.count,
+            expected: self.expected,
+            commit_lo: self.commit_lo,
+            commit_hi: self.commit_hi,
+        };
+        ckpt.set_hash(&self.hash);
+        Ok(Some((rec.0, rec.1, ckpt)))
     }
 
     /// Describe the durable state right now — valid only when `buffered() < PART`
@@ -693,14 +697,17 @@ impl PackWriter {
     /// the uploaded prefix and `sha` covers exactly those bytes. The import job
     /// snapshots at slice end; GC uses checkpoint()'s return instead.
     pub fn snapshot(&self) -> WriterCkpt {
-        WriterCkpt {
+        let mut ckpt = WriterCkpt {
             pos: self.offset.saturating_sub(self.part.len() as u64),
-            sha: self.sha1.clone(),
+            sha: None,
+            sha256: None,
             count: self.count,
             expected: self.expected,
             commit_lo: self.commit_lo,
             commit_hi: self.commit_hi,
-        }
+        };
+        ckpt.set_hash(&self.hash);
+        ckpt
     }
     /// Etags of all uploaded parts, in part order — the resume token.
     pub fn etags(&self) -> Vec<String> {
@@ -737,6 +744,11 @@ impl PackWriter {
         } else {
             (Vec::new(), state.pos)
         };
+        let hash = state.hash()?;
+        let kind = match hash {
+            CkptHash::Sha256(_) => gix_hash::Kind::Sha256,
+            CkptHash::Sha1(_) => gix_hash::Kind::Sha1,
+        };
         Ok(Self {
             mpu,
             pack: PackId(
@@ -747,7 +759,8 @@ impl PackWriter {
             offset,
             count: state.count,
             expected: state.expected,
-            sha1: state.sha.clone(),
+            hash,
+            kind,
             commit_lo: state.commit_lo,
             commit_hi: state.commit_hi,
             created_at,
@@ -1071,11 +1084,42 @@ pub mod schema {
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct WriterCkpt {
     pub pos: u64,
-    pub sha: CkptSha1,
+    /// sha1 pack state — checkpoints written before sha256 support always carry
+    /// `sha`; new sha256 checkpoints write `sha256` instead and leave this out
+    #[serde(default)]
+    pub sha: Option<CkptSha1>,
+    #[serde(default)]
+    pub sha256: Option<CkptSha256>,
     pub count: u32,
     pub expected: u32,
     pub commit_lo: u64,
     pub commit_hi: u64,
+}
+impl WriterCkpt {
+    /// The pack's hash state as the resumable hasher — sha256 wins when both
+    /// fields exist (a sha256 ckpt never writes `sha`).
+    pub fn hash(&self) -> Result<CkptHash, Error> {
+        if let Some(h) = &self.sha256 {
+            return Ok(CkptHash::Sha256(h.clone()));
+        }
+        self.sha
+            .clone()
+            .map(CkptHash::Sha1)
+            .ok_or_else(|| Error::Internal("checkpoint without hash state".into()))
+    }
+    /// Split the live hasher into whichever field its variant writes.
+    pub fn set_hash(&mut self, h: &CkptHash) {
+        match h {
+            CkptHash::Sha1(s) => {
+                self.sha = Some(s.clone());
+                self.sha256 = None;
+            }
+            CkptHash::Sha256(s) => {
+                self.sha256 = Some(s.clone());
+                self.sha = None;
+            }
+        }
+    }
 }
 
 /// FIPS 180-1 SHA-1 with serde state — `gix_hash::Hasher` state cannot be exported, so a
@@ -1148,5 +1192,178 @@ impl CkptSha1 {
             o[i * 4..i * 4 + 4].copy_from_slice(&h.to_be_bytes());
         }
         o
+    }
+}
+
+/// FIPS 180-4 SHA-256 with serde state — the resumable-pack sha1's sibling for
+/// sha256-format repos (same reason gix_hash::Hasher can't ride a checkpoint).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct CkptSha256 {
+    h: [u32; 8],
+    len: u64,
+    buf: Vec<u8>, // buf.len() < 64
+}
+impl CkptSha256 {
+    pub fn new() -> Self {
+        Self {
+            h: [
+                0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+                0x5BE0CD19,
+            ],
+            ..Self::default()
+        }
+    }
+    pub fn update(&mut self, mut d: &[u8]) {
+        self.len = self.len.wrapping_add(d.len() as u64);
+        while !d.is_empty() {
+            let n = (64usize).saturating_sub(self.buf.len()).min(d.len());
+            let (a, b) = d.split_at(n);
+            self.buf.extend_from_slice(a);
+            d = b;
+            if self.buf.len() == 64 {
+                let mut x = [0u8; 64];
+                x.copy_from_slice(&self.buf);
+                self.block(&x);
+                self.buf.clear();
+            }
+        }
+    }
+    fn block(&mut self, b: &[u8; 64]) {
+        const K: [u32; 64] = [
+            0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4,
+            0xAB1C5ED5, 0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE,
+            0x9BDC06A7, 0xC19BF174, 0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F,
+            0x4A7484AA, 0x5CB0A9DC, 0x76F988DA, 0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7,
+            0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967, 0x27B70A85, 0x2E1B2138, 0x4D2C6DFC,
+            0x53380D13, 0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85, 0xA2BFE8A1, 0xA81A664B,
+            0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070, 0x19A4C116,
+            0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
+            0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7,
+            0xC67178F2,
+        ];
+        let mut w = [0u32; 64];
+        for (i, c) in b.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let mut s = self.h;
+        for (i, wi) in w.iter().enumerate() {
+            let e1 = s[4].rotate_right(6) ^ s[4].rotate_right(11) ^ s[4].rotate_right(25);
+            let ch = (s[4] & s[5]) ^ (!s[4] & s[6]);
+            let t1 = s[7]
+                .wrapping_add(e1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(*wi);
+            let e0 = s[0].rotate_right(2) ^ s[0].rotate_right(13) ^ s[0].rotate_right(22);
+            let mj = (s[0] & s[1]) ^ (s[0] & s[2]) ^ (s[1] & s[2]);
+            let t2 = e0.wrapping_add(mj);
+            s = [t1.wrapping_add(t2), s[0], s[1], s[2], s[3].wrapping_add(t1), s[4], s[5], s[6]];
+        }
+        for (h, x) in self.h.iter_mut().zip(s) {
+            *h = h.wrapping_add(x);
+        }
+    }
+    pub fn fin(mut self) -> [u8; 32] {
+        let bits = self.len.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.buf.len() != 56 {
+            self.update(&[0]);
+        }
+        self.update(&bits.to_be_bytes());
+        let mut o = [0u8; 32];
+        for (i, h) in self.h.iter_mut().enumerate() {
+            o[i * 4..i * 4 + 4].copy_from_slice(&h.to_be_bytes());
+        }
+        o
+    }
+}
+
+/// The checkpointable hasher a PackWriter carries — the variant follows the
+/// repo's object format. Old checkpoints hold only `sha`, so WriterCkpt stores
+/// them as two optional fields rather than a tagged enum (see its comment).
+#[derive(Clone)]
+pub enum CkptHash {
+    Sha1(CkptSha1),
+    Sha256(CkptSha256),
+}
+impl CkptHash {
+    pub fn new(kind: gix_hash::Kind) -> Self {
+        match kind {
+            gix_hash::Kind::Sha256 => Self::Sha256(CkptSha256::new()),
+            _ => Self::Sha1(CkptSha1::new()),
+        }
+    }
+    pub fn update(&mut self, d: &[u8]) {
+        match self {
+            Self::Sha1(h) => h.update(d),
+            Self::Sha256(h) => h.update(d),
+        }
+    }
+    pub fn fin(self) -> Vec<u8> {
+        match self {
+            Self::Sha1(h) => h.fin().to_vec(),
+            Self::Sha256(h) => h.fin().to_vec(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FIPS 180-4 known-answer vectors: "" and "abc" — CkptSha256 is hand-rolled
+    /// crypto, so a wrong round lands as a wrong pack trailer and fsck fails.
+    #[test]
+    fn sha256_known_answers() {
+        let mut h = CkptSha256::new();
+        assert_eq!(
+            h.clone().fin().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        h.update(b"abc");
+        assert_eq!(
+            h.fin().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// The checkpoint round-trip a slice boundary relies on: split updates across
+    /// a serde round-trip must hash identically to one-shot. Both algorithms.
+    #[test]
+    fn ckpt_hash_resume_roundtrip() {
+        for kind in [gix_hash::Kind::Sha1, gix_hash::Kind::Sha256] {
+            let mut live = CkptHash::new(kind);
+            live.update(b"PACK");
+            // checkpoint mid-stream, resume into a fresh hasher, finish there
+            let mut ck = WriterCkpt {
+                pos: 4,
+                sha: None,
+                sha256: None,
+                count: 0,
+                expected: 0,
+                commit_lo: 0,
+                commit_hi: 0,
+            };
+            ck.set_hash(&live);
+            let json = serde_json::to_string(&ck).unwrap();
+            let back: WriterCkpt = serde_json::from_str(&json).unwrap();
+            let mut resumed = back.hash().unwrap();
+            resumed.update(b"\x00\x00\x00\x02rest");
+            live.update(b"\x00\x00\x00\x02rest");
+            assert_eq!(resumed.fin(), live.fin());
+        }
+    }
+
+    /// A pre-sha256 checkpoint (only `sha`) still parses and resumes.
+    #[test]
+    fn ckpt_legacy_sha_field() {
+        let json = r#"{"pos":12,"sha":{"h":[1732584193,4023233417,2562383102,271733878,3285377520],"len":0,"buf":[]},"count":0,"expected":0,"commit_lo":0,"commit_hi":0}"#;
+        let ck: WriterCkpt = serde_json::from_str(json).unwrap();
+        assert!(matches!(ck.hash().unwrap(), CkptHash::Sha1(_)));
     }
 }

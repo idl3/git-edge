@@ -165,6 +165,7 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         }
         (Method::Post, "_admin/delete") => repo_delete(&req, &env, &route, &spend).await,
         (Method::Post, "_admin/public") => repo_public(req, &env, &route, &spend).await,
+        (Method::Post, "_admin/format") => repo_format(req, &env, &route, &spend).await,
         (Method::Post, "_admin/pin") => pin_ref(req, &env, &route, "/_do/pin", &spend).await,
         (Method::Post, "_admin/unpin") => pin_ref(req, &env, &route, "/_do/unpin", &spend).await,
         (Method::Post, "_admin/import/stage") => import_stage(req, &env, &route, &spend).await,
@@ -260,35 +261,50 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend) -
         _ => return Err(Error::Protocol("service must be git-upload-pack or git-receive-pack".into())),
     };
     auth::authenticate(req, env, level, route, spend).await?; // before the DO wakes (8.1)
-    let mut refs_version = None;
     let mut w = PktWriter::default();
-    if protocol_version(req)? == Some(2) && matches!(service, Service::UploadPack { .. }) {
-        wire::write_capability_advertisement_v2(&mut w);
+    // the DO answers head+refs+the repo's object-format; v2 needs the format for
+    // its capability lines too, so both protocol paths pay the one subrequest
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    #[derive(serde::Deserialize)]
+    struct RefDto {
+        name: String,
+        target: String,
+        peeled: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RefsDto {
+        head: Option<String>,
+        refs: Vec<RefDto>,
+        obj_format: Option<String>,
+        #[serde(default)]
+        obj_format_pinned: bool,
+    }
+    let mut init = worker::RequestInit::new();
+    init.with_method(Method::Get);
+    let mut r = worker::Request::new_with_init("https://do/_do/refs", &init)
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    route.apply_headers(&mut r)?;
+    budget.charge(1)?;
+    let mut resp = stub.fetch_with_request(r).await?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp, &budget).await);
+    }
+    let refs_version = resp.headers().get("x-ge-refs-version").ok().flatten();
+    let dto: RefsDto = resp.json().await.map_err(|e| Error::Internal(e.to_string()))?;
+    let kind = match dto.obj_format.as_deref() {
+        Some("sha256") => gix_hash::Kind::Sha256,
+        _ => gix_hash::Kind::Sha1,
+    };
+    // unpinned: both formats — first write pins; pinned: the repo's own
+    let formats: &[gix_hash::Kind] = if dto.obj_format_pinned {
+        std::slice::from_ref(&kind)
     } else {
-        let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
-        #[derive(serde::Deserialize)]
-        struct RefDto {
-            name: String,
-            target: String,
-            peeled: Option<String>,
-        }
-        #[derive(serde::Deserialize)]
-        struct RefsDto {
-            head: Option<String>,
-            refs: Vec<RefDto>,
-        }
-        let mut init = worker::RequestInit::new();
-        init.with_method(Method::Get);
-        let mut r = worker::Request::new_with_init("https://do/_do/refs", &init)
-            .map_err(|e| Error::Internal(e.to_string()))?;
-        route.apply_headers(&mut r)?;
-        budget.charge(1)?;
-        let mut resp = stub.fetch_with_request(r).await?;
-        if resp.status_code() != 200 {
-            return Err(Error::from_do_response(resp, &budget).await);
-        }
-        refs_version = resp.headers().get("x-ge-refs-version").ok().flatten();
-        let dto: RefsDto = resp.json().await.map_err(|e| Error::Internal(e.to_string()))?;
+        const BOTH: [gix_hash::Kind; 2] = [gix_hash::Kind::Sha1, gix_hash::Kind::Sha256];
+        &BOTH
+    };
+    if protocol_version(req)? == Some(2) && matches!(service, Service::UploadPack { .. }) {
+        wire::write_capability_advertisement_v2(&mut w, formats);
+    } else {
         let refs: Vec<wire::RefRow> = dto
             .refs
             .into_iter()
@@ -304,7 +320,7 @@ async fn info_refs(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend) -
                 })
             })
             .collect::<Result<_, Error>>()?;
-        wire::write_advertisement_v0(&mut w, service, dto.head.as_deref().map(|s| bstr::ByteSlice::as_bstr(s.as_bytes())), &refs);
+        wire::write_advertisement_v0(&mut w, service, dto.head.as_deref().map(|s| bstr::ByteSlice::as_bstr(s.as_bytes())), &refs, formats);
     }
     let mut out = git_resp(w.out, ct)?;
     if let Some(v) = refs_version {
@@ -661,6 +677,17 @@ async fn repo_public(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spe
     git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
 }
 
+/// POST /:owner/:repo/_admin/format {object_format} — pin sha1|sha256 before the
+/// first write. How a sha256 repo is born for v0 push: pin first, then push —
+/// the advertised object-format cap names the pinned algo.
+async fn repo_format(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    auth::authenticate_admin(&req, env)?;
+    let v = json_body(&mut req).await?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    let out: serde_json::Value = stub_json(&stub, route, "/_do/format", &v, &mut budget).await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
 /// POST /:owner/:repo/_admin/pin {ref, sha} / _admin/unpin {ref} — ref pinning.
 async fn pin_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate_admin(&req, env)?;
@@ -916,6 +943,7 @@ async fn import_begin(mut req: Request, env: &Env, route: &RepoRoute, spend: &Sp
             "parts": parts,
             "principal": principal,
             "commands": commands,
+            "format": v.get("format"),
         }),
         &mut budget,
     )
@@ -1045,7 +1073,10 @@ async fn receive_inner(
         &stub,
         route,
         "/_do/push/begin",
-        &serde_json::json!({ "push_id": push.0, "principal": principal, "key": rate_key }),
+        &serde_json::json!({
+            "push_id": push.0, "principal": principal, "key": rate_key,
+            "object_format": if hdr.caps.object_format == gix_hash::Kind::Sha256 { "sha256" } else { "sha1" },
+        }),
         &mut budget,
     )
     .await?;
@@ -1071,7 +1102,7 @@ async fn receive_inner(
 
     // a post-begin failure must close the open push row now — leaving it for the
     // janitor's 1h expiry lets 64 failures DoS all pushes
-    let run = pack::run::run(body, &bucket, &stub, route, &push, &mut budget).await;
+    let run = pack::run::run(body, &bucket, &stub, route, &push, hdr.caps.object_format, &mut budget).await;
     if run.is_err() {
         let _: serde_json::Value = stub_json(
             &stub,
