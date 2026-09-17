@@ -500,6 +500,21 @@ impl RepoDo {
                 }
                 json(serde_json::json!({ "claimed": true, "repos": n, "cap": cap }))
             }
+            // The fleet sweep's enumeration step: repo names only — the claim
+            // values are timestamps nobody outside this DO needs.
+            (Method::Get, "/_owner/list") => {
+                #[derive(serde::Deserialize)]
+                struct K {
+                    key: String,
+                }
+                let repos = self
+                    .q("SELECT key FROM meta WHERE key LIKE 'claim:%' ORDER BY key", vec![])?
+                    .to_array::<K>()?
+                    .into_iter()
+                    .map(|k| k.key["claim:".len()..].to_string())
+                    .collect::<Vec<_>>();
+                json(serde_json::json!({ "repos": repos }))
+            }
             // Called by repo delete (ROADMAP #3) once that lands — frees the slot.
             (Method::Post, "/_owner/release") => {
                 self.q(

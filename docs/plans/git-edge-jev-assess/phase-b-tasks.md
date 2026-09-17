@@ -28,9 +28,9 @@ adopted-patterns:
 
 | Task | Status |
 |---|---|
-| B1 | todo |
-| B2 | todo |
-| B3 | todo |
+| B1 | done |
+| B2 | done |
+| B3 | done |
 | — done | — |
 
 ## Audit item coverage
