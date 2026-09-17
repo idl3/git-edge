@@ -1,0 +1,193 @@
+# Setting up git-edge
+
+A deterministic deploy guide: from a fresh checkout to a verified running
+service, then what to put in front of it for production.
+
+## What you're deploying
+
+One Cloudflare Worker (Rust/WASM), one Durable Object class (`RepoDo`, SQLite
+storage — one DO per repository), one R2 bucket (packfiles, staged import
+parts, LFS objects). `server/wrangler.jsonc` declares all of it; `wrangler
+deploy` creates the bucket and runs the DO migration.
+
+## Prerequisites
+
+- A Cloudflare account with Workers + R2 + Durable Objects enabled
+  (Durable Objects need a paid plan — the DO SQLite backend is not on the
+  free tier).
+- Rust toolchain with the wasm target:
+  `rustup target add wasm32-unknown-unknown`
+- Node ≥ 18 for wrangler; the repo pins it via `server/package.json`:
+  `cd server && npm ci` — `worker-build` (Rust→wasm→worker glue) comes with it.
+- `wrangler login` (or `CLOUDFLARE_API_TOKEN` for CI).
+
+## Secrets
+
+Two bearer tokens + one signing key. Set them as **secrets**, never in
+`wrangler.jsonc` — that file is committed:
+
+```bash
+cd server
+wrangler secret put GE_READ_TOKEN     # deployment-wide read (clone/fetch)
+wrangler secret put GE_WRITE_TOKEN    # deployment-wide write AND admin
+wrangler secret put GE_URL_SIGNING_KEY  # ≥32 random bytes — enables packfile-uris + LFS signed URLs
+```
+
+Generate with `openssl rand -hex 32` (or 64). `GE_URL_SIGNING_KEY` is optional
+but recommended: without it `packfile-uris` offload and LFS signed URLs are
+silently disabled, and clones past ~7 GiB wire can't complete inside the
+240 s request budget.
+
+| Credential | Can do |
+|---|---|
+| `GE_WRITE_TOKEN` | **Everything**: push anywhere, mint/revoke per-repo tokens, flip repos public, delete+purge repos, pin refs, run imports. The god credential — treat it like a root key. |
+| `GE_READ_TOKEN` | Clone/fetch every repo, including private ones. |
+| `GE_URL_SIGNING_KEY` | Not a credential users see — it signs the `/_packs/` and `/_lfs/` URLs the server mints. |
+
+## Vars (optional tuning)
+
+All have defaults; set in `wrangler.jsonc` `[vars]` or `wrangler dev --var`:
+
+| Var | Default | Meaning |
+|---|---|---|
+| `GE_QUOTA_MAX_OBJECTS` | 2,000,000 | Objects per repo |
+| `GE_QUOTA_MAX_BYTES` | 4 GiB | Stored bytes per repo (the normalized pack — undeltified ~6× the wire size) |
+| `GE_QUOTA_MAX_REPOS_PER_OWNER` | 50 | Live repo claims per `owner/` prefix |
+| `GE_RATE_PUSHES_PER_MIN` | 30 | Pushes per credential per repo per minute |
+| `GE_GC_QUIET_MS` | (ms) | Quiet period before GC consolidates after a push |
+| `GE_GC_GRACE_MS` | (ms) | Grace before dead packs are swept |
+
+`GE_METRICS` (Analytics Engine binding in `wrangler.jsonc`) is optional —
+one datapoint per request; delete the binding line if you don't want it.
+
+## Deploy
+
+```bash
+cd server
+npm ci                                   # pinned wrangler + worker-build
+wrangler r2 bucket create git-edge       # the bucket wrangler.jsonc binds
+wrangler deploy                          # builds wasm, runs the DO migration, uploads
+```
+
+The output prints the workers.dev URL. Then verify with the conformance
+suite — it is the deterministic acceptance gate, not a vibes check:
+
+```bash
+GE_URL="https://test:$GE_WRITE_TOKEN@git-edge.<acct>.workers.dev" \
+GE_CONFORMANCE_GC=1 GE_CONFORMANCE_PURGE=1 GE_CONFORMANCE_IMPORT=1 \
+GE_CONFORMANCE_LIMITS=1 GE_CONFORMANCE_LFS=1 GE_CONFORMANCE_URIS=1 \
+bash tests/conformance/run.sh     # ... == PASS
+```
+
+(LIMITS/GC want the tuning vars small — for a production verify you can skip
+those two flags, or run the full set against a staging deploy with caps.)
+
+For a custom domain, add a `routes` entry or `workers.dev` stays the endpoint.
+Custom domain recommended — see "In front" below.
+
+## First repository
+
+```bash
+REMOTE=https://git-edge.example.com
+TOKEN=$GE_WRITE_TOKEN
+
+# push works out of the box (repos are created on first push under the
+# owner's repo quota):
+git clone "$REMOTE/acme/app"   # empty — then push
+
+# mint a scoped deploy key instead of handing out the god token:
+curl -u "ci:$TOKEN" -X POST "$REMOTE/acme/app/_admin/tokens" \
+  -d '{"name":"ci-bot","level":"write","scope":"refs/heads/release-*"}'
+# -> {"token":"ge_…"} — push-only, and only to release-* refs
+
+# public read:
+curl -u "ops:$TOKEN" -X POST "$REMOTE/acme/app/_admin/public" -d '{"enabled":true}'
+
+# seed from an existing public repo — no client staging:
+curl -u "ops:$TOKEN" -X POST "$REMOTE/acme/app/_admin/import" \
+  -H 'Content-Type: application/json' -d '{"url":"https://github.com/org/repo"}'
+```
+
+Repo layout is `/:owner/:repo`; `owner` is the quota/claims namespace, not an
+ACL — real access control is per-repo tokens + public flags.
+
+## The admin surface — who can do what
+
+Everything under `/_admin/*` requires `GE_WRITE_TOKEN`. There is no separate
+admin credential: the deployment write token *is* the admin credential. That
+means the admin surface is exactly as wide as the set of people holding that
+token — which is the thing to fix for production, not with more code but by
+putting a layer in front.
+
+Data-plane endpoints (`info/refs`, `git-upload-pack`, `git-receive-pack`,
+`/_packs/<sig>`, LFS) authenticate per request: deployment read/write tokens,
+per-repo `ge_*` tokens (level + optional ref scope, enforced on every ref
+update a push or import attempts), or anonymous for public repos. `/_state`
+introspection is read-level.
+
+## What sits in front: three options, in order of effort
+
+**1. Cloudflare Access (zero code, do this).** Put an Access application over
+`*git-edge.example.com/*/_admin/*` — or over the whole hostname for an
+internal deployment. Requests without a valid Access identity (Google/GitHub/
+your SSO) are 302'd to login before they reach the Worker; the Worker still
+checks `GE_WRITE_TOKEN`, so admin becomes SSO-identity AND god-token. Free
+under 50 users. WAF custom rules are the same idea for IPs/ASNs/mTLS instead
+of identity.
+
+**2. A gateway Worker (the real control plane).** For anything multi-tenant:
+a small fronting Worker owns the mapping `user → repos → allowed ops`,
+holds `GE_WRITE_TOKEN` server-side, and mints per-repo scoped tokens on
+behalf of authenticated users. End users never see a deployment credential;
+git-edge stays the dumb-fast protocol engine. This is also where you'd put
+repo-name registration, billing, and per-user rate identity. The DO/R2 layer
+needs no changes — the gateway is just an auth translation proxy in front of
+the same routes.
+
+**3. Token discipline alone (minimum viable).** `GE_WRITE_TOKEN` lives only
+in your deploy environment + the handful of operators. Everything else —
+CI, devs, agents — gets per-repo `ge_*` tokens, optionally ref-scoped. Rotate
+by flipping the secrets (`wrangler secret put` again); repo tokens revoke via
+`DELETE /:owner/:repo/_admin/tokens/<id>`.
+
+## Production checklist
+
+- [ ] Custom domain, not the workers.dev hostname (you control the CNAME; the
+      workers.dev name is harder to retire).
+- [ ] Access or WAF rule over `/_admin/*` — the god token shouldn't be the
+      only gate on delete/purge/public.
+- [ ] `GE_URL_SIGNING_KEY` ≥ 32 random bytes — enables URI offload (clones
+      past ~7 GiB wire need it) and LFS signed URLs.
+- [ ] Quotas set deliberately: the defaults assume repos up to TypeScript
+      scale (18 GiB normalized). If you don't want that, lower
+      `GE_QUOTA_MAX_BYTES`.
+- [ ] R2 lifecycle rule on the bucket to abort incomplete multipart uploads —
+      crashed staged writes can orphan MPU parts (see HANDOFF.md for the
+      reclaim recipe; a lifecycle rule makes it automatic).
+- [ ] Rotate the deployment secrets on a schedule; per-repo tokens have their
+      own revoke path.
+- [ ] `GE_METRICS` bound if you want request telemetry in Analytics Engine.
+- [ ] Run the conformance suite against the deployed URL after every deploy —
+      it's the regression gate.
+
+## Failure modes worth knowing
+
+- **A stalled host outlives a push lease.** In-flight imports heartbeat per
+  slice; if the DO can't write for ~an hour the janitor legitimately expires
+  the push and sweeps the run. In practice: only a DO storage outage does
+  this — the import just needs re-POSTing.
+- **Inline clone wall.** A single HTTP request has a 240 s budget; verbatim
+  sideband streams ~32 MiB/s, so packs past ~7 GiB wire need
+  `fetch.uriprotocols` to negotiate the signed `/_packs/` offload (needs the
+  signing key, and the client's allowed scheme must match — `http` for
+  localhost, `https` in production).
+- **URL imports fetch public remotes only** — no credentials are sent, and
+  `http` URLs must be loopback. A private GitHub repo needs the staged-pack
+  path instead.
+
+## Teardown
+
+`wrangler delete` removes the Worker; the DOs and R2 objects are billed until
+the bucket is emptied/deleted (`wrangler r2 bucket delete git-edge`) — repo
+deletes tombstone+sweep per-repo, but retired deployments need the bucket
+gone too.

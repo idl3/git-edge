@@ -1,0 +1,12 @@
+# copy to .dev.vars for `wrangler dev` — same names as `wrangler secret put`
+GE_READ_TOKEN=read-test-token
+GE_WRITE_TOKEN=write-test-token
+GE_URL_SIGNING_KEY=dev-only-signing-key-32-bytes-minimum-ok
+
+# optional tuning (defaults in parens) — see SETUP.md
+# GE_QUOTA_MAX_OBJECTS=2000000
+# GE_QUOTA_MAX_BYTES=4294967296
+# GE_QUOTA_MAX_REPOS_PER_OWNER=50
+# GE_RATE_PUSHES_PER_MIN=30
+# GE_GC_QUIET_MS=…
+# GE_GC_GRACE_MS=…

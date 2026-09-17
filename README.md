@@ -123,6 +123,7 @@ The 56 proofs were written in TypeScript. We then asked whether the server can b
 | `server/` | The working server: the contract compiled to a Rust/WASM Cloudflare Worker, tested with real git | Engineers. |
 | `.devin/skills/git-edge/` | The agent skill: how to clone, push, import, and manage repos on a deployment (tokens, staged pushes, lifecycle endpoints, limits) | Agents operating a deployment. |
 | `tools/` | `git-edge-import.sh`: staged-push importer for repos too big for one request | Operators. |
+| `SETUP.md` | Deploy guide: secrets, vars, `wrangler deploy`, conformance verification, the admin surface, and what to put in front for production | Operators. |
 | `COMPATIBILITY.md` | Every git feature the server speaks, what it does not, and the limits | Everyone. |
 | `PRODUCTION-UAT.md` | The runnable deploy-and-verify checklist: gates, live battery, limits sign-off, rollback | Operators. |
 | `ROADMAP.md` | Prioritized backlog scoped to the agent-built small/disposable-app profile, plus the public-repo fit benchmark | Everyone. |
