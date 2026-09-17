@@ -85,8 +85,8 @@ Exact wire rules, all enforced inside `wire` and tested against real `git` (sect
 2. Sideband frames carry at most 65515 data bytes. Progress and error frames are single frames.
 3. v2 `fetch` response: `acknowledgments` section is **omitted entirely** when the client sent `done`. Otherwise it is `acknowledgments\n`, then `NAK\n` or one `ACK <oid>\n` per known have, then `ready\n` if a pack follows. If no pack follows, the response ends with flush after the section. If a pack follows: delim, optional `shallow-info` section, delim, `packfile\n`, sideband frames, flush. `response-end` is never written over smart HTTP.
 4. `report-status` and `report-status-v2` bodies are written in band 1 when `caps.side_band_64k` is true, else as raw pkt-lines. Both end with a flush. Under sideband the final flush is written after the last band-1 frame, outside the band.
-5. v0 receive-pack advertisement: `# service=git-receive-pack\n`, flush, then `<oid> <ref>\0<caps>\n` for the first ref, `<oid> <ref>\n` for the rest, flush. Empty repo: `<40 zeros> capabilities^{}\0<caps>\n`. Advertised receive caps, exactly: `report-status report-status-v2 delete-refs side-band-64k quiet ofs-delta object-format=sha1 agent=git-edge/0.1`. Not advertised: `atomic`, `push-options`.
-6. v2 capability advertisement, exactly: `version 2`, `agent=git-edge/0.1`, `ls-refs=unborn`, `fetch=shallow filter`, `object-format=sha1`, flush. Not advertised: `wait-for-done`, `ref-in-want`, `sideband-all`, `packfile-uris`, `server-option`.
+5. v0 receive-pack advertisement: `# service=git-receive-pack\n`, flush, then `<oid> <ref>\0<caps>\n` for the first ref, `<oid> <ref>\n` for the rest, flush. Empty repo: `<40 zeros> capabilities^{}\0<caps>\n`. Advertised receive caps, exactly: `report-status report-status-v2 delete-refs side-band-64k quiet ofs-delta atomic object-format=sha1 agent=git-edge/0.1`. Not advertised: `push-options`.
+6. v2 capability advertisement, exactly: `version 2`, `agent=git-edge/0.1`, `ls-refs=unborn`, `fetch=shallow filter packfile-uris`, `object-format=sha1`, flush. Not advertised: `wait-for-done`, `ref-in-want`, `sideband-all`, `server-option`.
 7. Upload-pack is v2 only. A `GET info/refs?service=git-upload-pack` without `Git-Protocol: version=2` gets the v0 advertisement with capabilities `object-format=sha1 agent=git-edge/0.1` only. A v0 `POST git-upload-pack` gets HTTP 400 with body `ERR protocol v2 required (git >= 2.26)\n` as one pkt-line.
 8. `Git-Protocol: version=1` is answered as v0 with a leading `version 1\n` pkt (upload-pack) or ignored (receive-pack).
 
@@ -100,6 +100,7 @@ pub struct ObjLoc { pub pack: PackId, pub idx: u32, pub offset: u64, pub len: u3
 pub mod keys {   // pure functions
     pub fn pack(repo: &RepoId, pack: &PackId) -> String;            // r/<repo>/packs/<pack>.pack
     pub fn pending(repo: &RepoId, push: &PushId) -> String;         // r/<repo>/pending/<push>.pack
+    pub fn pending_part(repo: &RepoId, push: &PushId, part: &str);  // r/<repo>/pending/<push>.part-<part>
 }
 pub mod codec {  // sync, no worker imports
     /// Encodes one full (non-delta) pack entry: varint type/size header + zlib(data). Returns entry bytes.
@@ -219,6 +220,7 @@ Why full objects: a reader resolves any SHA with one SQLite lookup plus **one R2
 ```
 r/<repo_id>/packs/<pack_id>.pack        normalized pack, immutable once the packs row is live
 r/<repo_id>/pending/<push_id>.pack      raw pack bytes exactly as received (thin, deltas, gzip removed), scratch
+r/<repo_id>/pending/<push_id>.part-<n>  staged import parts (A31) — same push prefix so the sweep gets them all
 ```
 
 `repo_id` comes from the DO `meta` table (section 8), never from `ctx.id.name`, never from the URL. Nothing else is ever written to R2 by the foundation. R2 `customMetadata` on a pack: `{ "repo": repo_id, "pack": pack_id, "count": "<n>", "created_at": "<unix ms>" }`. Metadata is informational for operators; no code path reads it.
@@ -323,7 +325,7 @@ Ordering, strictly: (1) pack durable in R2 (`finish` returned); (2) all `objects
 
 Atomicity of the span: all statements above execute with no await between them. Measured (#4): eight concurrent DO calls that read, awaited R2, then wrote lost seven updates; the same eight with a synchronous SQL CAS after the await had exactly one winner. The platform commits the writes of one sync span atomically and rolls them back if the handler throws before its next await (memo, section 1; gc review "per-invocation write rollback on throw"). Whether `worker` 0.8.5 binds `transactionSync` is **unverified**; if it does, the span is additionally wrapped in it. If it does not, the span still holds because no other DO event can run inside it.
 
-Multi-ref semantics: **per-ref, independent, in client order**, which is git's default. `atomic` is not advertised (section 1.1 rule 5), so a client never expects all-or-nothing. A ref name that fails `gix_validate` or targets a non-live object gets `ng` for that ref only. Ref deletion of `HEAD`'s target is refused with `ng refs/heads/main deletion of the current branch prohibited`.
+Multi-ref semantics: **per-ref, independent, in client order** by default (git's behavior). When the client sent `atomic` (advertised per rule 5), step 4 runs twice: a read-only dry pass validates every command — the CAS predicates become `SELECT target` comparisons — and any failure rejects the whole push; failing refs keep their `ng` reason, the rest get `ng <ref> atomic push failed`, the promoted pack demotes back to `ingesting` for the janitor, and no refs write, `refs_version` bump, or gc enqueue happens. A ref name that fails `gix_validate` or targets a non-live object gets `ng` for that ref only. Ref deletion of `HEAD`'s target is refused with `ng refs/heads/main deletion of the current branch prohibited`.
 
 The connectivity result and the `objects` presence check are decided before the span (section 2.5) and re-guarded by `gc_epoch` in step 2. That is what makes a sweep between lookup and commit harmless: the push is rejected, not accepted with a hole.
 
@@ -357,7 +359,7 @@ Constants: `GRACE = 1 h`, `PUSH_TIMEOUT = 1 h`, `GC_QUIET = 10 min`.
 **Janitor** (every 15 min, one slice each):
 1. `UPDATE pushes SET state='expired', ended_at=now WHERE state='open' AND began_at < now - PUSH_TIMEOUT` (sync).
 2. For each pack with `state='ingesting'` whose push is `expired` or `rejected`: in one sync span set `state='dead', dead_at=now` and delete its `objects` rows.
-3. Delete R2 keys: `pending/<push>.pack` for every push not `open` and older than GRACE; `packs/<id>.pack` for every pack `dead` with `dead_at < now - GRACE`, then delete the `packs` row. At most 400 keys per slice, 1,000 per `Bucket::delete` call.
+3. Delete R2 keys: every key under `pending/<push>.` (the `.pack` and any `.part-*` staged parts) for every push not `open` and older than GRACE; `packs/<id>.pack` for every pack `dead` with `dead_at < now - GRACE`, then delete the `packs` row. At most 400 pushes/keys per slice, 8 list pages of 100 keys per push per pass — an unfinished prefix stays `swept_at NULL` and re-sweeps next pass.
 The list of keys in step 3 is built from SQLite rows in the same slice, but each deleted key has been `dead`/not-`open` for at least GRACE, which is longer than any request can live. "Never delete in the same slice that listed" therefore means: **R2 deletion only ever targets rows that a previous slice, at least GRACE earlier, marked dead.** Marking and deleting never happen in one slice.
 
 **GC** (`GcMark` -> `GcConsolidate` -> `GcSweep`), enqueued 10 min after a ref change:
@@ -517,7 +519,7 @@ Each revised proof names the scenarios it must pass, and adds at most two scenar
 The following are not built, not advertised, and must not be assumed by a revised proof of the 33 non-foundation ideas:
 
 - Delta compression at rest or on the wire (all packs are full-object; `thin-pack` is accepted from clients, never sent).
-- `atomic` push, `push-options`, `report-status-v2` option lines, `wait-for-done`, `ref-in-want`, `sideband-all`, `packfile-uris`, `bundle-uri`, `object-info`, `server-option`.
+- `push-options`, `report-status-v2` option lines, `wait-for-done`, `ref-in-want`, `sideband-all`, `packfile-uris`, `bundle-uri`, `object-info`, `server-option`.
 - Protocol v0/v1 upload-pack negotiation (`multi_ack_detailed`, `no-done`).
 - `deepen-since`, `deepen-not`, `deepen-relative`, `tree:<n>` and `sparse:` filters, `include-tag` beyond peeled tags of wanted commits.
 - Objects larger than 32 MiB inflated, LFS, presigned uploads, repository imports.
@@ -945,3 +947,184 @@ Continuing the audit-fix numbering (last: A16).
   reject — falls back to `send_set`, which produces the proper response.
   Mid-stream failures degrade exactly like step 6's: one band-3 `ERR` frame,
   then the stream ends.
+- **A30. `packfile-uris` offload (amends section 9 step 6, sits atop A29).**
+  The v2 advertisement lists `packfile-uris` among `fetch`'s features; an
+  opted-in client (git >= 2.40 with `fetch.uriprotocols` set) then sends one
+  `packfile-uris <csv>` argument naming acceptable URI schemes. When the A29
+  gate holds AND the client's list admits the request's own scheme AND
+  `GE_URL_SIGNING_KEY` is configured at >= 32 bytes (a shorter value
+  silently disables the feature; set it with `wrangler secret put`, not
+  `[vars]`) AND the edge forwarded the public origin (`x-ge-base`), the
+  DO answers with a `packfile-uris` section —
+  `<trailer-sha1> <uri>` per the spec's `40-HEXDIGIT SP uri` line — followed
+  by a `packfile` section containing a valid zero-object pack, which the
+  client index-packs regardless. The URI is
+  `GET /<owner>/<repo>/_packs/<id>.pack?e=<exp>&r=<repo_id>&s=<sig>`: the
+  signature is HMAC-SHA256 over `v1\n<repo_id>\n<pack>\n<exp>` keyed by
+  `GE_URL_SIGNING_KEY`, TTL one hour. URI fetches carry no auth headers by
+  protocol design, so `s` is the credential — a bearer capability: anyone
+  holding the URL reads that pack until `e`, independent of later token
+  revocation. Minting is delegation: a read-token holder may hand the URL
+  to a third party for the TTL, and (like A29) the pack is the verbatim
+  superset, so objects unreachable from current refs ride along. Binding
+  to the opaque `repo_id` (not the route name) means a deleted+recreated
+  repo invalidates its old sigs. `e`, `r`, and `s` are validated before
+  any R2 read; failures are 403 (bad/expired sig) or 404 (feature off,
+  bad name, missing object). The route enforces time, not pack state — a
+  sig minted just before consolidation can serve the dead pack until `e`
+  or the janitor's R2 delete, whichever comes first. Responses carry
+  `Cache-Control: private, no-store`; the URL is a credential. The pack
+  body streams via `response_body` — one subrequest, no CPU burn on the
+  edge. Any missing precondition falls through to the A29 verbatim
+  stream, and so does a failed trailer read — degrading beats failing a
+  fetch that could still be served. Hash tokens are the packs' real
+  trailer SHA-1s (last 20 bytes — one range read): `git http-fetch
+  --packfile` dies on a checksum mismatch, so a corrupt or stale pack
+  surfaces loudly rather than silently. Rotating `GE_URL_SIGNING_KEY`
+  invalidates outstanding URLs instantly — expected, but worth knowing:
+  a clone mid-URI-fetch dies and retries cleanly. Clients that never opt
+  in see no behavioral change; the feature degrades to A29.
+- **A31. Server-side resumable import (`import_pack` job; I1).** For packs
+  no client push can slice — the TypeScript-class case is one commit
+  introducing ~222k objects — the owner stages pack parts into R2 and the DO
+  ingests them across alarm slices, ending in the same `commit_push` a live
+  push gets (atomic semantics, per-ref results, janitor lifecycle).
+  - `POST /<o>/<r>/_admin/import/stage` (write token) streams one part to
+    `r/<repo_id>/pending/<push>.pack` via a RawWriter MPU and answers
+    `{push, key, bytes}`; the call opens the `pushes` row. Later parts of
+    the same import pass `?push=<id>&part=<name>` — push begin is
+    idempotent for an `open` push under the same principal (a closed push
+    is 409, a foreign one 403) and the part lands at
+    `pending/<push>.part-<name>`. Sharing one push is required: the import
+    job heartbeats only its own `began_at`, so parts parked on separate
+    stage pushes would expire at PUSH_TIMEOUT and be swept mid-import.
+  - `POST /<o>/<r>/_admin/import` (write token) takes
+    `{push, parts: [{key,bytes}], commands: [{old,new,name}]}`; every part
+    key must sit under that repo's `pending/` namespace (the bucket is
+    shared — an unchecked key would read across tenancy) and commands must
+    parse — both fail 400 at enqueue, not mid-job. A start on an unknown or
+    non-`open` push is 409. A start while a queued/running `import_pack`
+    already owns the push is idempotent: it returns the existing job's
+    pack id instead of planting a second `ingesting` row.
+  - The payload's `principal` comes from the `pushes` row, not the request
+    body — a replayed start can't rewrite who the reflog credits.
+  - **Pass A** parses entry headers + zlib boundaries off the staged parts
+    into `import_toc` (one row per entry: input offset, header length,
+    kind/delta aux, compressed length, size). The cursor is `(parse_pos,
+    next_idx)` — always an entry boundary; inserts are `INSERT OR REPLACE`
+    so a crashed slice replays cleanly. The staged pack's trailer is read
+    but not re-hashed: per-entry adler32 already vetted the bytes and a
+    second pass costs GiBs of reads (same trade as the edge path, which
+    does hash — the delta is documented).
+  - **Pass B** resolves each TOC entry against the staged bytes and
+    appends the normalized (non-delta) object to an output `PackWriter`
+    MPU. In-pack OFS bases resolve by offset; REF bases resolve through
+    `objects` rows plus the current slice's in-memory ids; a REF base not
+    yet emitted parks the entry until its base id resolves (`run_wakes`
+    drains transitively). External (thin-pack) bases resolve through the
+    live index exactly like 2.4.
+  - **Durable state** = uploaded R2 parts (`import_parts` etags) plus the
+    `WriterCkpt` in the job cursor; `objects`/`push_links`/`import_open`
+    rows. `import_open` marks an entry's output start at first append and
+    seals `(end, sha)` when its `ObjRow` is cut — an entry counts done iff
+    `end <= durable` or its objects row exists (dup-sha dedup keeps no
+    second row). Every slice re-derives: delete objects rows past the
+    durable boundary, restore fully-durable lost rows straight from shadow
+    cols (the writer can't write out of order, so no byte replay), and
+    frag-resume the one straddling entry at `skip = durable - off`. A
+    boundary entry can never legitimately `Await` — its base necessarily
+    emitted before its own bytes — so a deferral there is `Internal`, not
+    a park.
+  - Objects rows may run ahead of the durable prefix inside a slice; that
+    is safe because only the resume-time delete treats them as lost — the
+    checkpoint itself never deletes live buffered state.
+  - The `check` phase pages `push_links` (1k/page) and accepts each sha
+    that resolves in a live pack or the importing pack's own rows — the
+    same 2.5 contract as `push_index`, minus the 1M in-memory cap (job
+    links cap at 8M staged rows).
+  - The `commit` slice drains whatever the resolve tail left undurable
+    (the <PART buffer no mid-run checkpoint can upload), finishes the MPU,
+    posts real pack meta over the `ingesting` placeholder, refreshes the
+    push's `gc_epoch` (import reads are lazy across slices, so the
+    begin-time capture is stale by construction), and calls `commit_push`.
+    Every commit outcome is terminal: the MPU is consumed either way and
+    the `pushes` row records the truth; cleanup of `push_links` /
+    `import_toc` / `import_parts` / `import_open` / staged parts runs on
+    acceptance and rejection alike.
+  - Each slice heartbeats `pushes.began_at`; the janitor's orphan reaper
+    keys on `packs.push_id` (NULL `pushes.pack_id` would flag an active
+    import's pack abandoned). A dead job's MPU is aborted and its staging
+    swept in bounded janitor batches.
+  - `GET /<o>/<r>/_admin/import/<push>` reports `{push_state, job_state,
+    job_phase, attempts, last_error, objects_done, objects_total, result}`.
+- **A32. GC yield-persisted tail (`gc_tail`; amends A14/5.2).** A mid-slice
+  checkpoint still rewinds `(ci, idx, frag)` to the durable boundary, but a
+  *yield* must not depend on having drained a part: a pack whose marked
+  bitmap is sparse (~1 R2 read per entry) buffers under 8 MiB inside the
+  request budget, so a rewind-only cursor replays the same span every slice
+  forever. On `Flow::Yield` the undrained `<PART` buffer is chunked into
+  `gc_tail` (64 KiB rows) and `gc.pos` keeps the scan cursor plus a separate
+  durable-boundary triple `(bci, bidx, bfrag)`; `pos.tail` is the tail's
+  byte length. Resume loads the rows back into the writer wholesale —
+  `WriterCkpt` still describes only uploaded bytes, `pos.ord0` re-counts
+  the tail's completed entries from `objects` rows so `count`/commit spans
+  and ordinals continue exactly. A tail that reads back short or absent
+  while `pos.tail > 0` is corrupt — the scan rewinds to `(bci, bidx,
+  bfrag)` and replays deterministically; rows the replay re-appends are
+  deduped by `insert_objects`' ON CONFLICT. `gc_parts` is pruned to
+  `st.pos / PART` on every persist so etags from a slice that died before
+  its checkpoint can't rebind to wrong part numbers. All GC wipe paths —
+  mark-cycle start, sweep reschedule, begin_build early-outs, rebuild,
+  finish — delete `gc_tail` with the rest.
+  The import resolver has the same hazard with the same fix
+  (`import_tail(push_id, seq, blob)`, cursor `scan_after` + `tail`):
+  `scan_after` keeps the TOC queue scan monotonic so resume never re-walks
+  the completed prefix, `tail` is the persisted `<PART` buffer length.
+  Ordering differs from GC because the import can re-run a boundary entry
+  mid-body: the `lost`-writers pass runs at `out.offset()==durable` first;
+  if any entry needs the straddler re-run (`end IS NULL` past the boundary),
+  the tail is discarded rather than restored — its bytes belong to offsets
+  the re-run would overwrite. Otherwise the tail loads back wholesale,
+  `import_open` rows inside `[durable, durable+tail)` supply the completed
+  count and commit span, and the requeue bound becomes `durable+tail_len`.
+  `import_tail` dies with the push on abort, rebuild, terminal cleanup, and
+  janitor sweep.
+
+- **A33. Git LFS basic transfer (`/_do/lfs/batch`, `/_lfs/<oid>`).** The
+  standard LFS batch endpoint
+  `POST /<owner>/<repo>/info/lfs/objects/batch` answers per the spec:
+  `{transfer:"basic", hash_algo:"sha256", objects:[…]}`. The edge
+  authenticates at the level the `operation` implies (`download` → read or
+  `public`, `upload` → write) then forwards the body to the DO with
+  `x-ge-base`; the DO does an R2 `head` per object under
+  `r/<repo_id>/lfs/<oid>` and mints action hrefs
+  `GET|PUT /<owner>/<repo>/_lfs/<oid>?e=<exp>&r=<repo_id>&s=<sig>` signed
+  with the A30 key under a `lfs`-domain-separated message that binds
+  repo_id + oid + expiry + HTTP op — a download sig cannot upload. Objects
+  already present get no upload action; missing downloads get a per-object
+  `{code:404}`. Upload batches are quota-checked as `packs + lfs + declared
+  new bytes ≤ GE_QUOTA_MAX_BYTES`. LFS keys sit under the repo's `r/<id>/`
+  prefix so delete/purge takes them too. No `verify` callback, locking
+  API, or custom transfer adapters; a deployment without
+  `GE_URL_SIGNING_KEY` answers 403 on every batch.
+
+- **A34. Import dead-upload recovery (amends I1).** The output MPU can
+  die independently of the job cursor — aborted by a failing `finish`,
+  reaped server-side, or lost with the isolate — and
+  `resume_multipart_upload` is lazy, so a dead upload only surfaces at
+  the first `upload_part`/`complete` touching it, anywhere inside a
+  resolve or commit slice. `run_slice` catches that error shape
+  (`multipart upload … not exist` / `NoSuchUpload`) and probes the pack
+  key: if the object exists, the dead slice's `complete()` won and
+  commit runs straight from the posted `import_open` spans; otherwise
+  `import_parts`/`import_open`/`import_tail`/`objects` are wiped,
+  `scan_after` resets to -1, and resolve re-emits the pack onto a fresh
+  MPU — deterministic bytes make the rebuild safe, just slow. The
+  import finishes through `finish_resumable`, which leaves the MPU
+  alive on a mid-finish failure (transient part upload, a check fixed
+  in a later build) so the retry re-finishes from the checkpoint;
+  non-resumable callers keep the aborting `finish` so a failed inline
+  push can't orphan an upload. A pushes row that is no longer `open`
+  ends the job `Done` rather than erroring — a crash between
+  `commit_push` and the fenced job-row delete must not dead-letter an
+  import that already committed.

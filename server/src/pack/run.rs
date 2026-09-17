@@ -86,7 +86,13 @@ pub async fn run(
     };
     let pending = keys::pending(&bucket.repo, push);
     let tail = match super::ingest::resolve_and_normalize(
-        bucket, &pending, &entries, &external, &mut out, &mut sink, budget,
+        bucket,
+        &pending,
+        &entries,
+        super::ingest::Externals::Map(&external),
+        &mut out,
+        &mut sink,
+        budget,
     )
     .await
     {

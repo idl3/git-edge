@@ -26,6 +26,8 @@ const BATCH_N: usize = 90; // idx batch, <= A6's 100 bound params
 /// One buffered read's ceiling: entries with more wire bytes than this are copied
 /// fragment-by-fragment instead of through read_entries (which reads whole entries).
 const SPAN: u64 = 8 << 20;
+/// gc_tail row size — under the SqlStorage value ceiling; a <PART tail is ~100 rows.
+const TAIL_CHUNK: usize = 64 << 10;
 
 #[derive(serde::Deserialize)]
 struct N {
@@ -85,10 +87,25 @@ struct Pos {
     st: Option<WriterCkpt>,
     /// bytes of the in-flight streamed entry already appended at the last
     /// checkpoint — 0 means the next copy of cands[ci].idx starts at its offset.
+    /// When `tail > 0`, (ci,idx,frag) name the scan position instead of the
+    /// durable boundary: the undrained tail bytes live in gc_tail and resume
+    /// continues from here without replaying.
     frag: u64,
     total: u32,
     lo: i64,
     hi: i64,
+    /// length of the undrained buffer persisted to gc_tail at the last yield —
+    /// 0 means the writer held nothing undrained (or the cursor predates tails).
+    tail: u64,
+    /// durable-boundary entry (bci,bidx,bfrag) for the replay fallback taken
+    /// when a persisted tail is missing/corrupt — only meaningful when tail > 0.
+    bci: u32,
+    bidx: u32,
+    bfrag: u64,
+    /// runtime-only: entries already completed inside a just-loaded tail —
+    /// skipped on persist, set by the resume path, consumed once by `build`.
+    #[serde(skip)]
+    ord0: u32,
 }
 
 /// One appended entry's span in the NEW pack — the durable-cursor lookup table.
@@ -197,7 +214,7 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
             return Ok(SliceOutcome::Reschedule { run_at: now_ms() + d.gc_quiet_ms() });
         }
         let now = now_ms();
-        for t in ["marked", "gc_frontier", "gc_seen", "gc_parts"] {
+        for t in ["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail"] {
             exec(&sql, &format!("DELETE FROM {t}"), vec![])?;
         }
         exec(&sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
@@ -368,7 +385,7 @@ fn abort(d: &RepoDo, sql: &SqlStorage) -> Result<SliceOutcome, Error> {
             vec![now_ms().into(), p.into()],
         )?;
     }
-    for t in ["marked", "gc_frontier", "gc_seen", "gc_parts"] {
+    for t in ["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail"] {
         exec(sql, &format!("DELETE FROM {t}"), vec![])?;
     }
     exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
@@ -422,7 +439,7 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
             }
             pos.upload.clear();
         }
-        let out = if pos.upload.is_empty() {
+        let mut out = if pos.upload.is_empty() {
             let w = PackWriter::create(&bucket, &key, pos.total, &mut budget.req).await?;
             pos.upload = w.upload_id().await;
             // persist immediately: a kill before the first checkpoint would otherwise
@@ -441,6 +458,78 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
             )
             .await?
         };
+        // Fold a yield-persisted tail back in. (bci,bidx,bfrag) is the durable
+        // boundary recorded beside the scan cursor: a short/corrupt tail can't be
+        // trusted, so the fallback rewinds the scan to it and replays — the rows
+        // and etags the tail covered were already posted, and replay is
+        // byte-identical, so insert_objects' ON CONFLICT absorbs them.
+        #[derive(serde::Deserialize)]
+        struct TB {
+            #[serde(with = "serde_bytes")]
+            blob: Vec<u8>,
+        }
+        let tail: Vec<u8> = exec(&sql, "SELECT blob FROM gc_tail ORDER BY seq", vec![])?
+            .to_array::<TB>()?
+            .into_iter()
+            .flat_map(|r| r.blob)
+            .collect();
+        exec(&sql, "DELETE FROM gc_tail", vec![])?;
+        if pos.tail > 0 {
+            let base = pos.st.as_ref().map(|s| s.pos).unwrap_or(0);
+            if tail.len() as u64 == pos.tail {
+                #[derive(serde::Deserialize)]
+                struct Tally {
+                    n: i64,
+                }
+                #[derive(serde::Deserialize)]
+                struct CSpan {
+                    lo: Option<i64>,
+                    hi: Option<i64>,
+                }
+                // entries that completed inside the tail posted their rows at the
+                // yield — count them so the writer's totals and the build ordinal
+                // pick up where the slice left off
+                let n: u32 = exec(
+                    &sql,
+                    "SELECT COUNT(*) AS n FROM objects WHERE pack_id=? AND offset+len>? AND offset+len<=?",
+                    vec![
+                        pos.pack.clone().into(),
+                        i64::try_from(base).unwrap_or(0).into(),
+                        i64::try_from(base.saturating_add(pos.tail)).unwrap_or(i64::MAX).into(),
+                    ],
+                )?
+                .to_array::<Tally>()?
+                .into_iter()
+                .next()
+                .map(|t| u32::try_from(t.n).unwrap_or(0))
+                .unwrap_or(0);
+                let cs = exec(
+                    &sql,
+                    "SELECT MIN(offset) AS lo, MAX(offset+len) AS hi FROM objects \
+                     WHERE pack_id=? AND offset+len>? AND offset+len<=? AND kind=1",
+                    vec![
+                        pos.pack.clone().into(),
+                        i64::try_from(base).unwrap_or(0).into(),
+                        i64::try_from(base.saturating_add(pos.tail)).unwrap_or(i64::MAX).into(),
+                    ],
+                )?
+                .to_array::<CSpan>()?
+                .into_iter()
+                .next()
+                .unwrap_or(CSpan { lo: None, hi: None });
+                out.resume_tail(
+                    &tail,
+                    n,
+                    cs.lo.and_then(|v| u64::try_from(v).ok()).unwrap_or(u64::MAX),
+                    cs.hi.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
+                );
+                pos.ord0 = n;
+            } else {
+                // tail bytes lost/short — replay from the durable boundary
+                (pos.ci, pos.idx, pos.frag) = (pos.bci, pos.bidx, pos.bfrag);
+            }
+            pos.tail = 0;
+        }
         match build(d, &sql, &bucket, &key, out, &mut pos, job, budget).await? {
             Flow::Yield => return Ok(SliceOutcome::Continue { cursor: "{}".into() }),
             Flow::Done => return Ok(SliceOutcome::Done),
@@ -469,12 +558,30 @@ async fn build(
         .map(|r| r.pack_id)
         .collect();
     let (mut staged, mut bm): (Vec<ObjRow>, (u32, Vec<u8>)) = (vec![], (u32::MAX, vec![]));
-    let mut ordinal: u32 = pos.st.as_ref().map(|s| s.count).unwrap_or(0);
+    // ord0 = entries that completed inside a just-loaded tail — their ordinals are
+    // already spent; the next scanned entry continues after them
+    let mut ordinal: u32 = pos
+        .st
+        .as_ref()
+        .map(|s| s.count)
+        .unwrap_or(0)
+        .saturating_add(pos.ord0);
     // appended-entry spans + the in-flight entry: the durable-cursor table for flush
     let mut spans: VecDeque<Span> = VecDeque::new();
     let mut cur: Option<Span> = None;
     loop {
         if budget.spent_80pct() {
+            // persist_tail: the undrained buffer must survive the slice or a
+            // sparse mark set (≈1 read/entry) can never buffer a full part —
+            // gc.pos would replay the same span every slice forever
+            if let Some(f) = flush(
+                d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job, budget,
+                true,
+            )
+            .await?
+            {
+                return Ok(f);
+            }
             return Ok(Flow::Yield);
         }
         let mut idxs: Vec<u32> = Vec::new();
@@ -530,7 +637,17 @@ async fn build(
         let locs: Vec<(ObjectId, ObjLoc)> = rows.iter().map(loc).collect::<Result<_, _>>()?;
         for chunk in chunks(&locs) {
             if budget.spent_80pct() {
-                return Ok(Flow::Yield); // the inner batch can run ~90 reads — still bounded
+                // the inner batch can run ~90 reads — still bounded; persist_tail
+                // carries the undrained buffer into the next slice
+                if let Some(f) = flush(
+                    d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job,
+                    budget, true,
+                )
+                .await?
+                {
+                    return Ok(f);
+                }
+                return Ok(Flow::Yield);
             }
             // An entry too big for one buffered read can't ride read_entries (it
             // materializes whole entries and refuses > 48 MiB). Small entries coalesce
@@ -571,12 +688,11 @@ async fn build(
                     let mut p = l.offset.saturating_add(pos.frag);
                     while p < end {
                         if budget.spent_80pct() {
-                            // try to checkpoint the progress first — flush persists
-                            // the durable cursor in the same span as the part etags
-                            // + WriterCkpt
+                            // persist the tail so mid-entry progress survives: the
+                            // frag bytes already buffered go to gc_tail
                             if let Some(f) = flush(
                                 d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur,
-                                job, budget,
+                                job, budget, true,
                             )
                             .await?
                             {
@@ -600,7 +716,7 @@ async fn build(
                         pos.frag = p.saturating_sub(l.offset);
                         if let Some(f) = flush(
                             d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur,
-                            job, budget,
+                            job, budget, false,
                         )
                         .await?
                         {
@@ -649,6 +765,7 @@ async fn build(
             // whole 90-entry batch (~1.4 GiB of buffered pack bytes) and OOM the isolate
             if let Some(f) = flush(
                 d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job, budget,
+                false,
             )
             .await?
             {
@@ -667,6 +784,7 @@ async fn build(
         }
         if let Some(f) = flush(
             d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job, budget,
+            false,
         )
         .await?
         {
@@ -678,10 +796,16 @@ async fn build(
 /// Upload every full PART-sized part, then commit — one span — the rows, the etags and
 /// the position. Parts are uniform because R2 rejects complete() when non-final part
 /// sizes differ. The durable boundary (WriterCkpt.pos = appended minus buffered) can
-/// land mid-entry and even inside an entry that finished copying: the persisted cursor
-/// rewinds (ci, idx, frag) to the entry containing that byte — and st.count to its
-/// ordinal — so a resume re-copies only bytes that were never uploaded. The in-memory
-/// pos keeps the appended cursor; only the serialized copy rewinds.
+/// land mid-entry and even inside an entry that finished copying.
+///
+/// `persist_tail=false` (mid-slice): the persisted cursor rewinds (ci, idx, frag) to
+/// the entry containing the boundary — a resume re-copies only bytes that were never
+/// uploaded. `persist_tail=true` (yield): the undrained <PART tail is written to
+/// gc_tail and the cursor instead records the *scan* position plus the boundary
+/// entry separately (bci/bidx/bfrag) — a resume loads the tail into the writer and
+/// continues without replaying. Without it a sparse-mark pack (≈1 read per entry)
+/// can never buffer a whole part inside the request budget: every slice would
+/// re-copy the same undrained span forever.
 async fn flush(
     d: &RepoDo,
     sql: &SqlStorage,
@@ -694,6 +818,7 @@ async fn flush(
     cur: &Option<Span>,
     job: &Job,
     budget: &mut SliceBudget,
+    persist_tail: bool,
 ) -> Result<Option<Flow>, Error> {
     let mut news: Vec<(u16, String)> = Vec::new();
     let mut st = None;
@@ -707,7 +832,12 @@ async fn flush(
             Err(e) => return mpu_err(d, sql, bucket, key, pos, e, budget).await.map(Some),
         }
     }
-    let Some(mut st) = st else { return Ok(None) };
+    // a yield persists even when nothing drained — the tail is the progress
+    let mut st = match st {
+        Some(s) => s,
+        None if persist_tail => out.snapshot(),
+        None => return Ok(None),
+    };
     Index(sql).insert_objects(&PackId(pos.pack.clone()), staged)?; // OR IGNORE: replay-safe
     staged.clear();
     for (n, e) in news {
@@ -717,23 +847,67 @@ async fn flush(
             vec![i64::from(n).into(), e.into()],
         )?;
     }
-    // durable = last uploaded byte. If it falls short of appended, the persisted
-    // cursor must point at the entry containing it (buffered bytes die with the slice)
+    // etags posted by a slice that died before its checkpoint landed sit past the
+    // durable prefix — prune so a resume never feeds them to complete()
+    exec(
+        sql,
+        "DELETE FROM gc_parts WHERE part_no > ?",
+        vec![V::from(i64::try_from(st.pos / PART as u64).unwrap_or(0))],
+    )?;
+    // durable = last uploaded byte. If it falls short of appended, the boundary
+    // lands inside an entry — mid-slice persists rewind to it; a yield keeps the
+    // scan cursor and records the boundary entry separately for the replay path.
     let durable = st.pos;
     let mut pp = pos.clone();
     if durable < out.offset() {
         let hit = cur
             .filter(|c| durable >= c.off)
             .or_else(|| spans.iter().copied().find(|s| durable >= s.off && durable < s.off + s.len));
-        let Some(s) = hit else {
-            return Err(Error::Internal(format!(
-                "durable boundary {durable} outside appended spans"
-            )));
-        };
-        pp.ci = s.ci;
-        pp.idx = s.idx;
-        pp.frag = durable - s.off;
-        st.count = s.ord; // entries fully durable = the boundary entry's ordinal
+        match hit {
+            Some(s) => {
+                st.count = s.ord; // entries fully durable = the boundary entry's ordinal
+                if persist_tail {
+                    (pp.bci, pp.bidx, pp.bfrag) = (s.ci, s.idx, durable - s.off);
+                } else {
+                    (pp.ci, pp.idx, pp.frag) = (s.ci, s.idx, durable - s.off);
+                    // keep the fallback boundary fresh too — a later yield reuses it
+                    (pp.bci, pp.bidx, pp.bfrag) = (pp.ci, pp.idx, pp.frag);
+                }
+            }
+            None => {
+                // the boundary entry predates this slice's spans only when nothing
+                // drained at all (durable == the loaded checkpoint) — reuse the
+                // persisted boundary. durable==0 means nothing ever uploaded: the
+                // fallback replays from scratch.
+                if persist_tail && durable == 0 {
+                    (pp.bci, pp.bidx, pp.bfrag) = (0, 0, 0);
+                    st.count = 0;
+                } else if persist_tail && pos.st.as_ref().map(|s| s.pos) == Some(durable) {
+                    (pp.bci, pp.bidx, pp.bfrag) = (pos.bci, pos.bidx, pos.bfrag);
+                    st.count = pos.st.as_ref().map(|s| s.count).unwrap_or(st.count);
+                } else {
+                    return Err(Error::Internal(format!(
+                        "durable boundary {durable} outside appended spans"
+                    )));
+                }
+            }
+        }
+    } else if persist_tail {
+        // fully drained at yield — the fallback boundary is the scan position
+        (pp.bci, pp.bidx, pp.bfrag) = (pp.ci, pp.idx, pp.frag);
+    }
+    pp.tail = if persist_tail { out.buffered() } else { 0 };
+    if persist_tail {
+        // the tail replaces the previous generation wholesale; chunk under the
+        // SqlStorage value-size ceiling
+        exec(sql, "DELETE FROM gc_tail", vec![])?;
+        for chunk in out.buffered_bytes().chunks(TAIL_CHUNK) {
+            exec(
+                sql,
+                "INSERT INTO gc_tail(blob) VALUES(?)",
+                vec![V::from(chunk.to_vec())],
+            )?;
+        }
     }
     pp.st = Some(st);
     put(
@@ -809,6 +983,7 @@ fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
     if total == 0 && !cands.is_empty() {
         // nothing reachable in any candidate: no repack to write — sweep deletes them outright
         exec(sql, "DELETE FROM gc_parts", vec![])?;
+        exec(sql, "DELETE FROM gc_tail", vec![])?;
         exec(sql, "DELETE FROM meta WHERE key IN ('gc.pos','gc.new_pack','gc.fails')", vec![])?;
         enqueue(sql, JobKind::GcSweep, now_ms(), "{}")?;
         return Ok(None);
@@ -823,7 +998,7 @@ fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
                 vec![now_ms().into(), p.into()],
             )?;
         }
-        for t in ["marked", "gc_frontier", "gc_seen", "gc_parts"] {
+        for t in ["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail"] {
             exec(sql, &format!("DELETE FROM {t}"), vec![])?;
         }
         exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
@@ -843,6 +1018,7 @@ fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
     // stale gc_parts from a dead build must not survive into the new upload — resume
     // numbers parts by these rows, so leftovers would rebind etags to wrong part numbers
     exec(sql, "DELETE FROM gc_parts", vec![])?;
+    exec(sql, "DELETE FROM gc_tail", vec![])?;
     let pack = PackId::random()?;
     exec(
         sql,
@@ -866,6 +1042,7 @@ fn wipe_build(d: &RepoDo, sql: &SqlStorage) -> Result<(), Error> {
         )?;
     }
     exec(sql, "DELETE FROM gc_parts", vec![])?;
+    exec(sql, "DELETE FROM gc_tail", vec![])?;
     exec(sql, "DELETE FROM meta WHERE key IN ('gc.pos','gc.new_pack','gc.fails')", vec![])?;
     Ok(())
 }
@@ -907,9 +1084,33 @@ pub async fn gc_sweep(d: &RepoDo) -> Result<SliceOutcome, Error> {
     )?;
     exec(&sql, "DELETE FROM objects WHERE pack_id IN (SELECT pack_id FROM marked)", vec![])?;
     exec(&sql, "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='gc_epoch'", vec![])?;
-    for t in ["marked", "gc_frontier", "gc_seen", "gc_parts"] {
+    for t in ["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail"] {
         exec(&sql, &format!("DELETE FROM {t}"), vec![])?;
     }
     exec(&sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
     Ok(SliceOutcome::Done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pos;
+
+    /// A gc.pos persisted before tail/(bci,bidx,bfrag) existed must still load —
+    /// serde defaults degrade a missing tail to 0, which the resume path reads
+    /// as "nothing undrained persisted" and falls back to boundary replay.
+    #[test]
+    fn pos_backward_compat() {
+        let old = r#"{"ci":0,"idx":20407,"pack":"p","upload":"u","st":null,
+                     "frag":0,"total":718383,"lo":0,"hi":0}"#;
+        let p: Pos = serde_json::from_str(old).unwrap();
+        assert_eq!(p.idx, 20407);
+        assert_eq!(p.tail, 0);
+        assert_eq!((p.bci, p.bidx, p.bfrag), (0, 0, 0));
+        // a cursor with the fields round-trips
+        let new = r#"{"ci":1,"idx":5,"pack":"p","upload":"u","st":null,"frag":9,
+                     "total":10,"lo":0,"hi":0,"tail":6427865,"bci":0,"bidx":3,"bfrag":2}"#;
+        let p: Pos = serde_json::from_str(new).unwrap();
+        assert_eq!(p.tail, 6427865);
+        assert_eq!((p.bci, p.bidx, p.bfrag), (0, 3, 2));
+    }
 }

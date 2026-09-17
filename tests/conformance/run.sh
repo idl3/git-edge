@@ -51,6 +51,137 @@ git clone -q "$URL/$REPO" "$WORK/clone1" || fail "single-pack clone"
 [ "$(git -C "$WORK/clone1" rev-parse main)" = "$TIP1" ] || fail "single-pack clone tip"
 git -C "$WORK/clone1" fsck --strict || fail "single-pack clone fsck"
 
+# packfile-uris (C1/A30): only runs with GE_CONFORMANCE_URIS=1, a dev server
+# started with GE_URL_SIGNING_KEY in .dev.vars, and git >= 2.40 as GE_GITBIN
+# (stock PATH git is fine on >= 2.40). packs_live=1 still holds here.
+if [ "${GE_CONFORMANCE_URIS:-0}" = "1" ]; then
+  note "packfile-uris: opted-in fetch gets a signed URI, inline pack is empty"
+  GITC="${GE_GITBIN:-git}"
+  python3 - "$TIP1" > "$WORK/fetchuri.bin" <<'PY'
+import sys
+tip = sys.argv[1]
+def pkt(b):
+    return f"{len(b)+4:04x}".encode() + b
+out = pkt(b"command=fetch\n") + pkt(b"object-format=sha1\n") + b"0001"
+out += pkt(f"want {tip}\n".encode()) + pkt(b"packfile-uris http,https\n") + pkt(b"done\n") + b"0000"
+sys.stdout.buffer.write(out)
+PY
+  curl -s -D "$WORK/uh" -o "$WORK/uresp.bin" -X POST "$URL/$REPO/git-upload-pack" \
+    -H 'Git-Protocol: version=2' -H 'Content-Type: application/x-git-upload-pack-request' \
+    --data-binary @"$WORK/fetchuri.bin"
+  python3 - "$WORK/uresp.bin" > "$WORK/uri.txt" <<'PY'
+import sys
+d = open(sys.argv[1],'rb').read()
+i = 0
+uri = None
+packdata = 0
+while i < len(d):
+    n = int(d[i:i+4], 16)
+    if n == 0:
+        break
+    if n < 4:          # delim/response-end pkts carry no payload
+        i += 4
+        continue
+    line = d[i+4:i+n]
+    if line.startswith(b"packfile-uris"):
+        pass
+    elif line[:1] == b"\x01":
+        packdata += len(line) - 1
+    elif b" http" in line and len(line) > 42 and line[:40].decode().strip("0123456789abcdef") == "":
+        uri = line[41:].strip().decode()
+    i += n
+if not uri:
+    sys.exit("no <hash> <uri> line in packfile-uris section")
+if packdata != 32:
+    sys.exit(f"inline pack should be the 32-byte empty pack, got {packdata}")
+print(uri)
+PY
+  URI=$(cat "$WORK/uri.txt")
+  HASH=$(python3 - "$WORK/uresp.bin" <<'PY'
+import sys,re
+d=open(sys.argv[1],'rb').read()
+m=re.search(rb'\n?([0-9a-f]{40}) http', d) or re.search(rb'([0-9a-f]{40}) http', d)
+print(m.group(1).decode())
+PY
+  )
+  # the signed URI self-authenticates: bare curl, no token
+  curl -sf "$URI" -o "$WORK/via-uri.pack" || fail "signed URI fetch"
+  [ "$(python3 -c 'import hashlib,sys;print(hashlib.sha1(open(sys.argv[1],"rb").read()[:-20]).hexdigest())' "$WORK/via-uri.pack")" = "$HASH" ] \
+    || fail "URI pack checksum != advertised hash"
+  head -c 4 "$WORK/via-uri.pack" | grep -q PACK || fail "URI body is not a pack"
+  # tampered signature must be refused, and so must an expired or missing one
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${URI%s=*}s=deadbeef")
+  [ "$code" = "403" ] || fail "bad-sig pack fetch -> $code, want 403"
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${URI/e=*/e=1}")
+  [ "$code" = "403" ] || fail "expired-sig pack fetch -> $code, want 403"
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${URI/%s=*/}")
+  [ "$code" = "403" ] || fail "sig-less pack fetch -> $code, want 403"
+  # scheme gate: a client naming only https on an http origin gets the A29
+  # inline pack instead of a URI; an empty value and a duplicate line likewise
+  python3 - "$TIP1" > "$WORK/fetchhttps.bin" <<'PY'
+import sys
+tip = sys.argv[1]
+def pkt(b):
+    return f"{len(b)+4:04x}".encode() + b
+out = pkt(b"command=fetch\n") + pkt(b"object-format=sha1\n") + b"0001"
+out += pkt(f"want {tip}\n".encode()) + pkt(b"packfile-uris https\n") + pkt(b"done\n") + b"0000"
+sys.stdout.buffer.write(out)
+PY
+  curl -s -o "$WORK/hresp.bin" -X POST "$URL/$REPO/git-upload-pack" \
+    -H 'Git-Protocol: version=2' -H 'Content-Type: application/x-git-upload-pack-request' \
+    --data-binary @"$WORK/fetchhttps.bin"
+  python3 - "$WORK/hresp.bin" <<'PY'
+import sys
+d = open(sys.argv[1],'rb').read()
+if b"packfile-uris" in d:
+    sys.exit("https-only request must not mint an http URI")
+i = 0; packdata = 0
+while i < len(d):
+    n = int(d[i:i+4], 16)
+    if n == 0: break
+    if n < 4:
+        i += 4; continue
+    if d[i+4:i+5] == b"\x01":
+        packdata += n - 5
+    i += n
+if packdata <= 32:
+    sys.exit(f"expected the real inline pack via A29, got {packdata} bytes")
+PY
+  python3 - "$TIP1" > "$WORK/fetchdup.bin" <<'PY'
+import sys
+tip = sys.argv[1]
+def pkt(b):
+    return f"{len(b)+4:04x}".encode() + b
+out = pkt(b"command=fetch\n") + pkt(b"object-format=sha1\n") + b"0001"
+out += pkt(f"want {tip}\n".encode()) + pkt(b"packfile-uris http\n") + pkt(b"packfile-uris https\n") + pkt(b"done\n") + b"0000"
+sys.stdout.buffer.write(out)
+PY
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$REPO/git-upload-pack" \
+    -H 'Git-Protocol: version=2' -H 'Content-Type: application/x-git-upload-pack-request' \
+    --data-binary @"$WORK/fetchdup.bin")
+  [ "$code" = "400" ] || fail "duplicate packfile-uris -> $code, want 400"
+  # bare/empty value is legal per real git — fetch succeeds via the A29 path
+  python3 - "$TIP1" > "$WORK/fetchempty.bin" <<'PY'
+import sys
+tip = sys.argv[1]
+def pkt(b):
+    return f"{len(b)+4:04x}".encode() + b
+out = pkt(b"command=fetch\n") + pkt(b"object-format=sha1\n") + b"0001"
+out += pkt(f"want {tip}\n".encode()) + pkt(b"packfile-uris \n") + pkt(b"done\n") + b"0000"
+sys.stdout.buffer.write(out)
+PY
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$REPO/git-upload-pack" \
+    -H 'Git-Protocol: version=2' -H 'Content-Type: application/x-git-upload-pack-request' \
+    --data-binary @"$WORK/fetchempty.bin")
+  [ "$code" = "200" ] || fail "empty packfile-uris value -> $code, want 200"
+  # real client: clone downloads the pack over the signed URL (git >= 2.40)
+  "$GITC" -c fetch.uriprotocols=http,https clone -q "$URL/$REPO" "$WORK/clone-uri" || fail "packfile-uris clone (git too old?)"
+  [ "$(git -C "$WORK/clone-uri" rev-parse main)" = "$TIP1" ] || fail "packfile-uris clone tip"
+  git -C "$WORK/clone-uri" fsck --strict || fail "packfile-uris clone fsck"
+  n=$(tr -d '\r' < "$WORK/uh" | sed -nE 's/^x-ge-subrequests: ([0-9]+).*/\1/ip' | tail -1)
+  [ -n "$n" ] && [ "$n" -le 8 ] || fail "C1 fetch spend $n, want <= 8"
+fi
+
 note "incremental push (thin pack with deltas)"
 dd if=/dev/urandom of=big.bin bs=1m count=6 2>/dev/null
 git add big.bin && git commit -qm big
@@ -64,6 +195,16 @@ git push -q "$URL/$REPO" --delete side || fail "delete branch"
 note "tag push + delete-only push (no PACK)"
 git tag v-test && git push -q "$URL/$REPO" v-test || fail "push tag"
 git push -q "$URL/$REPO" --delete v-test || fail "delete tag"
+
+note "--atomic: one failing command rejects the whole push"
+# `:main` is always refused (deletion of the current branch); under --atomic
+# the sibling create must not land either
+if git push --atomic "$URL/$REPO" :main HEAD:refs/heads/at-good 2>/dev/null; then
+  fail "atomic push with a bad command succeeded"
+fi
+git ls-remote "$URL/$REPO" refs/heads/at-good | grep -q . && fail "atomic push leaked a ref"
+git push -q --atomic "$URL/$REPO" HEAD:refs/heads/at-good HEAD:refs/heads/at-good2 || fail "atomic push"
+git push -q --atomic "$URL/$REPO" --delete refs/heads/at-good refs/heads/at-good2 || fail "atomic delete"
 
 note "clone back + fsck"
 git clone -q "$URL/$REPO" "$WORK/clone" || fail "clone"
@@ -130,6 +271,62 @@ curl -sf -X POST "$URL/$ADMINREPO/_admin/unpin" \
 git push -q "$URL/$ADMINREPO" HEAD:main || fail "push after unpin"
 ATIP=$(git rev-parse HEAD)
 
+note "scoped token (#19): in-scope push lands, out-of-scope rejected"
+SCJSON=$(curl -sf -X POST "$URL/$ADMINREPO/_admin/tokens" \
+  -d '{"name":"scoper","level":"write","scope":"refs/heads/scoped-*"}') || fail "token mint"
+SCTOK=$(echo "$SCJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+SCURL="$(echo "$URL" | sed -E "s|^(https?://)[^/@]*@|\1x:$SCTOK@|")"
+git push -q "$SCURL/$ADMINREPO" HEAD:refs/heads/scoped-ok 2>"$WORK/scerr" \
+  || fail "in-scope push rejected: $(cat "$WORK/scerr")"
+if git push "$SCURL/$ADMINREPO" HEAD:refs/heads/escape 2>"$WORK/scerr2"; then
+  fail "out-of-scope push succeeded"
+fi
+grep -q "outside token scope" "$WORK/scerr2" || fail "no scope reason: $(cat "$WORK/scerr2")"
+# a scoped token can't mint further credentials (still global-write gated)
+if curl -sf -X POST "$SCURL/$ADMINREPO/_admin/tokens" -d '{"name":"x","level":"write"}' 2>/dev/null; then
+  fail "scoped token minted a credential"
+fi
+
+note "lfs (#21): batch -> signed PUT -> batch -> signed GET round-trip"
+printf 'lfs test payload %s\n' "$(date +%s%N)" > "$WORK/lfs.bin"
+OID=$(shasum -a 256 "$WORK/lfs.bin" | cut -d' ' -f1)
+SIZE=$(stat -f%z "$WORK/lfs.bin" 2>/dev/null || stat -c%s "$WORK/lfs.bin")
+LFSJSON=$(curl -sf -X POST "$URL/$ADMINREPO/info/lfs/objects/batch" \
+  -H 'Content-Type: application/vnd.git-lfs+json' \
+  -d "{\"operation\":\"upload\",\"transfers\":[\"basic\"],\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}") \
+  || fail "lfs upload batch"
+HREF=$(echo "$LFSJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["objects"][0]["actions"]["upload"]["href"])')
+# the href carries no Authorization — the HMAC alone is the credential (A30 model)
+curl -sf -X PUT "$HREF" --data-binary @"$WORK/lfs.bin" || fail "lfs PUT"
+# second batch: object exists now -> no upload action
+LFSJSON2=$(curl -sf -X POST "$URL/$ADMINREPO/info/lfs/objects/batch" \
+  -H 'Content-Type: application/vnd.git-lfs+json' \
+  -d "{\"operation\":\"upload\",\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}") || fail "lfs re-batch"
+echo "$LFSJSON2" | grep -q '"upload"' && fail "re-batch offered upload for existing object"
+LFSGET=$(curl -sf -X POST "$URL/$ADMINREPO/info/lfs/objects/batch" \
+  -H 'Content-Type: application/vnd.git-lfs+json' \
+  -d "{\"operation\":\"download\",\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}") || fail "lfs dl batch"
+GHREF=$(echo "$LFSGET" | python3 -c 'import sys,json;print(json.load(sys.stdin)["objects"][0]["actions"]["download"]["href"])')
+curl -sf "$GHREF" -o "$WORK/lfs-dl.bin" || fail "lfs GET"
+cmp "$WORK/lfs.bin" "$WORK/lfs-dl.bin" || fail "lfs round-trip differs"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${GHREF%%s=*}s=deadbeef")
+[ "$code" = "403" ] || fail "bad-sig lfs GET -> $code, want 403"
+# a get sig is not a put sig — the op is inside the HMAC
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$WORK/lfs.bin" "$GHREF")
+[ "$code" = "403" ] || fail "get-sig lfs PUT -> $code, want 403"
+MISSING=$(printf 'never-uploaded' | shasum -a 256 | cut -d' ' -f1)
+curl -sf -X POST "$URL/$ADMINREPO/info/lfs/objects/batch" \
+  -H 'Content-Type: application/vnd.git-lfs+json' \
+  -d "{\"operation\":\"download\",\"objects\":[{\"oid\":\"$MISSING\",\"size\":1}]}" \
+  | grep -q '"code":404' || fail "missing lfs object not 404 in batch"
+# batch needs auth: anonymous gets 401
+LFSNOAUTH="$(echo "$URL" | sed -E 's|^(https?://)[^/@]*@|\1|')"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  "$LFSNOAUTH/$ADMINREPO/info/lfs/objects/batch" \
+  -H 'Content-Type: application/vnd.git-lfs+json' \
+  -d "{\"operation\":\"download\",\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}")
+[ "$code" = "401" ] || fail "anonymous lfs batch -> $code, want 401"
+
 note "public read: anonymous fetch, push still gated"
 NOAUTH="$(echo "$URL" | sed -E 's|^(https?://)[^/@]*@|\1|')"
 # a credential helper (osxkeychain) may have stored the URL-embedded token from
@@ -154,7 +351,10 @@ curl -sf "$URL/$ADMINREPO/_admin/export" -o "$WORK/exp.bundle" || fail "export"
 head -1 "$WORK/exp.bundle" | grep -q "v3 git bundle" || fail "not a v3 bundle"
 git -C "$WORK/seed" bundle verify "$WORK/exp.bundle" >/dev/null || fail "bundle verify"
 git clone -q "$WORK/exp.bundle" "$WORK/bundleclone" || fail "clone from bundle"
-[ "$(git -C "$WORK/bundleclone" rev-parse main)" = "$ATIP" ] || fail "bundle tip"
+# HEAD is a detached oid in the bundle (git's own format does the same), so with
+# two refs at the same tip the checked-out branch is ambiguous — assert the
+# remote-tracking ref carries main's tip instead of relying on a local branch
+[ "$(git -C "$WORK/bundleclone" rev-parse origin/main)" = "$ATIP" ] || fail "bundle tip"
 
 note "repo delete: tombstone 410 window, purge, name reusable"
 curl -sf -X POST "$URL/$ADMINREPO/_admin/delete" | grep -q deleted || fail "delete"
@@ -183,8 +383,9 @@ done
 
 # Quota + push rate-limit checks (A26/A27): only runs with GE_CONFORMANCE_LIMITS=1
 # and the dev server started with small caps, e.g. .dev.vars:
-#   GE_QUOTA_MAX_OBJECTS=25 GE_QUOTA_MAX_REPOS_PER_OWNER=3 GE_RATE_PUSHES_PER_MIN=12
-# (25 stays above the main suite's ~12 objects/repo; 12 stays above its 9 pushes.)
+#   GE_QUOTA_MAX_OBJECTS=25 GE_QUOTA_MAX_REPOS_PER_OWNER=4 GE_RATE_PUSHES_PER_MIN=12
+# (25 stays above the main suite's ~12 objects/repo; 12 stays above its 9 pushes;
+# the owner cap must exceed the suite's peak live claims — run+admin+gc+import = 4.)
 if [ "${GE_CONFORMANCE_LIMITS:-0}" = "1" ]; then
   O="quota-$SECONDS-$$"
   post() { # one canned receive-pack POST (bad pack body is fine — it reaches begin)
@@ -203,10 +404,13 @@ if [ "${GE_CONFORMANCE_LIMITS:-0}" = "1" ]; then
   grep -qi "quota" "$WORK/qerr" || fail "no quota reason in push output: $(cat "$WORK/qerr")"
 
   note "repo quota: claims past GE_QUOTA_MAX_REPOS_PER_OWNER are rejected"
-  # $O/obj already claimed slot 1; fill the remaining two, then the next must fail
-  post "$O/b" >/dev/null
-  post "$O/c" >/dev/null
-  out=$(post "$O/d")
+  # $O/obj already claimed slot 1; fill until the registry refuses — the exact
+  # cap is the dev server's, so this loop (not a fixed third post) is the test
+  out=""
+  for r in b c d e f g h; do
+    out=$(post "$O/$r")
+    echo "$out" | grep -q "GE_QUOTA_MAX_REPOS_PER_OWNER" && break
+  done
   echo "$out" | grep -q "GE_QUOTA_MAX_REPOS_PER_OWNER" \
     || fail "repo-cap rejection missing GE_QUOTA_MAX_REPOS_PER_OWNER: $out"
 
@@ -248,6 +452,93 @@ if [ "${GE_CONFORMANCE_GC:-0}" = "1" ]; then
   git -C "$WORK/gcclone" fsck --strict || fail "post-GC fsck"
   [ "$(git -C "$WORK/gcclone" rev-parse main)" = "$(git rev-parse orphan)" ] || fail "post-GC tip"
   note "GC swept (objects before: $OBJ0)"
+fi
+
+# I1 server-side import: stage a pack -> import_pack job -> atomic commit.
+# Only runs with GE_CONFORMANCE_IMPORT=1 against a build with the _admin/import
+# routes. The staged pack uses REF deltas (pack-objects default) so the job's
+# forward-reference/wake path is exercised, not just verbatim copies.
+if [ "${GE_CONFORMANCE_IMPORT:-0}" = "1" ]; then
+  note "import: stage pack, job ingests, refs commit"
+  IREPO="$REPO-import"
+  cd "$WORK/seed"
+  git rev-list --objects HEAD | git pack-objects --stdout > "$WORK/stage.pack"
+  NEW=$(git rev-parse HEAD)
+  # split into two halves: exercises Source::Parts reads and the shared-push
+  # stage API (`?push=` + `?part=`) — every part must live on one open push or
+  # PUSH_TIMEOUT would sweep siblings mid-import
+  half=$(( ($(wc -c < "$WORK/stage.pack" | tr -d ' ') + 1) / 2 ))
+  split -b "$half" "$WORK/stage.pack" "$WORK/stage.part."
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import/stage" --data-binary @"$WORK/stage.part.aa")
+  PUSH=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["push"])')
+  KEY=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+  BYTES=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["bytes"])')
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import/stage?push=$PUSH&part=b" --data-binary @"$WORK/stage.part.ab")
+  KEY2=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+  BYTES2=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["bytes"])')
+  echo "$KEY2" | grep -q "\.part-b" || fail "part key shape: $KEY2"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$IREPO/_admin/import/stage?push=$PUSH" --data-binary @"$WORK/stage.part.ab")
+  [ "$code" = "400" ] || fail "reused push without ?part -> $code, want 400"
+  ZERO=0000000000000000000000000000000000000000
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import" -H 'Content-Type: application/json' \
+    -d "{\"push\":\"$PUSH\",\"parts\":[{\"key\":\"$KEY\",\"bytes\":$BYTES},{\"key\":\"$KEY2\",\"bytes\":$BYTES2}],\"commands\":[{\"old\":\"$ZERO\",\"new\":\"$NEW\",\"name\":\"refs/heads/main\"}]}")
+  echo "$st" | grep -q queued || fail "import start: $st"
+  deadline=$((SECONDS + 120))
+  while :; do
+    st=$(curl -sf "$URL/$IREPO/_admin/import/$PUSH")
+    ps=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("push_state"))')
+    [ "$ps" = "committed" ] && break
+    [ "$ps" = "rejected" ] && fail "import rejected: $st"
+    [ $SECONDS -lt $deadline ] || fail "import did not commit within 120s: $st"
+    sleep 2
+  done
+  git clone -q "$URL/$IREPO" "$WORK/iclone" || fail "post-import clone"
+  [ "$(git -C "$WORK/iclone" rev-parse main)" = "$NEW" ] || fail "import tip"
+  git -C "$WORK/iclone" fsck --strict || fail "post-import fsck"
+  # a part key outside this repo's pending namespace must be refused outright —
+  # needs a fresh open push (a committed one is refused earlier, on state)
+  st2=$(curl -sf -X POST "$URL/$IREPO/_admin/import/stage" --data-binary @"$WORK/stage.pack")
+  PUSH2=$(echo "$st2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["push"])')
+  code=$(curl -s -o "$WORK/ibad" -w '%{http_code}' -X POST "$URL/$IREPO/_admin/import" \
+    -H 'Content-Type: application/json' \
+    -d "{\"push\":\"$PUSH2\",\"parts\":[{\"key\":\"r/00000000000000000000000000000000/pending/x.pack\",\"bytes\":1}],\"commands\":[{\"old\":\"$ZERO\",\"new\":\"$NEW\",\"name\":\"refs/heads/x\"}]}")
+  [ "$code" = "400" ] || fail "cross-namespace part -> $code, want 400"
+  # a re-start on the committed push is refused (state check), not a dup job
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$IREPO/_admin/import" \
+    -H 'Content-Type: application/json' \
+    -d "{\"push\":\"$PUSH\",\"parts\":[{\"key\":\"$KEY\",\"bytes\":$BYTES}],\"commands\":[{\"old\":\"$ZERO\",\"new\":\"$NEW\",\"name\":\"refs/heads/main\"}]}")
+  [ "$code" = "409" ] || fail "re-start on committed push -> $code, want 409"
+  # and a stage that re-begins the now-committed push is refused the same way
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$IREPO/_admin/import/stage?push=$PUSH&part=c" --data-binary @"$WORK/stage.part.ab")
+  [ "$code" = "409" ] || fail "re-begin committed push -> $code, want 409"
+  # no-walk dedup regression: a second import re-ships an object already live,
+  # so while its pack is live pre-sweep that object sits in two live packs at
+  # once — the exact shape a gc_consolidate/gc_sweep window creates. A clone
+  # must emit each sha once; index-pack rejects duplicates in one pack. The
+  # pack carries only the tip commit (its tree/blob resolve against the live
+  # pack at check) so GE_QUOTA_MAX_OBJECTS stays comfortably under a limits run.
+  echo "$NEW" | git pack-objects --stdout > "$WORK/dup.pack"
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import/stage" --data-binary @"$WORK/dup.pack")
+  PUSH3=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["push"])')
+  KEY3=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+  BYTES3=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["bytes"])')
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import" -H 'Content-Type: application/json' \
+    -d "{\"push\":\"$PUSH3\",\"parts\":[{\"key\":\"$KEY3\",\"bytes\":$BYTES3}],\"commands\":[{\"old\":\"$ZERO\",\"new\":\"$NEW\",\"name\":\"refs/heads/dup2\"}]}")
+  echo "$st" | grep -q queued || fail "overlap import start: $st"
+  deadline=$((SECONDS + 60))
+  while :; do
+    st=$(curl -sf "$URL/$IREPO/_admin/import/$PUSH3")
+    ps=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("push_state"))')
+    [ "$ps" = "committed" ] && break
+    [ "$ps" = "rejected" ] && fail "overlap import rejected: $st"
+    [ $SECONDS -lt $deadline ] || fail "overlap import did not commit: $st"
+    sleep 0.2
+  done
+  # clone inside the overlap window — GC's quiet period holds the sweep back
+  OVRLAP=$(curl -sf "$URL/$IREPO/_state" | python3 -c 'import sys,json;print(json.load(sys.stdin)["packs_live"])')
+  git clone -q "$URL/$IREPO" "$WORK/dclone" || fail "overlap-window clone"
+  git -C "$WORK/dclone" fsck --strict || fail "overlap-window fsck"
+  [ "$OVRLAP" -ge 2 ] && note "overlap clone exercised dedup (packs_live=$OVRLAP)" || note "sweep beat the clone — dedup path not exercised this run"
 fi
 
 # purge_repo job: POST _admin/delete enqueues it; the repo converges to empty

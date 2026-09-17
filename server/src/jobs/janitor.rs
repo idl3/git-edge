@@ -10,7 +10,7 @@ use super::{Job, SliceBudget, SliceOutcome};
 use crate::error::Error;
 use crate::platform;
 use crate::repo_do::RepoDo;
-use crate::store::{keys, PackId, PushId};
+use crate::store::{keys, PackId};
 
 const BATCH: i64 = 400; // keys per slice (5.1: at most 400)
 const GRACE_MS: i64 = 3_600_000;
@@ -62,13 +62,16 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
             vec![V::from(now), V::from(p.id.as_str())],
         )?;
     }
-    // a pack 'ingesting' with no open push pointing at it is abandoned (crash between pack finish
-    // and commit): dead after PUSH_TIMEOUT so step 3 reclaims it. push_id IS NULL marks the GC
-    // consolidation build pack — its lifetime is owned by the gc_consolidate job, not the janitor.
+    // a pack 'ingesting' whose owning push is not open is abandoned (crash between pack
+    // finish and commit, or an import job that died): dead after PUSH_TIMEOUT so step 3
+    // reclaims it. The link is packs.push_id — pushes.pack_id stays NULL until commit, so
+    // joining on it would mark every live multi-hour import's pack dead mid-run.
+    // push_id IS NULL marks the GC consolidation build pack — its lifetime is owned by
+    // the gc_consolidate job, not the janitor.
     let orphaned: Vec<I> = d
         .q(
             "SELECT id FROM packs WHERE state='ingesting' AND created_at < ? AND push_id IS NOT NULL \
-             AND NOT EXISTS(SELECT 1 FROM pushes u WHERE u.pack_id = packs.id AND u.state='open') LIMIT ?",
+             AND NOT EXISTS(SELECT 1 FROM pushes u WHERE u.id = packs.push_id AND u.state='open') LIMIT ?",
             vec![V::from(now.saturating_sub(PUSH_TIMEOUT_MS)), V::from(BATCH)],
         )?
         .to_array::<I>()?
@@ -101,16 +104,60 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         if budget.spent_80pct() {
             return Ok(SliceOutcome::Continue { cursor: "{}".into() });
         }
-        let key = keys::pending(&d.repo_id()?, &PushId(p.id.clone()));
-        budget.req.charge(1)?;
-        match d.bucket()?.inner.delete(key.as_str()).await {
-            Ok(()) => {
-                d.q("UPDATE pushes SET swept_at=? WHERE id=?", vec![V::from(now), V::from(p.id.as_str())])?;
+        // I1: a staged import parks N parts under `pending/<push>.` (one `.pack`
+        // and any `.part-*` keys) — sweep the whole prefix, not just `.pack`.
+        let prefix = format!("r/{}/pending/{}.", d.repo_id()?.0, p.id);
+        let bucket = d.bucket()?;
+        let mut done = true;
+        let mut cur: Option<String> = None;
+        for _ in 0..8 {
+            // cap pages per push per slice; an unfinished prefix re-sweeps next
+            // pass since swept_at stays NULL (list re-reads the remainder)
+            if budget.spent_80pct() {
+                done = false;
+                break;
             }
-            Err(e) => {
-                del_fail += 1;
-                worker::console_log!("janitor: pending delete {} failed: {e}", p.id);
+            budget.req.charge(1)?;
+            let mut q = bucket.inner.list().prefix(prefix.clone()).limit(100);
+            if let Some(c) = cur.take() {
+                q = q.cursor(c);
             }
+            match q.execute().await {
+                Ok(page) => {
+                    let keys: Vec<String> = page.objects().iter().map(|o| o.key()).collect();
+                    if !keys.is_empty() {
+                        budget.req.charge(1)?;
+                        if let Err(e) = bucket
+                            .inner
+                            .delete_multiple(keys.iter().map(String::as_str).collect())
+                            .await
+                        {
+                            del_fail += 1;
+                            worker::console_log!("janitor: pending delete {} failed: {e}", p.id);
+                            done = false;
+                            break;
+                        }
+                    }
+                    match (page.truncated(), page.cursor()) {
+                        (true, Some(c)) => cur = Some(c),
+                        _ => break,
+                    }
+                }
+                Err(e) => {
+                    del_fail += 1;
+                    worker::console_log!("janitor: pending list {} failed: {e}", p.id);
+                    done = false;
+                    break;
+                }
+            }
+        }
+        if done {
+            // I1 staging tables die with the push: committed imports already cleaned
+            // theirs (no-op), expired/rejected ones get theirs dropped here
+            for t in ["push_links", "import_toc", "import_parts", "import_open", "import_tail"] {
+                d.q(&format!("DELETE FROM {t} WHERE push_id=?"), vec![V::from(p.id.as_str())])?;
+            }
+            d.q("UPDATE pushes SET swept_at=? WHERE id=?", vec![V::from(now), V::from(p.id.as_str())])?;
         }
         // CAS heartbeat (A19): a stale slice stops before its next delete
         if !super::heartbeat(&d.sql(), job)? {
@@ -146,6 +193,50 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         if !super::heartbeat(&d.sql(), job)? {
             return Err(super::stale_lease());
         }
+    }
+
+    // 3b. dead import_pack jobs still own an open R2 multipart upload (their output
+    // pack never completed): rebind + abort so uploaded parts don't leak, then drop
+    // the job row. The push/staging cleanup above handles the rest on its own clock.
+    #[derive(serde::Deserialize)]
+    struct DeadJob {
+        id: i64,
+        payload: String,
+        cursor: Option<String>,
+    }
+    let dead_jobs: Vec<DeadJob> = d
+        .q(
+            "SELECT id, payload, cursor FROM jobs WHERE kind='import_pack' AND state='dead' LIMIT ?",
+            vec![V::from(BATCH)],
+        )?
+        .to_array::<DeadJob>()?
+        .into_iter()
+        .collect();
+    for j in dead_jobs {
+        if budget.spent_80pct() {
+            return Ok(SliceOutcome::Continue { cursor: "{}".into() });
+        }
+        let pack = serde_json::from_str::<serde_json::Value>(&j.payload)
+            .ok()
+            .and_then(|v| v.get("pack").and_then(|p| p.as_str()).map(String::from));
+        let upload = j
+            .cursor
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .and_then(|v| v.get("upload").and_then(|u| u.as_str()).map(String::from))
+            .filter(|u| !u.is_empty());
+        if let (Some(pack), Some(upload)) = (pack, upload) {
+            let key = keys::pack(&d.repo_id()?, &PackId(pack));
+            if let Ok(mpu) = d.bucket()?.inner.resume_multipart_upload(&key, &upload) {
+                budget.req.charge(1)?;
+                if let Err(e) = mpu.abort().await {
+                    del_fail += 1;
+                    worker::console_log!("janitor: import mpu abort {} failed: {e}", j.id);
+                    continue; // keep the row — retry next run
+                }
+            }
+        }
+        d.q("DELETE FROM jobs WHERE id=?", vec![V::from(j.id)])?;
     }
 
     // 4. reflog expiry: 90 days, keyed by row id.

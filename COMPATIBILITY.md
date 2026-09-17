@@ -29,7 +29,7 @@ corruption.
 version 2
 agent=git-edge/0.1
 ls-refs=unborn
-fetch=shallow filter
+fetch=shallow filter packfile-uris
 object-format=sha1
 ```
 
@@ -56,7 +56,7 @@ object-format=sha1`
 | `thin-pack` arg | ✅ | accepted | packs sent are self-contained — deltas never appear on the wire |
 | `include-tag` | ✅ | ✅ | peeled tags of wanted commits only |
 | `sideband-all` | ✅ | — | not advertised; plain side-band-64k semantics |
-| `packfile-uris` (CDN offload) | ✅ | — | not advertised |
+| `packfile-uris` (CDN offload) | ✅ | ✅ | advertised; opted-in plain clones get a signed `/_packs` URL (A30) |
 | `wait-for-done` | ✅ | — | not advertised |
 | `no-done` | ✅ | tolerated, not advertised | parsed; we answer before `done` anyway |
 | `object-info`, `bundle-uri`, `server-option` commands | ✅ | — | unknown command → protocol error |
@@ -73,7 +73,7 @@ object-format=sha1`
 | `report-status` | ✅ | ✅ | |
 | `report-status-v2` | ✅ | accepted, not advertised | option lines not supported |
 | `delete-refs`, `side-band-64k`, `quiet` | ✅ | ✅ | |
-| `atomic` | ✅ | — | not advertised → client-side refusal |
+| `atomic` | ✅ | ✅ | advertised; dry-run validation rejects the whole push on any failure |
 | `push-options` (`-o`) | ✅ | — | not advertised → client-side refusal |
 | Signed pushes (`push-cert`) | ✅ | — | |
 | `shallow` lines from a shallow client | ✅ | parsed, ignored | push proceeds; see caveats |
@@ -122,8 +122,9 @@ server adopts an existing branch — clones check out like a GitHub import.
 | Delta chain depth | 64 (git default: 50) | unbounded-ish |
 | Aggregate delta-chain bytes | 64 MiB compressed / 128 MiB live | none |
 | Refs per repo | 65,536 | none |
-| Fetch commit-walk bound | 200,000 commits or 64 MiB mem → `ERR fetch too large` | none |
+| Fetch commit-walk bound (haves-ful fetches) | 200,000 commits or 64 MiB mem → `ERR fetch too large` | none |
 | Reachable objects per fetch | 1,000,000 | none |
+| Clone object bound | none — plain clones stream all live objects in pack order (no walk); verified ≥718k objects | n/a |
 | Push links (tree edges) per push | 1,000,000 | none |
 | upload-pack request body | 1 MiB | ~unbounded |
 | ls-refs prefixes | 32 | unbounded |
@@ -143,16 +144,18 @@ truncation, or corrupted ref state.
    responses carry full objects only. Legal per protocol; fetch bodies are
    larger than a deltifying server's. This is what makes constant-memory
    streaming possible.
-4. **`--atomic` and `-o <push-option>` refuse client-side.** Capabilities are
-   not advertised, so the client errors before the request — clean, but these
-   workflows are unavailable.
+4. **`-o <push-option>` refuses client-side; `--atomic` works.** Push options
+   are not advertised, so the client errors before the request — clean.
+   `--atomic` is advertised and honored: `commit_push` dry-runs every
+   command's CAS predicate before any write and rejects the whole push on
+   any failure.
 5. **Shallow-push tracking is not maintained.** `shallow` lines from a shallow
    client are parsed and ignored; the server does not remember that a pushed
    history was truncated. Consequence is benign (objects are stored; the
    connectivity rule still requires referenced bases to exist).
-6. **v0/v1 fetch, `tree:`/`sparse:`/`combine:` filters, `packfile-uris`,
-   `sideband-all`, `object-info`, `bundle-uri`, sha256** — deliberately
-   unadvertised; clients get a protocol error, never silent misbehavior.
+6. **v0/v1 fetch, `tree:`/`sparse:`/`combine:` filters, `sideband-all`,
+   `object-info`, `bundle-uri`, sha256** — deliberately unadvertised;
+   clients get a protocol error, never silent misbehavior.
 7. **Auth is static tokens, but now per-repo too.** `GE_READ_TOKEN`/
    `GE_WRITE_TOKEN` remain the deployment-wide admin credentials (HTTP Basic or
    Bearer). Per-repo tokens are minted via `POST /:owner/:repo/_admin/tokens`
@@ -161,16 +164,27 @@ truncation, or corrupted ref state.
    are stored; a token is shown once at creation. Read tokens get 403 on push.
    `POST /_admin/public {enabled}` opens a repo to anonymous reads (ls-refs,
    fetch, export) — a request with no credential is admitted; a presented bad
-   token still gets a 401. Still no per-branch permissions or user accounts.
-8. **No LFS.** Full objects now stream verbatim up to the 2 GiB pending-pack
-   bound, so ordinary large blobs are fine — but anything pushed *as a delta*
-   whose result exceeds 16 MiB is still rejected (`unpack object too large`),
-   and a REF_DELTA whose *base* is a streamed >16 MiB object is rejected with
-   `delta base <oid> exceeds 16 MiB`. Note `git push --no-thin` does **not**
-   prevent a client from sending REF_DELTA (verified on git 2.54) — the
-   reliable workaround is pushing the object undeltified, e.g.
+   token still gets a 401. Tokens accept an optional `scope`: a comma list
+   of `refs/…` patterns (a trailing `*` makes the pattern a prefix glob),
+   enforced on every ref update a push or import attempts — e.g.
+   `refs/heads/scoped-*` lets a deploy key push only matching branches.
+   No user accounts.
+8. **Git LFS: basic transfer only.** The batch endpoint
+   `POST /:owner/:repo/info/lfs/objects/batch` answers the spec and mints
+   HMAC-signed `GET|PUT /_lfs/<oid>` URLs (same capability model as
+   `/_packs/`; the sig binds repo+oid+expiry+op). Objects live in R2 under
+   `r/<id>/lfs/` — inside the repo's purge prefix — and count toward
+   `GE_QUOTA_MAX_BYTES`. Requires `GE_URL_SIGNING_KEY`; without it the
+   batch route 403s. No `verify` callback, locking API, or custom
+   transfers. Without LFS, full objects stream verbatim up to the 2 GiB
+   pending-pack bound, but anything pushed *as a delta* whose result
+   exceeds 16 MiB is still rejected (`unpack object too large`), and a
+   REF_DELTA whose *base* is a streamed >16 MiB object is rejected with
+   `delta base <oid> exceeds 16 MiB`. Note `git push --no-thin` does
+   **not** prevent a client from sending REF_DELTA (verified on git 2.54)
+   — the reliable workaround is pushing the object undeltified, e.g.
    `git -c core.bigFileThreshold=1 push`. The ~100 MB platform body cap
-   applies per request. Very large assets should still live outside git.
+   applies per request.
 9. **No hooks, repo rename, or web UI.** A repo is created by pushing to it and
    deleted by `POST /_admin/delete` (write-auth): the repo tombstones to 410
    immediately and a `purge_repo` job reclaims R2 packs and DO storage in the
@@ -203,9 +217,10 @@ truncation, or corrupted ref state.
 | Import sinatra/sinatra (4,684 commits, 22.6k objects, 8 MiB pack) | 1 push, 11 s; clone 2 s, fsck clean |
 | Import expressjs/express (6,169 commits, 32.5k objects, 11 MiB pack) | 2 staged pushes, 15 s; clone 8 s, fsck clean |
 | Import vitejs/vite (9,678 commits, 110k objects, 75 MiB pack) | 4 staged pushes, 337 s; clone 133 s, fsck clean |
-| Import facebook/react (21,698 commits, 263k objects, 1,078 MiB pack) | 25 staged pushes, 337 s; **clone fails** — `Error::Budget` → HTTP 413 mid-walk (per-request subrequest budget). *Pre-A29: once GC consolidates to `packs_live=1` the clone takes the verbatim path (~1 subrequest)* |
-| Import rails/rails (99,661 commits, 787k objects, 308 MiB pack) | 39 staged pushes, 644 s; **clone fails** — same budget wall; `blob:none` doesn't help (budget is index reads, not blob bytes). *Pre-A29: verbatim path applies once consolidated to one live pack* |
-| Import microsoft/TypeScript (39,366 commits, 945k objects, 2.8 GiB pack) | **import infeasible** — one commit alone adds ~222k objects; staging can't split below a commit |
+| Import facebook/react (21,698 commits, 263k objects, 1,078 MiB pack) | 25 staged pushes, 337 s; clone 18.7 s @ 1 subrequest verbatim / 14.8 s via signed `packfile-uris` — the budget wall is cleared once consolidated |
+| Import facebook/react — all 1,149 refs (462,299 objects, 1.12 GiB pack) | server-side import, committed across ~7 isolate strands incl. a dead-MPU rebuild; clone-back 6.41 GiB in 219 s, `fsck --strict` clean, refs exact |
+| Import rails/rails (99,661 commits, 787k objects, 308 MiB pack) | 39 staged pushes, 644 s; GC consolidated 23→1 live pack (718,383 objects); clone + `fsck --strict` clean |
+| Import microsoft/TypeScript (39,366 commits, 984,826 objects, 2.72 GiB pack) | server-side import in ~1h52m (44 parts, zero retries); normalized to one 18.63 GiB live pack; clone 1,020 s via signed `packfile-uris`, `fsck --strict` clean, 324 refs + HEAD exact. Inline verbatim clone exceeds the 240 s request wall past ~7 GiB wire — set `fetch.uriprotocols` |
 
 ## Interoperability test matrix (git 2.54, live)
 

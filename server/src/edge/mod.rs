@@ -14,7 +14,7 @@ use crate::auth::{self, Level};
 use crate::error::{respond, Error};
 use crate::pack;
 use crate::platform;
-use crate::store::{Bucket, PushId, RepoId};
+use crate::store::{Bucket, PackId, PushId, RepoId};
 use crate::wire::{
     self,
     http::{stub_json, stub_raw, RepoRoute},
@@ -147,6 +147,16 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         (Method::Get, "info/refs") => info_refs(&req, &env, &route, &spend).await,
         (Method::Get, "_state") => state_probe(&req, &env, &route, &spend).await,
         (Method::Post, "git-upload-pack") => upload_pack(req, &env, &route, &spend).await,
+        (Method::Get, p) if p.starts_with("_packs/") => {
+            pack_get(&req, &env, &route, &p["_packs/".len()..], &spend).await
+        }
+        (Method::Post, "info/lfs/objects/batch") => lfs_batch(req, &env, &route, &spend).await,
+        (Method::Get, p) if p.starts_with("_lfs/") => {
+            lfs_object(req, &env, &route, &p["_lfs/".len()..], "get", &spend).await
+        }
+        (Method::Put, p) if p.starts_with("_lfs/") => {
+            lfs_object(req, &env, &route, &p["_lfs/".len()..], "put", &spend).await
+        }
         (Method::Post, "git-receive-pack") => receive_pack(req, env, route, &spend).await,
         (Method::Post, "_admin/tokens") => token_create(req, &env, &route, &spend).await,
         (Method::Get, "_admin/tokens") => token_list(&req, &env, &route, &spend).await,
@@ -157,6 +167,11 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         (Method::Post, "_admin/public") => repo_public(req, &env, &route, &spend).await,
         (Method::Post, "_admin/pin") => pin_ref(req, &env, &route, "/_do/pin", &spend).await,
         (Method::Post, "_admin/unpin") => pin_ref(req, &env, &route, "/_do/unpin", &spend).await,
+        (Method::Post, "_admin/import/stage") => import_stage(req, &env, &route, &spend).await,
+        (Method::Post, "_admin/import") => import_begin(req, &env, &route, &spend).await,
+        (Method::Get, p) if p.starts_with("_admin/import/") => {
+            import_status(&req, &env, &route, &p["_admin/import/".len()..], &spend).await
+        }
         (Method::Get, "_admin/export") => export_bundle(&req, &env, &route, &spend).await,
         _ => Err(Error::NotFound),
     };
@@ -171,6 +186,7 @@ fn op_name(method: &Method, rest: &str) -> &'static str {
         (Method::Get, "_state") => "state",
         (Method::Post, "git-upload-pack") => "fetch",
         (Method::Post, "git-receive-pack") => "push",
+        (Method::Get, p) if p.starts_with("_packs/") => "pack-uri",
         (_, p) if p.starts_with("_admin/") => "admin",
         _ => "other",
     }
@@ -358,8 +374,11 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spe
         wire::V2Command::LsRefs(_) => "/_do/ls-refs",
         wire::V2Command::Fetch(_) => "/_do/fetch",
     };
+    // the fetch may answer with packfile-uris URLs (A30) — the DO composes them
+    // from the public origin, forwarded on the internal request as x-ge-base
+    let base = req.url().ok().map(|u| u.origin().ascii_serialization());
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
-    let mut resp = stub_raw(&stub, route, path, body, &mut budget).await?;
+    let mut resp = stub_raw(&stub, route, path, body, &mut budget, base.as_deref()).await?;
     if resp.status_code() != 200 {
         return Err(Error::from_do_response(resp, &budget).await);
     }
@@ -375,6 +394,162 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spe
             .map_err(|e| Error::Internal(e.to_string()))?;
     }
     Ok(out)
+}
+
+/// GET /:owner/:repo/_packs/<id>.pack?e=<exp>&s=<sig> — signed pack download (A30).
+/// URI fetches carry no auth headers (packfile-uris sends the client through
+/// `git http-fetch` bare), so the HMAC in `s` is the credential: it binds
+/// repo+pack+expiry. No token check here by design — the DO only mints these
+/// for fetches that already passed read auth.
+async fn pack_get(req: &Request, env: &Env, _route: &RepoRoute, name: &str, spend: &Spend) -> Result<Response, Error> {
+    let signing = crate::sign::signing_key(env).ok_or(Error::NotFound)?; // feature off: never minted, never served
+    let pack = name
+        .strip_suffix(".pack")
+        .filter(|p| RepoRoute::seg_ok(p))
+        .ok_or(Error::NotFound)?;
+    let url = req.url().map_err(|e| Error::Internal(e.to_string()))?;
+    let qp = |k: &str| {
+        url.query_pairs()
+            .find(|(q, _)| q == k)
+            .map(|(_, v)| v.into_owned())
+    };
+    let exp: i64 = qp("e").and_then(|v| v.parse().ok()).ok_or(Error::Forbidden)?;
+    if exp < platform::now_ms() / 1000 {
+        return Err(Error::Forbidden);
+    }
+    // r= is the opaque repo_id the DO signed (the R2 namespace); the path's
+    // owner/repo is routing sugar only — the sig is the authority
+    let repo_id = qp("r").filter(|r| RepoRoute::seg_ok(r)).ok_or(Error::Forbidden)?;
+    let sig = qp("s").ok_or(Error::Forbidden)?;
+    if !crate::sign::pack_sig_ok(&signing, &repo_id, pack, exp, &sig) {
+        return Err(Error::Forbidden);
+    }
+    let mut budget = ReqBudget::paid().reporting(spend);
+    let key = crate::store::keys::pack(&RepoId(repo_id), &PackId(pack.into()));
+    budget.charge(1)?;
+    let obj = env
+        .bucket("BUCKET")?
+        .get(&key)
+        .execute()
+        .await?
+        .ok_or(Error::NotFound)?;
+    let body = obj.body().ok_or_else(|| Error::Storage(format!("no body for {key}")))?;
+    let mut resp = Response::from_body(body.response_body()?).map_err(Error::from)?;
+    let h = resp.headers_mut();
+    h.set("Content-Type", "application/octet-stream")
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    // the URL is a bearer credential — never let a cache serve it past expiry
+    h.set("Cache-Control", "private, no-store")
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    Ok(resp)
+}
+
+/// POST /:owner/:repo/info/lfs/objects/batch — Git LFS batch API (#21, basic
+/// transfer). The operation picks the auth level: download needs read, upload
+/// needs write. The DO does existence checks + mints the signed `/_lfs/` URLs.
+async fn lfs_batch(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    // a batch spec is small JSON (≤100 objects typical) — cap before buffering
+    let too_big = req
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|n| n > 1_048_576)
+        .unwrap_or(false);
+    if too_big {
+        return Err(Error::Protocol("lfs batch body too large".into()));
+    }
+    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    if body.len() > 1_048_576 {
+        return Err(Error::Protocol("lfs batch body too large".into()));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("lfs batch: {e}")))?;
+    let level = match v.get("operation").and_then(|o| o.as_str()) {
+        Some("download") => Level::Read,
+        Some("upload") => Level::Write,
+        _ => return Err(Error::Protocol("lfs operation must be download or upload".into())),
+    };
+    auth::authenticate(&req, env, level, route, spend).await?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    let base = req.url().ok().map(|u| u.origin().ascii_serialization());
+    let mut resp = stub_raw(&stub, route, "/_do/lfs/batch", body, &mut budget, base.as_deref()).await?;
+    let out = resp.bytes().await.map_err(|e| Error::Internal(e.to_string()))?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp, &budget).await);
+    }
+    git_resp(out, "application/vnd.git-lfs+json")
+}
+
+/// GET|PUT /:owner/:repo/_lfs/<oid>?r=<repo_id>&e=<exp>&s=<sig> — signed LFS
+/// object transfer (#21). Same capability model as `_packs/` (A30): the HMAC
+/// binds repo_id + oid + expiry + op; no bearer check by design. `op=get`
+/// streams the object; `op=put` writes it via RawWriter MPU.
+async fn lfs_object(req: Request, env: &Env, _route: &RepoRoute, oid: &str, op: &str, spend: &Spend) -> Result<Response, Error> {
+    let signing = crate::sign::signing_key(env).ok_or(Error::NotFound)?; // never minted, never served
+    if oid.len() != 64 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::NotFound);
+    }
+    let url = req.url().map_err(|e| Error::Internal(e.to_string()))?;
+    let qp = |k: &str| url.query_pairs().find(|(q, _)| q == k).map(|(_, v)| v.into_owned());
+    let exp: i64 = qp("e").and_then(|v| v.parse().ok()).ok_or(Error::Forbidden)?;
+    if exp < platform::now_ms() / 1000 {
+        return Err(Error::Forbidden);
+    }
+    let repo_id = qp("r").filter(|r| RepoRoute::seg_ok(r)).ok_or(Error::Forbidden)?;
+    let sig = qp("s").ok_or(Error::Forbidden)?;
+    if !crate::sign::lfs_sig_ok(&signing, &repo_id, oid, exp, op, &sig) {
+        return Err(Error::Forbidden);
+    }
+    let mut budget = ReqBudget::paid().reporting(spend);
+    let key = crate::store::keys::lfs(&RepoId(repo_id.clone()), oid);
+    let bucket = env.bucket("BUCKET")?;
+    if op == "get" {
+        budget.charge(1)?;
+        let obj = bucket.get(&key).execute().await?.ok_or(Error::NotFound)?;
+        let body = obj.body().ok_or_else(|| Error::Storage(format!("no body for {key}")))?;
+        let mut resp = Response::from_body(body.response_body()?).map_err(Error::from)?;
+        let h = resp.headers_mut();
+        h.set("Content-Type", "application/octet-stream")
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        h.set("Content-Length", &obj.size().to_string()).ok();
+        h.set("Cache-Control", "private, no-store").ok();
+        Ok(resp)
+    } else {
+        // put — stream the body through an MPU; the sig already vetted it
+        let mut req = req;
+        let mut body = BodyReader::new(&mut req)?;
+        let bkt = Bucket::new(bucket, RepoId(repo_id));
+        let mut out = crate::store::RawWriter::create(&bkt, key.clone(), &mut budget).await?;
+        let mut err = None;
+        while err.is_none() {
+            match body.fill(FILL_STEP).await {
+                Ok(_) => {
+                    let n = body.buffered().len();
+                    if n == 0 {
+                        break;
+                    }
+                    out.append(body.buffered());
+                    body.consume(n);
+                    if let Err(e) = out.flush_if_full(&mut budget).await {
+                        err = Some(e);
+                    }
+                }
+                Err(e) => err = Some(e),
+            }
+        }
+        match err {
+            Some(e) => {
+                out.abort().await;
+                Err(e)
+            }
+            None => {
+                out.finish(&mut budget).await?;
+                git_resp(Vec::new(), "application/vnd.git-lfs+json")
+            }
+        }
+    }
 }
 
 /// POST /:owner/:repo/_admin/tokens {name, level} — mint a per-repo credential.
@@ -500,13 +675,229 @@ async fn pin_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str, spe
     git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
 }
 
+/// POST /:owner/:repo/_admin/import/stage — stream a client-assembled pack into
+/// pending/<push> untouched (I1). No parse at the edge: the import job's pass A
+/// re-reads it from R2 across slices, which is the point — a pack this large
+/// cannot fit receive-pack's single-request ingest. Returns {push, key, bytes}
+/// for the follow-up _admin/import call.
+async fn import_stage(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    let principal = auth::authenticate(&req, env, Level::Write, route, spend).await?;
+    let rate_key = auth::presented_hash(&req)?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    // I1: parts of one import share ONE open push — `?push=<id>` re-begins it
+    // (idempotent for the same principal) and `?part=<name>` picks the key
+    // `pending/<push>.part-<name>`. Without reuse every part is its own open push
+    // whose PUSH_TIMEOUT expiry would sweep sibling parts mid-import.
+    let url = req.url().map_err(|e| Error::Internal(e.to_string()))?;
+    let qp = |k: &str| url.query_pairs().find(|(n, _)| n == k).map(|(_, v)| v.into_owned());
+    let ok_id = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    let (push, part) = match qp("push") {
+        Some(id) => {
+            if !ok_id(&id) {
+                return Err(Error::Protocol("bad push id".into()));
+            }
+            let part = qp("part").filter(|p| ok_id(p)).ok_or_else(|| {
+                Error::Protocol("reused push needs ?part=<name>".into())
+            })?;
+            (PushId(id), Some(part))
+        }
+        None => (PushId::random()?, None),
+    };
+    #[derive(serde::Deserialize)]
+    struct Begin {
+        repo_id: String,
+        #[serde(default)]
+        claimed: bool,
+    }
+    let begin: Begin = stub_json(
+        &stub,
+        route,
+        "/_do/push/begin",
+        &serde_json::json!({ "push_id": push.0, "principal": principal, "key": rate_key }),
+        &mut budget,
+    )
+    .await?;
+    // same A26 claim as receive_inner: an unclaimed repo must take a slot before
+    // the staged upload burns bandwidth
+    if !begin.claimed {
+        if let Err(e) = owner_claim(env, route, &mut budget).await {
+            let _: serde_json::Value = stub_json(
+                &stub,
+                route,
+                "/_do/push/abort",
+                &serde_json::json!({ "push_id": push.0 }),
+                &mut budget,
+            )
+            .await
+            .unwrap_or_default();
+            return Err(e);
+        }
+    }
+    let bucket = Bucket::new(env.bucket("BUCKET")?, RepoId(begin.repo_id));
+    let key = match &part {
+        Some(p) => crate::store::keys::pending_part(&bucket.repo, &push, p),
+        None => crate::store::keys::pending(&bucket.repo, &push),
+    };
+    let mut body = BodyReader::new(&mut req)?;
+    let mut out =
+        crate::store::RawWriter::create(&bucket, key.clone(), &mut budget)
+            .await?;
+    let mut total = 0u64;
+    let mut err = None;
+    while err.is_none() {
+        match body.fill(FILL_STEP).await {
+            Ok(_) => {
+                let n = body.buffered().len();
+                if n == 0 {
+                    break;
+                }
+                out.append(body.buffered());
+                body.consume(n);
+                total = total.saturating_add(n as u64);
+                if let Err(e) = out.flush_if_full(&mut budget).await {
+                    err = Some(e);
+                }
+            }
+            Err(e) => err = Some(e),
+        }
+    }
+    match err {
+        Some(e) => {
+            out.abort().await;
+            let _: serde_json::Value = stub_json(
+                &stub,
+                route,
+                "/_do/push/abort",
+                &serde_json::json!({ "push_id": push.0 }),
+                &mut budget,
+            )
+            .await
+            .unwrap_or_default();
+            Err(e)
+        }
+        // finish() aborts its own MPU on failure — only the pushes row needs closing
+        None => match out.finish(&mut budget).await {
+            Ok(()) => git_resp(
+                serde_json::to_vec(&serde_json::json!({
+                    "push": push.0,
+                    "key": key,
+                    "bytes": total,
+                }))
+                .map_err(|e| Error::Internal(e.to_string()))?,
+                "application/json",
+            ),
+            Err(e) => {
+                let _: serde_json::Value = stub_json(
+                    &stub,
+                    route,
+                    "/_do/push/abort",
+                    &serde_json::json!({ "push_id": push.0 }),
+                    &mut budget,
+                )
+                .await
+                .unwrap_or_default();
+                Err(e)
+            }
+        },
+    }
+}
+
+/// Bounded body for _admin/import — commands for a many-ref import run to a few
+/// hundred KB, so this gets its own cap rather than json_body's 4 KiB.
+async fn import_body(req: &mut Request) -> Result<serde_json::Value, Error> {
+    if let Some(n) = req
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if n > (4 << 20) {
+            return Err(Error::Protocol("import body too large".into()));
+        }
+    }
+    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    if body.len() > (4 << 20) {
+        return Err(Error::Protocol("import body too large".into()));
+    }
+    serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("import body: {e}")))
+}
+
+/// POST /:owner/:repo/_admin/import {push, parts:[{key,bytes}], commands:[{old,new,name,peeled?}]}
+/// — point a queued import_pack job at the staged pack(s) (I1). The DO validates
+/// that every part lives under this repo's pending/ namespace; the job rides the
+/// stage call's open push to the same commit_push a live push runs.
+async fn import_begin(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    let principal = auth::authenticate(&req, env, Level::Write, route, spend).await?;
+    let v = import_body(&mut req).await?;
+    let ok_id = |s: &str| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let push = v
+        .get("push")
+        .and_then(|p| p.as_str())
+        .filter(|p| ok_id(p))
+        .ok_or_else(|| Error::Protocol("import needs a push id".into()))?;
+    let parts = v.get("parts").and_then(|p| p.as_array()).filter(|p| !p.is_empty()).ok_or_else(|| {
+        Error::Protocol("import needs parts:[{key,bytes}]".into())
+    })?;
+    for part in parts {
+        if part.get("key").and_then(|k| k.as_str()).is_none()
+            || part.get("bytes").and_then(|b| b.as_u64()).is_none()
+        {
+            return Err(Error::Protocol("part needs {key,bytes}".into()));
+        }
+    }
+    let commands = v.get("commands").and_then(|c| c.as_array()).filter(|c| !c.is_empty()).ok_or_else(|| {
+        Error::Protocol("import needs commands".into())
+    })?;
+    for c in commands {
+        for f in ["old", "new", "name"] {
+            if c.get(f).and_then(|x| x.as_str()).is_none() {
+                return Err(Error::Protocol(format!("command needs {f}")));
+            }
+        }
+    }
+    let pack = PackId::random()?;
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    let out: serde_json::Value = stub_json(
+        &stub,
+        route,
+        "/_do/import/start",
+        &serde_json::json!({
+            "push": push,
+            "pack": pack.0,
+            "parts": parts,
+            "principal": principal,
+            "commands": commands,
+        }),
+        &mut budget,
+    )
+    .await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
+/// GET /:owner/:repo/_admin/import/<push> — job/push progress for a staged import.
+async fn import_status(req: &Request, env: &Env, route: &RepoRoute, push: &str, spend: &Spend) -> Result<Response, Error> {
+    auth::authenticate(req, env, Level::Write, route, spend).await?;
+    if push.is_empty() || push.len() > 64 || !push.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(Error::Protocol("bad push id".into()));
+    }
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    let out: serde_json::Value =
+        stub_json(&stub, route, "/_do/import/status", &serde_json::json!({ "push": push }), &mut budget).await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
 /// GET /:owner/:repo/_admin/export — stream a v3 git bundle of every live ref.
 /// Read-level auth suffices (anonymous on a public repo); the DO builds the pack
 /// with the same send_set machinery as fetch, framed by the bundle header.
 async fn export_bundle(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate(req, env, Level::Read, route, spend).await?;
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
-    let mut resp = stub_raw(&stub, route, "/_do/export", Vec::new(), &mut budget).await?;
+    let mut resp = stub_raw(&stub, route, "/_do/export", Vec::new(), &mut budget, None).await?;
     if resp.status_code() != 200 {
         return Err(Error::from_do_response(resp, &budget).await);
     }
@@ -671,6 +1062,7 @@ async fn receive_inner(
         "/_do/push/commit",
         &serde_json::json!({
             "push_id": push.0, "pack_id": pack.map(|p| p.0), "principal": principal, "commands": commands,
+            "atomic": hdr.caps.atomic,
         }),
         &mut budget,
     )
@@ -712,6 +1104,7 @@ fn leak_reason(m: &str) -> &'static str {
         "missing necessary objects" => "missing necessary objects",
         "gc ran during push, retry" => "gc ran during push, retry",
         "ref is pinned" => "ref is pinned",
+        "ref outside token scope" => "ref outside token scope",
         _ => "failed to update ref",
     }
 }

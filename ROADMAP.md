@@ -15,30 +15,35 @@ Public repos staged-pushed to a local worker via `tests/bench/oss-bench.sh`
 | sinatra/sinatra | 4,684 | 22.6k | 8 MiB | 1 push, 11 s | 2 s, fsck clean | fits |
 | expressjs/express | 6,169 | 32.5k | 11 MiB | 2 pushes, 15 s | 8 s, fsck clean | fits |
 | vitejs/vite | 9,678 | 110k | 75 MiB | 4 pushes, 337 s | 133 s, fsck clean | fits |
-| facebook/react | 21,698 | 263k | 1,078 MiB | 25 pushes, 337 s | **413** | import fits, clone over budget |
-| rails/rails | 99,661 | 787k | 308 MiB | 39 pushes, 644 s | **413** | import fits, clone over budget |
-| microsoft/TypeScript | 39,366 | 945k | 2,805 MiB | stopped | — | **import infeasible** — single commit introduces 222k objects; can't stage below one-commit granularity |
+| facebook/react | 21,698 | 263k | 1,078 MiB | 25 pushes, 337 s | **18.7 s inline / 14.8 s via packfile-uris, fsck clean** | fits post-A29/A30 |
+| rails/rails | 99,661 | 787k | 308 MiB | 39 pushes, 644 s | **fsck clean** — consolidated 23→1 pack (718,383 objects) then verbatim-cloned | fits post-A29/A30 |
+| facebook/react — all refs | 21,698+branches/tags | 462k | 1,123 MiB | server-side import (1 job, dead-MPU rebuild survived) | 219 s for 6.41 GiB, fsck clean, 1,149 refs exact | fits via #25 |
+| microsoft/TypeScript | 39,366 | 984,826 | 2,720 MiB | server-side import, ~1h52m, 44 parts | 1,020 s via packfile-uris (18.63 GiB normalized), fsck clean, 324 refs + HEAD exact | fits via #25 — inline clone needs `fetch.uriprotocols` past ~7 GiB wire |
+
+**Re-bench post-A29/A30 (C2/C1):** the react clone that used to die at HTTP 413
+now streams the consolidated pack verbatim — `x-ge-subrequests: 1/9000`, one R2
+GET for the whole 1.08 GiB. The URI-offloaded variant moves pack bytes off the
+Worker entirely. The remaining wall was import-side only.
 
 **The binding constraints are now mapped.** Import scales far past the profile
 (rails' 787k objects landed fine in 39 slices); the walls that bite are:
 
 - **~100 MB request body cap** on initial import — staged pushes (or the
-  `tools/git-edge-import.sh` slicer) are the workaround.
-- **Single-commit object explosions can't be staged** — TypeScript carries a
-  commit that alone introduces ~222k objects; staged-push granularity is one
-  commit, so no client-side slicing can get it under the ingest budget. This
-  is the concrete case for server-side import (`POST /_admin/import`).
-- **Per-request subrequest budget on clone/fetch** — somewhere between
-  110k objects (vite ✓) and 263k objects (react ✗) a full clone exhausts the
-  request budget and the DO returns `Error::Budget` → HTTP 413 mid-walk.
-  `blob:none` does not help: the budget is spent on object-index reads
-  (commits + trees), not blob bytes. Everything else has 5–25× headroom at
-  profile scale (200k-commit walk, 1M objects/fetch, 2M objects/pack,
-  2 GiB pending pack, 65k refs).
+  `tools/git-edge-import.sh` slicer) are the workaround; for a pack that can't
+  be sliced (one giant commit), `POST /_admin/import` runs the ingest as a job.
+- ~~**Single-commit object explosions can't be staged**~~ — `/_admin/import`
+  (I1) ingests a staged pack across resumable job slices; a 222k-object commit
+  no longer has to fit inside one request. Conformance covers stage → job →
+  commit → clone/fsck; the 462k-object react pack validates scale in flight.
+- **Per-request subrequest budget on clone/fetch** — cleared by A29: a
+  consolidated single-pack repo streams verbatim at ~1 subrequest instead of
+  thousands. Non-consolidated or have-heavy fetches still walk the index.
+  Everything else has 5–25× headroom at profile scale (200k-commit walk,
+  1M objects/fetch, 2M objects/pack, 2 GiB pending pack, 65k refs).
 
 For the small-app profile — typically well under 50k objects — both clone and
 import sit comfortably inside limits. Repos in the react/rails class import
-fine but need a lift on the fetch budget before they can be cloned.
+fine and clone fine once GC consolidates them to one live pack.
 
 The original (private-repo) benchmark flushed out two real bugs, both long fixed:
 
@@ -60,7 +65,7 @@ The original (private-repo) benchmark flushed out two real bugs, both long fixed
 | 5 | ~~**Anonymous/public read**~~ | done — `meta.public` flag via `POST /_admin/public`; anonymous reads only when no credential presented | S |
 | 6 | ~~**Dead-job / GC alerting**~~ | done — `blob3=dead` job datapoints + `jobs_dead` gauge per alarm pass; alert wiring documented (A18) | S |
 | 7 | ~~**Job-lifecycle metrics**~~ | done — `job_event` datapoints: kind/event/outcome/error-class/attempt/duration (A17) | S |
-| 8 | **Agent skill** | ship `.devin/skills/git-edge` (or AGENTS.md section): clone/push URLs, `_admin/tokens` minting, staged-push recipe for >80 MiB, credential-helper config (never tokens in URLs — process-listing leak), `_state` introspection | S |
+| 8 | ~~**Agent skill**~~ | done — `.devin/skills/git-edge/SKILL.md`: URL shape, credential-helper recipes (never tokens in URLs), `_admin/tokens` mint/revoke, staged-push recipe for >80 MiB, `_state` introspection, limits table incl. A29/A30 clone scale | S |
 
 ## Priority 1 — production hardening
 
@@ -79,14 +84,15 @@ The original (private-repo) benchmark flushed out two real bugs, both long fixed
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| 17 | **`--atomic` push** | single-ref agent pushes don't need it; multi-ref CI flows do | M |
-| 18 | **Repo rename / owner move** | cosmetic; delete+repush covers it | S |
-| 19 | **Per-ref token scopes / deploy keys** | read/write covers the profile; per-branch ACLs are the GitHub-shaped feature nobody asked for yet | M |
-| 20 | **Custom domain + Cloudflare Access** | zero-code auth upgrade if a zone exists | S |
-| 21 | **Git LFS** | the structural answer for >100 MB assets; the profile rarely needs it — revisit when a real workload does | L |
-| 22 | **Streaming no-walk clone** | removes the 200k-commit bound; irrelevant below it | M |
+| 17 | ~~**`--atomic` push**~~ | done — advertised; `commit_push` dry-runs every command's CAS predicate before any write, whole push rejects on any failure (git's `atomic push failed` wording, pack demotes for the janitor) | M |
+| 18 | ~~**Repo rename / owner move**~~ | resolved-wontfix — `id_from_name(owner/repo)` makes the DO name immutable; a registry indirection on every hot path is disproportionate for cosmetics. Delete+repush is the documented recipe (SKILL.md) | S |
+| 19 | ~~**Per-ref token scopes / deploy keys**~~ | done — `scope` on token mint (full `refs/…` pattern, optional trailing `*`), captured into `pushes.scope` at begin, enforced centrally in `apply_one` for pushes and `import_start` for imports; `token_list` exposes it | M |
+| 20 | ~~**Custom domain + Cloudflare Access**~~ | done — deployment/config documentation in PRODUCTION-UAT.md (workers.dev vs custom domain, Access in front, bindings/secrets/rollback) | S |
+| 21 | ~~**Git LFS**~~ | done — basic transfer: `POST /info/lfs/objects/batch` + HMAC-signed `GET|PUT /_lfs/<oid>` URLs (A30 key, `lfs`-domain-separated sig binds repo+oid+expiry+op); objects under `r/<id>/lfs/` inside the purge prefix; upload quota = packs + lfs + declared ≤ `GE_QUOTA_MAX_BYTES`; no verify/locking/custom transfers (A33) | L |
+| 22 | ~~**Streaming no-walk clone**~~ | done — `no_walk_set` marks every live-pack bit and rides `plan_reads`/`FetchStream`; plain clones stream all live objects in (pack_id, idx) order, no 200k-commit walk | M |
 | 23 | ~~**Verbatim consolidated-pack fast path**~~ | done — packs_live=1 + plain-clone shape streams the live pack verbatim as the fetch response; 1 subrequest per R2 `get` instead of thousands of entry reads (A29). Lifts the 110k–263k-object clone wall for default clients once a repo consolidates | M |
-| 24 | **`packfile-uris` offload** | same coverage test as #23 but hands the client a signed `/packs/<key>` URL — clone spend ~10 subrequests, bandwidth bypasses the Worker. Opt-in (`fetch.uriprotocols` defaults empty). Design: `findings/scale-ceilings.md` C1 | M |
+| 24 | ~~**`packfile-uris` offload**~~ | done — same coverage test as #23; opted-in clients (`fetch.uriprotocols`) get a signed `/_packs/<id>.pack` URL (HMAC-SHA256 over repo_id+pack+expiry, `GE_URL_SIGNING_KEY`), inline packfile is a valid empty pack, hash token is the real trailer SHA-1 (A30). Clone spend ~4 subrequests; bandwidth bypasses the Worker | M |
+| 25 | ~~**Server-side resumable import (I1)**~~ | done — `POST /_admin/import/stage` (stream a pack part to `pending/`) + `POST /_admin/import` starts an `import_pack` job that ingests the staged pack across alarm slices: pass A parses a persistent `import_toc`, pass B normalizes entries into a resumable output MPU with `import_open`/`import_parts` crash-resume, links live in `push_links` (no 1M cap), commit rides `commit_push` atomically. Kills the single-commit ingest ceiling | L |
 
 ## Wild bucket — parked, worth remembering
 

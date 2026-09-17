@@ -6,17 +6,21 @@ use worker::{Headers, Method, Request, RequestInit, Response, Stub};
 use crate::error::Error;
 use crate::ReqBudget;
 
-/// x-ge-owner / x-ge-repo, set by the edge on every stub request (section 8.1).
+/// x-ge-owner / x-ge-repo / x-ge-base, set by the edge on every stub request
+/// (section 8.1). `base` is the public origin (scheme://host[:port]) — present
+/// only on routes that may compose client-facing URLs (fetch: packfile-uris).
 pub struct RepoHeaders {
     pub owner: Option<String>,
     pub repo: Option<String>,
+    pub base: Option<String>,
 }
 impl RepoHeaders {
-    pub const NONE: RepoHeaders = RepoHeaders { owner: None, repo: None };
+    pub const NONE: RepoHeaders = RepoHeaders { owner: None, repo: None, base: None };
     pub fn from_request(req: &Request) -> Self {
         Self {
             owner: req.headers().get("x-ge-owner").ok().flatten(),
             repo: req.headers().get("x-ge-repo").ok().flatten(),
+            base: req.headers().get("x-ge-base").ok().flatten(),
         }
     }
 }
@@ -27,7 +31,7 @@ pub struct RepoRoute {
     pub repo: String,
 }
 impl RepoRoute {
-    fn seg_ok(s: &str) -> bool {
+    pub(crate) fn seg_ok(s: &str) -> bool {
         (1..=64).contains(&s.len())
             && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
             && s != "."
@@ -131,14 +135,20 @@ pub async fn stub_json<T: serde::de::DeserializeOwned>(
 }
 
 /// Forward a raw pkt-line body to a DO route (ls-refs, fetch). The response streams back as-is.
+/// `base` is the public request origin — forwarded as x-ge-base on the fetch route so the DO
+/// can compose client-facing packfile-uris URLs (A30).
 pub async fn stub_raw(
     stub: &Stub,
     repo: &RepoRoute,
     path: &str,
     body: Vec<u8>,
     budget: &mut ReqBudget,
+    base: Option<&str>,
 ) -> Result<Response, Error> {
     budget.charge(1)?;
-    let req = repo.internal_request(path, body)?;
+    let mut req = repo.internal_request(path, body)?;
+    if let Some(b) = base {
+        req.headers_mut()?.set("x-ge-base", b)?;
+    }
     stub.fetch_with_request(req).await.map_err(|e| Error::Storage(e.to_string()))
 }

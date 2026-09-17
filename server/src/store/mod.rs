@@ -145,6 +145,16 @@ pub mod keys {
     pub fn pending(repo: &RepoId, push: &PushId) -> String {
         format!("r/{}/pending/{}.pack", repo.0, push.0)
     }
+    /// I1 staged-part key — shares the push's `pending/<id>.` prefix so a janitor
+    /// prefix sweep reaps every part with the push.
+    pub fn pending_part(repo: &RepoId, push: &PushId, part: &str) -> String {
+        format!("r/{}/pending/{}.part-{}", repo.0, push.0, part)
+    }
+    /// LFS object content (#21) — sits under the repo's prefix so purge_repo's
+    /// `r/<id>/` sweep reaps it with everything else.
+    pub fn lfs(repo: &RepoId, oid: &str) -> String {
+        format!("r/{}/lfs/{}", repo.0, oid)
+    }
 }
 
 /// Sync, no `worker` imports (1.2).
@@ -503,6 +513,24 @@ impl PackWriter {
     pub fn buffered(&self) -> u64 {
         self.part.len() as u64
     }
+    /// The buffered bytes themselves — the undrained tail a GC yield persists.
+    pub fn buffered_bytes(&self) -> &[u8] {
+        &self.part
+    }
+    /// GC resume counterpart of `buffered_bytes`: load a persisted tail back into
+    /// the buffer. `extra`/`lo`/`hi` fold the tail's already-completed entries back
+    /// into the writer's counters (their `ObjRow`s were posted at the yield).
+    pub fn resume_tail(&mut self, bytes: &[u8], extra: u32, lo: u64, hi: u64) {
+        self.offset = self
+            .offset
+            .saturating_sub(self.part.len() as u64)
+            .saturating_add(bytes.len() as u64);
+        self.part.clear();
+        self.part.extend_from_slice(bytes);
+        self.count = self.count.saturating_add(extra);
+        self.commit_lo = self.commit_lo.min(lo);
+        self.commit_hi = self.commit_hi.max(hi);
+    }
     /// Append raw pack bytes verbatim: any chunk of an entry's `varint header + zlib
     /// body`, exactly as it appeared in the source pack. The caller ends each logical
     /// entry with `raw_entry_done` — checkpoints and index rows must never split one.
@@ -543,6 +571,17 @@ impl PackWriter {
             let _ = self.mpu.abort().await;
             return Err(e);
         }
+        self.seal(budget).await
+    }
+    /// finish() for a resumable caller (the import job): a mid-finish failure —
+    /// a transient part-upload error, a fixed-in-a-later-build check — leaves
+    /// the MPU and its parts alive so the retry resumes the checkpoint and
+    /// re-finishes instead of rebuilding gigabytes of output from scratch.
+    pub async fn finish_resumable(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+        self.finish_inner(budget).await?;
+        self.seal(budget).await
+    }
+    async fn seal(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
         let bytes = self.offset.saturating_add(20);
         budget.charge(1)?;
         let obj = self
@@ -649,6 +688,25 @@ impl PackWriter {
         )))
     }
 
+    /// Describe the durable state right now — valid only when `buffered() < PART`
+    /// (all full parts drained via checkpoint/flush_if_full), so `pos` is exactly
+    /// the uploaded prefix and `sha` covers exactly those bytes. The import job
+    /// snapshots at slice end; GC uses checkpoint()'s return instead.
+    pub fn snapshot(&self) -> WriterCkpt {
+        WriterCkpt {
+            pos: self.offset.saturating_sub(self.part.len() as u64),
+            sha: self.sha1.clone(),
+            count: self.count,
+            expected: self.expected,
+            commit_lo: self.commit_lo,
+            commit_hi: self.commit_hi,
+        }
+    }
+    /// Etags of all uploaded parts, in part order — the resume token.
+    pub fn etags(&self) -> Vec<String> {
+        self.parts.iter().map(|p| p.etag()).collect()
+    }
+
     /// Rebind to an existing multipart upload and resume at a checkpoint (5.2).
     /// `etags` are the parts already uploaded, in order.
     pub async fn resume(
@@ -668,14 +726,25 @@ impl PackWriter {
             })
             .collect();
         let created_at = platform::now_ms();
+        // pos==0 means nothing ever uploaded — the 12-byte header was buffered-only
+        // and is lost, so the resumed writer re-emits it (the durable sha covers no
+        // bytes yet, so the header is hashed when its part finally lands)
+        let (part, offset) = if state.pos == 0 {
+            (
+                gix_pack::data::header::encode(gix_pack::data::Version::V2, state.expected).to_vec(),
+                12,
+            )
+        } else {
+            (Vec::new(), state.pos)
+        };
         Ok(Self {
             mpu,
             pack: PackId(
                 key.rsplit('/').next().and_then(|f| f.strip_suffix(".pack")).unwrap_or_default().to_string(),
             ),
-            part: Vec::new(),
+            part,
             parts,
-            offset: state.pos,
+            offset,
             count: state.count,
             expected: state.expected,
             sha1: state.sha.clone(),
@@ -914,23 +983,50 @@ pub mod schema {
         "CREATE TABLE IF NOT EXISTS refs (name TEXT PRIMARY KEY, target TEXT NOT NULL, peeled TEXT, updated_at INTEGER NOT NULL) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS reflog (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, old TEXT NOT NULL, new TEXT NOT NULL, push_id TEXT NOT NULL, principal TEXT NOT NULL, at INTEGER NOT NULL)",
         "CREATE INDEX IF NOT EXISTS reflog_at ON reflog(at)",
-        "CREATE TABLE IF NOT EXISTS pushes (id TEXT PRIMARY KEY, state TEXT NOT NULL, pack_id TEXT, principal TEXT NOT NULL, began_at INTEGER NOT NULL, ended_at INTEGER, gc_epoch INTEGER NOT NULL, result TEXT, swept_at INTEGER) WITHOUT ROWID",
+        "CREATE TABLE IF NOT EXISTS pushes (id TEXT PRIMARY KEY, state TEXT NOT NULL, pack_id TEXT, principal TEXT NOT NULL, began_at INTEGER NOT NULL, ended_at INTEGER, gc_epoch INTEGER NOT NULL, result TEXT, swept_at INTEGER, scope TEXT) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS pushes_state ON pushes(state)",
         "CREATE TABLE IF NOT EXISTS packs (id TEXT PRIMARY KEY, state TEXT NOT NULL, count INTEGER NOT NULL, bytes INTEGER NOT NULL, commit_lo INTEGER NOT NULL, commit_hi INTEGER NOT NULL, push_id TEXT, created_at INTEGER NOT NULL, dead_at INTEGER) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS packs_state ON packs(state)",
         "CREATE TABLE IF NOT EXISTS objects (sha TEXT NOT NULL, pack_id TEXT NOT NULL, idx INTEGER NOT NULL, offset INTEGER NOT NULL, len INTEGER NOT NULL, kind INTEGER NOT NULL, size INTEGER NOT NULL, PRIMARY KEY (sha, pack_id)) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS objects_pack ON objects(pack_id, idx)",
         "CREATE INDEX IF NOT EXISTS objects_pack_off ON objects(pack_id, offset)",
-        "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, run_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, cursor TEXT, payload TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'queued', last_error TEXT, started_at INTEGER, lease TEXT)",
+        "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, run_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, cursor TEXT, payload TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'queued', last_error TEXT, started_at INTEGER, lease TEXT, strands INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS marked (pack_id TEXT PRIMARY KEY, bitmap BLOB NOT NULL) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_frontier (sha TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_seen (sha TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS gc_parts (part_no INTEGER PRIMARY KEY, etag TEXT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL, level TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID",
+        // GcConsolidate yield persistence: the undrained <PART tail of the output
+        // buffer, chunked. Without it a slice that can't fill one part inside the
+        // request budget (sparse marks => ~1 read per entry) replays forever.
+        "CREATE TABLE IF NOT EXISTS gc_tail (seq INTEGER PRIMARY KEY, blob BLOB NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL, level TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL, scope TEXT) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS tokens_hash ON tokens(hash)",
         "CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, sha TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID",
         // A27: sliding-window rate counters — one row per (bucket, minute window).
         "CREATE TABLE IF NOT EXISTS rate (bucket TEXT NOT NULL, window INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (bucket, window)) WITHOUT ROWID",
+        // I1 import staging: object references for the 2.5 connectivity check live
+        // here instead of memory, so an import job can span slices — and a push
+        // whose links exceed MAX_LINKS can overflow onto the same table.
+        "CREATE TABLE IF NOT EXISTS push_links (push_id TEXT NOT NULL, sha TEXT NOT NULL, PRIMARY KEY (push_id, sha)) WITHOUT ROWID",
+        // the entry TOC parsed off the staged pack, one row per pack entry:
+        // ktype 0-3 = gix kind; 4 = ofs-delta (kaux_n = base distance); 5 = ref-delta
+        // (kaux_id = base sha hex). idx is the entry's ordinal in the pack.
+        "CREATE TABLE IF NOT EXISTS import_toc (push_id TEXT NOT NULL, idx INTEGER NOT NULL, offset INTEGER NOT NULL, hlen INTEGER NOT NULL, ktype INTEGER NOT NULL, kaux_n INTEGER, kaux_id TEXT, clen INTEGER NOT NULL, size INTEGER NOT NULL, PRIMARY KEY (push_id, idx)) WITHOUT ROWID",
+        "CREATE INDEX IF NOT EXISTS import_toc_off ON import_toc(push_id, offset)",
+        // MPU part etags for the import's output pack — same role as gc_parts.
+        "CREATE TABLE IF NOT EXISTS import_parts (push_id TEXT NOT NULL, part_no INTEGER NOT NULL, etag TEXT NOT NULL, PRIMARY KEY (push_id, part_no)) WITHOUT ROWID",
+        // I1 crash-resume: entry idx -> output-pack byte offset where its write started
+        // (off, at first append) and where its objects row posted (end = offset+len —
+        // NULL until then). Done = end <= the durable boundary; the last writer at or
+        // below it is the mid-entry resume point. sha/kind/size shadow the eventual
+        // objects row so a fully-durable-but-unposted entry can be restored without
+        // a byte replay (PackWriter cannot write out of order).
+        "CREATE TABLE IF NOT EXISTS import_open (push_id TEXT NOT NULL, idx INTEGER NOT NULL, off INTEGER NOT NULL, end INTEGER, sha TEXT, kind INTEGER, size INTEGER, PRIMARY KEY (push_id, idx)) WITHOUT ROWID",
+        "CREATE INDEX IF NOT EXISTS import_open_off ON import_open(push_id, off)",
+        // A32 for the import side: the undrained <PART writer tail, chunked
+        // under the SqlStorage value ceiling — persisted at yield, reloaded at
+        // resume so a sub-part slice's appends don't die with the isolate
+        "CREATE TABLE IF NOT EXISTS import_tail (push_id TEXT NOT NULL, seq INTEGER NOT NULL, blob BLOB NOT NULL, PRIMARY KEY (push_id, seq)) WITHOUT ROWID",
     ];
     /// Columns added after first deploy. CREATE TABLE IF NOT EXISTS never updates an
     /// existing table, so DOs booted under an older schema need ALTER TABLE — SQLite
@@ -940,6 +1036,12 @@ pub mod schema {
         ("packs", "dead_at", "dead_at INTEGER"),
         ("jobs", "started_at", "started_at INTEGER"),
         ("jobs", "lease", "lease TEXT"),
+        ("jobs", "strands", "strands INTEGER NOT NULL DEFAULT 0"),
+        ("import_open", "sha", "sha TEXT"),
+        ("import_open", "kind", "kind INTEGER"),
+        ("import_open", "size", "size INTEGER"),
+        ("tokens", "scope", "scope TEXT"),
+        ("pushes", "scope", "scope TEXT"),
     ];
     pub fn migrate(sql: &SqlStorage) -> Result<(), Error> {
         for q in DDL {

@@ -10,6 +10,8 @@ use gix_object::Kind;
 use gix_pack::data::{entry::Header, Entry as PackEntry, File};
 use gix_zlib::{Compression, Decompress, FlushDecompress, Inflate, Status};
 
+use worker::{SqlStorage, SqlStorageValue as V};
+
 use crate::edge::BodyReader;
 use crate::error::Error;
 use crate::store::{codec, keys, Bucket, ObjLoc, ObjRow, PackWriter, PushId, RawWriter};
@@ -17,6 +19,8 @@ use crate::ReqBudget;
 
 use super::run::IndexSink;
 
+
+#[derive(Clone, Copy)]
 pub struct EntryRec {
     pub offset: u64,
     pub header_len: u8,
@@ -29,16 +33,16 @@ pub struct EntryRec {
 // alone must leave room for Cache (48 MiB) + window + part buffer inside a 128 MiB
 // isolate — 750k records ≈ 36 MiB keeps the worst-case sum comfortably under it
 const MAX_ENTRIES: usize = 750_000;
-const MAX_OBJ: u64 = 16 << 20; // A7
+pub const MAX_OBJ: u64 = 16 << 20; // A7
 /// A8: ceiling on a streamed blob's *decompressed* size, checked from the header in
 /// pass A. Pass A inflates the whole stream to validate and pass B re-inflates it to
 /// hash — with zlib's ~1000:1 ratio an uncapped entry could cost terabytes of CPU.
-const MAX_STREAM_BLOB: u64 = 2 << 30;
+pub const MAX_STREAM_BLOB: u64 = 2 << 30;
 /// One entry's *compressed* wire size. `decompressed_size` ≤ 16 MiB bounds output but a
 /// deflate stream can carry ~5 bytes-in/0 bytes-out padding, so an entry could claim a
 /// ~2 GiB compressed length — which pass B would then range-read into memory whole.
 /// A real 16 MiB object compresses to < ~17 MiB; 32 MiB is generous headroom.
-const MAX_ENTRY_WIRE: u64 = 32 << 20;
+pub const MAX_ENTRY_WIRE: u64 = 32 << 20;
 /// Total compressed bytes held by in-flight delta chains across every nested
 /// resolve_at frame — the aggregate bound MAX_CHAIN_BYTES alone can't provide.
 const MAX_CHAIN_LIVE: u64 = 128 << 20;
@@ -191,7 +195,7 @@ enum Key {
 type Obj = (Kind, Rc<Vec<u8>>);
 
 #[derive(Default)]
-struct Cache {
+pub struct Cache {
     bytes: usize,
     map: HashMap<Key, Obj>,
     order: VecDeque<Key>,
@@ -214,12 +218,47 @@ impl Cache {
     }
 }
 
-struct Window<'a> {
-    bucket: &'a Bucket,
-    key: &'a str,
-    pack_len: u64,
-    start: u64,
-    buf: Vec<u8>,
+/// Where entry bytes live: one R2 object (push pending pack) or a list of
+/// staged part objects read as one concatenated stream (I1 import).
+pub enum Source<'a> {
+    Key(&'a str),
+    /// (key, length) pairs in order — offsets index into the concatenation.
+    Parts(&'a [(String, u64)]),
+}
+impl Source<'_> {
+    async fn read(&self, bucket: &Bucket, off: u64, n: u64, budget: &mut ReqBudget) -> Result<Vec<u8>, Error> {
+        match self {
+            Source::Key(k) => bucket.read_range(k, off, n, budget).await,
+            Source::Parts(parts) => {
+                let mut out = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
+                let want_end = off.saturating_add(n);
+                let mut base = 0u64;
+                for (key, len) in *parts {
+                    let end = base.saturating_add(*len);
+                    let (a, b) = (off.max(base), want_end.min(end));
+                    if a < b {
+                        out.extend_from_slice(&bucket.read_range(key, a - base, b - a, budget).await?);
+                    }
+                    if b >= want_end {
+                        break;
+                    }
+                    base = end;
+                }
+                if out.len() as u64 != n {
+                    return Err(Error::Storage("read past staged parts".into()));
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+pub struct Window<'a> {
+    pub bucket: &'a Bucket,
+    pub src: Source<'a>,
+    pub pack_len: u64,
+    pub start: u64,
+    pub buf: Vec<u8>,
 }
 impl Window<'_> {
     /// Raw bytes of one entry; slides to [offset, +8 MiB) with one range read when outside.
@@ -238,7 +277,7 @@ impl Window<'_> {
             Some(lo) => lo,
             None => {
                 let n = len.max(WINDOW).min(self.pack_len.saturating_sub(rec.offset));
-                self.buf = self.bucket.read_range(self.key, rec.offset, n, budget).await?;
+                self.buf = self.src.read(self.bucket, rec.offset, n, budget).await?;
                 self.start = rec.offset;
                 0
             }
@@ -249,24 +288,298 @@ impl Window<'_> {
         );
         self.buf.get(a..b).map(<[u8]>::to_vec).ok_or_else(|| Error::Storage("entry outside window".into()))
     }
+    /// Raw range read for the verbatim blob path — same source abstraction.
+    async fn read(&mut self, off: u64, n: u64, budget: &mut ReqBudget) -> Result<Vec<u8>, Error> {
+        self.src.read(self.bucket, off, n, budget).await
+    }
 }
 
-struct Cx<'a> {
-    win: Window<'a>,
-    cache: Cache,
-    z: Inflate,
-    by_id: HashMap<ObjectId, usize>,
-    external: &'a HashMap<ObjectId, ObjLoc>,
+/// Thin-pack base lookup: the edge's prefetched map, or the live objects index
+/// for an in-DO job (I1 resolves bases lazily, slice after slice).
+pub enum Externals<'a> {
+    Map(&'a HashMap<ObjectId, ObjLoc>),
+    Idx(&'a crate::store::Index<'a>),
+}
+impl Externals<'_> {
+    fn get(&self, id: &ObjectId) -> Result<Option<ObjLoc>, Error> {
+        match self {
+            Externals::Map(m) => Ok(m.get(id).cloned()),
+            Externals::Idx(idx) => Ok(idx.lookup(&[*id])?.into_iter().next().flatten()),
+        }
+    }
+}
+
+/// object id -> entry index: the edge's in-memory map, or the objects table for
+/// an in-DO job. Posted rows are already durable; `mem` covers the current
+/// slice's unposted rows so a ref-delta can resolve a same-batch base.
+pub enum IdMap<'a> {
+    Map(HashMap<ObjectId, usize>),
+    Sql { idx: &'a crate::store::Index<'a>, pack: &'a str, mem: HashMap<ObjectId, usize> },
+}
+impl IdMap<'_> {
+    fn get(&self, id: &ObjectId) -> Result<Option<usize>, Error> {
+        match self {
+            IdMap::Map(m) => Ok(m.get(id).copied()),
+            IdMap::Sql { idx, pack, mem } => {
+                if let Some(i) = mem.get(id) {
+                    return Ok(Some(*i));
+                }
+                idx.lookup_in_pack(id, &crate::store::PackId((*pack).to_string()))
+                    .map(|l| l.map(|l| l.idx as usize))
+            }
+        }
+    }
+    fn insert(&mut self, id: ObjectId, i: usize) {
+        match self {
+            IdMap::Map(m) => {
+                m.insert(id, i);
+            }
+            IdMap::Sql { mem, .. } => {
+                mem.insert(id, i);
+            }
+        }
+    }
+}
+
+/// The pass-A entry table: the edge's in-memory Vec, or the import job's
+/// `import_toc` rows — by-idx and by-offset lookups stay O(log n) either way, so
+/// a pack too big to hold in memory still resolves.
+pub enum Toc<'a> {
+    Mem(&'a [EntryRec]),
+    Sql { sql: &'a SqlStorage, push: &'a str },
+}
+impl Toc<'_> {
+    pub fn by_idx(&self, i: usize) -> Result<Option<EntryRec>, Error> {
+        match self {
+            Toc::Mem(v) => Ok(v.get(i).copied()),
+            Toc::Sql { sql, push } => Self::get(
+                sql,
+                "SELECT offset,hlen,ktype,kaux_n,kaux_id,clen,size FROM import_toc WHERE push_id=? AND idx=?",
+                vec![V::from(*push), V::from(i64::try_from(i).map_err(internal)?)],
+            ),
+        }
+    }
+    pub fn by_off(&self, off: u64) -> Result<Option<EntryRec>, Error> {
+        match self {
+            Toc::Mem(v) => Ok(v
+                .binary_search_by_key(&off, |r| r.offset)
+                .ok()
+                .map(|i| v[i])),
+            Toc::Sql { sql, push } => Self::get(
+                sql,
+                "SELECT idx,offset,hlen,ktype,kaux_n,kaux_id,clen,size FROM import_toc WHERE push_id=? AND offset=?",
+                vec![V::from(*push), V::from(i64::try_from(off).map_err(internal)?)],
+            ),
+        }
+    }
+    fn get(sql: &SqlStorage, q: &str, args: Vec<V>) -> Result<Option<EntryRec>, Error> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            idx: Option<i64>,
+            offset: i64,
+            hlen: i64,
+            ktype: i64,
+            kaux_n: Option<i64>,
+            kaux_id: Option<String>,
+            clen: i64,
+            size: i64,
+        }
+        let r = sql
+            .exec(q, Some(args))
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .to_array::<Row>()
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .into_iter()
+            .next();
+        let Some(r) = r else { return Ok(None) };
+        let u = |n: i64| -> Result<u64, Error> {
+            u64::try_from(n).map_err(|_| Error::Internal("negative in import_toc".into()))
+        };
+        let kind_or_delta = match r.ktype {
+            0 => Header::Commit,
+            1 => Header::Tree,
+            2 => Header::Blob,
+            3 => Header::Tag,
+            4 => Header::OfsDelta {
+                base_distance: u(r.kaux_n.ok_or_else(|| Error::Internal("ofs-delta without distance".into()))?)?,
+            },
+            5 => Header::RefDelta {
+                base_id: crate::repo_do::oid(
+                    r.kaux_id.as_deref().ok_or_else(|| Error::Internal("ref-delta without base id".into()))?,
+                )?,
+            },
+            k => return Err(Error::Internal(format!("bad import_toc.ktype {k}"))),
+        };
+        let _ = r.idx; // by_off selects it; by_idx queries by it
+        Ok(Some(EntryRec {
+            offset: u(r.offset)?,
+            header_len: u8::try_from(r.hlen).map_err(|_| Error::Internal("hlen".into()))?,
+            kind_or_delta,
+            compressed_len: u32::try_from(r.clen).map_err(|_| Error::Internal("clen".into()))?,
+            size: u(r.size)?,
+        }))
+    }
+}
+
+/// The resolve loop's row/link/tag sink: the edge posts rows over the stub; an
+/// in-DO job writes them straight to SQLite (and spills links to push_links so
+/// the set survives slice boundaries).
+pub enum AnySink<'a, 'b> {
+    Edge(&'a mut super::run::IndexSink<'b>),
+    Job(&'a mut JobSink<'b>),
+}
+impl AnySink<'_, '_> {
+    pub async fn post(&mut self, rows: &[ObjRow], budget: &mut ReqBudget) -> Result<(), Error> {
+        match self {
+            AnySink::Edge(s) => s.post(rows, budget).await,
+            AnySink::Job(s) => s.post(rows, budget).await,
+        }
+    }
+    /// 2.5 links bookkeeping — bounded by MAX_LINKS either way.
+    pub fn push_links(&mut self, links: Vec<ObjectId>) -> Result<(), Error> {
+        match self {
+            AnySink::Edge(s) => {
+                s.links.extend(links);
+                if s.links.len() > super::run::MAX_LINKS {
+                    return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
+                }
+                Ok(())
+            }
+            AnySink::Job(s) => s.push_links(links),
+        }
+    }
+    pub fn tags_mut(&mut self) -> &mut HashMap<ObjectId, ObjectId> {
+        match self {
+            AnySink::Edge(s) => &mut s.tags,
+            AnySink::Job(s) => &mut s.tags,
+        }
+    }
+    /// Total links seen — the A5 bound applies to both shapes.
+    pub fn links_total(&self) -> usize {
+        match self {
+            AnySink::Edge(s) => s.links.len(),
+            AnySink::Job(s) => s.links_total,
+        }
+    }
+    /// Record an entry's output-pack start + object identity the moment its first
+    /// bytes append — the import job's crash-resume names straddling writers from
+    /// these rows. `sha` is None for the streamed-blob path (hash lands at seal).
+    /// Edge pushes never resume mid-run: no-op.
+    pub fn mark(&mut self, idx: usize, off: u64, sha: Option<ObjectId>, kind: Kind, size: u64) -> Result<(), Error> {
+        match self {
+            AnySink::Edge(_) => Ok(()),
+            AnySink::Job(s) => s.mark(idx, off, sha, kind, size),
+        }
+    }
+    /// The entry's wire span is complete: record its end offset and (for blobs)
+    /// its id. Writers ≤ the durable boundary with an end get direct-inserted on
+    /// resume; without one they're the mid-write straddler.
+    pub fn seal(&mut self, idx: usize, end: u64, sha: ObjectId) -> Result<(), Error> {
+        match self {
+            AnySink::Edge(_) => Ok(()),
+            AnySink::Job(s) => s.seal(idx, end, sha),
+        }
+    }
+}
+
+/// DO-side sink for the import job: objects rows and links batches go straight
+/// to SQLite — no stub, no subrequests, and links spill past the in-memory cap.
+pub struct JobSink<'a> {
+    pub sql: &'a worker::SqlStorage,
+    pub pack: crate::store::PackId,
+    pub push: &'a str,
+    pub links_buf: Vec<ObjectId>,
+    pub links_total: usize,
+    pub tags: HashMap<ObjectId, ObjectId>,
+}
+impl JobSink<'_> {
+    pub async fn post(&mut self, rows: &[ObjRow], _budget: &mut ReqBudget) -> Result<(), Error> {
+        crate::store::Index(self.sql).insert_objects(&self.pack, rows)?;
+        self.flush_links()
+    }
+    fn push_links(&mut self, links: Vec<ObjectId>) -> Result<(), Error> {
+        self.links_total = self.links_total.saturating_add(links.len());
+        if self.links_total > super::run::MAX_LINKS * 8 {
+            return Err(Error::Limit("push references too many objects (8,000,000 max)".into()));
+        }
+        self.links_buf.extend(links);
+        if self.links_buf.len() >= 10_000 {
+            self.flush_links()?;
+        }
+        Ok(())
+    }
+    /// Pending links → push_links. PRIMARY KEY dedups repeats for free.
+    pub fn flush_links(&mut self) -> Result<(), Error> {
+        if self.links_buf.is_empty() {
+            return Ok(());
+        }
+        for chunk in self.links_buf.chunks(50) {
+            let marks = std::iter::repeat("(?,?)").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let mut args = Vec::with_capacity(chunk.len() * 2);
+            for id in chunk {
+                args.push(worker::SqlStorageValue::from(self.push));
+                args.push(worker::SqlStorageValue::from(id.to_string().as_str()));
+            }
+            self.sql
+                .exec(&format!("INSERT OR IGNORE INTO push_links(push_id,sha) VALUES{marks}"), Some(args))
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        self.links_buf.clear();
+        Ok(())
+    }
+    /// entry idx -> output start + shadow row cols. Written at first append, so a
+    /// crash resume can name the entry whose bytes straddle the durable boundary —
+    /// attempt-order markers can't (a parked entry's prospective start collides
+    /// with the entry that actually writes there).
+    fn mark(&mut self, idx: usize, off: u64, sha: Option<ObjectId>, kind: Kind, size: u64) -> Result<(), Error> {
+        self.sql
+            .exec(
+                "INSERT OR REPLACE INTO import_open(push_id,idx,off,sha,kind,size) VALUES(?,?,?,?,?,?)",
+                vec![
+                    worker::SqlStorageValue::from(self.push),
+                    worker::SqlStorageValue::from(i64::try_from(idx).map_err(internal)?),
+                    worker::SqlStorageValue::from(i64::try_from(off).map_err(internal)?),
+                    sha.map(|s| worker::SqlStorageValue::from(s.to_string().as_str()))
+                        .unwrap_or(worker::SqlStorageValue::Null),
+                    worker::SqlStorageValue::from(i64::from(crate::store::git_kind(kind))),
+                    worker::SqlStorageValue::from(i64::try_from(size).map_err(internal)?),
+                ],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+    fn seal(&mut self, idx: usize, end: u64, sha: ObjectId) -> Result<(), Error> {
+        self.sql
+            .exec(
+                "UPDATE import_open SET end=?, sha=? WHERE push_id=? AND idx=?",
+                vec![
+                    worker::SqlStorageValue::from(i64::try_from(end).map_err(internal)?),
+                    worker::SqlStorageValue::from(sha.to_string().as_str()),
+                    worker::SqlStorageValue::from(self.push),
+                    worker::SqlStorageValue::from(i64::try_from(idx).map_err(internal)?),
+                ],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+}
+
+pub struct Cx<'a> {
+    pub win: Window<'a>,
+    pub cache: Cache,
+    pub z: Inflate,
+    pub by_id: IdMap<'a>,
+    pub externals: Externals<'a>,
     /// Nested `resolve_at` depth (ref-delta -> ref-delta hops). Each level keeps its
     /// `chain` alive across the inner await, so depth without a byte bound is an OOM.
-    res_depth: u32,
+    pub res_depth: u32,
     /// Compressed bytes held by in-flight delta chains across ALL nested resolve_at
     /// calls — decremented when a chain finishes or aborts.
-    chain_live: u64,
+    pub chain_live: u64,
 }
 
 /// One decode_entry over `[PACK v2][base as a level-0 zlib full entry][delta re-headed as ofs-delta][20 zero bytes]`.
-fn decode_mini(z: &mut Inflate, base: Option<(Kind, &[u8])>, raw: &[u8]) -> Result<(Kind, Vec<u8>), Error> {
+pub fn decode_mini(z: &mut Inflate, base: Option<(Kind, &[u8])>, raw: &[u8]) -> Result<(Kind, Vec<u8>), Error> {
     let mut mini = b"PACK\0\0\0\x02\0\0\0\x02".to_vec();
     if let Some((k, d)) = base {
         let hk = match k {
@@ -318,15 +631,11 @@ pub enum Base {
 }
 
 /// Thin-pack base (2.4): prefetched cache, else one coalesced read of its live location.
-async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> Result<Obj, Error> {
+pub async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> Result<Obj, Error> {
     if let Some(hit) = cx.cache.get(&Key::Id(id)) {
         return Ok(hit);
     }
-    let loc = cx
-        .external
-        .get(&id)
-        .ok_or_else(|| unpack(format!("missing base {id}")))?
-        .clone();
+    let loc = cx.externals.get(&id)?.ok_or_else(|| unpack(format!("missing base {id}")))?;
     if loc.size > MAX_OBJ {
         // a streamed (>16 MiB) blob can't materialize as a delta base — name the
         // cause and the client-side workaround instead of decode_entry's bare limit
@@ -348,16 +657,16 @@ async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> Resu
 
 /// Resolve a ref-delta base id: resolved in-pack entry -> chain walk; repo base -> read;
 /// unknown -> `Await` so the caller can defer until the entry is processed.
-async fn base_by_id(
+pub async fn base_by_id(
     cx: &mut Cx<'_>,
-    entries: &[EntryRec],
+    entries: &Toc<'_>,
     base_id: ObjectId,
     budget: &mut ReqBudget,
 ) -> Result<Base, Error> {
     if let Some(hit) = cx.cache.get(&Key::Id(base_id)) {
         return Ok(Base::Ready(hit));
     }
-    match cx.by_id.get(&base_id).copied() {
+    match cx.by_id.get(&base_id)? {
         Some(j) => {
             // async recursion (resolve_at -> base_by_id -> resolve_at) needs boxing;
             // bounded twice: nested hop depth AND shared in-flight chain bytes
@@ -365,11 +674,15 @@ async fn base_by_id(
                 return Err(unpack("delta chain too deep"));
             }
             cx.res_depth += 1;
-            let r = Box::pin(resolve_at(cx, entries, entries.get(j).ok_or_else(|| internal("idx"))?.offset, budget)).await;
+            let off = entries
+                .by_idx(j)?
+                .ok_or_else(|| internal("by_id idx"))?
+                .offset;
+            let r = Box::pin(resolve_at(cx, entries, off, budget)).await;
             cx.res_depth -= 1;
             r
         }
-        None if cx.external.contains_key(&base_id) => {
+        None if cx.externals.get(&base_id)?.is_some() => {
             Ok(Base::Ready(external(cx, base_id, budget).await?))
         }
         None => Ok(Base::Await(base_id)),
@@ -377,9 +690,9 @@ async fn base_by_id(
 }
 
 /// In-pack base at `start`: walk the chain back to a cached or full entry, then apply forward.
-async fn resolve_at(
+pub async fn resolve_at(
     cx: &mut Cx<'_>,
-    entries: &[EntryRec],
+    entries: &Toc<'_>,
     start: u64,
     budget: &mut ReqBudget,
 ) -> Result<Base, Error> {
@@ -391,11 +704,10 @@ async fn resolve_at(
         if chain.len() >= MAX_DEPTH {
             return Err(unpack("delta chain too deep"));
         }
-        let i = entries
-            .binary_search_by_key(&off, |r| r.offset)
-            .map_err(|_| unpack("delta base is not an entry"))?;
-        let rec = entries.get(i).ok_or_else(|| internal("idx"))?;
-        let raw = cx.win.entry(rec, budget).await?;
+        let rec = entries
+            .by_off(off)?
+            .ok_or_else(|| unpack("delta base is not an entry"))?;
+        let raw = cx.win.entry(&rec, budget).await?;
         // the chain holds each delta's compressed bytes: 64 × ~16 MiB worst case is a
         // GiB-scale allocation — bound the bytes, not just the depth. chain_live bounds
         // the SAME memory summed across every nested resolve_at frame.
@@ -442,15 +754,18 @@ async fn resolve_at(
 }
 
 /// `sink` posts `/_do/push/index` in 10,000-row batches and collects links (2.5).
+/// `externals` is the thin-pack base view — a prefetched map here, the live index
+/// itself for an in-DO job (see jobs/import.rs).
 pub async fn resolve_and_normalize(
     bucket: &Bucket,
     pending_key: &str,
     entries: &[EntryRec],
-    external_bases: &HashMap<ObjectId, ObjLoc>,
+    externals: Externals<'_>,
     out: &mut PackWriter,
     sink: &mut IndexSink<'_>,
     budget: &mut ReqBudget,
 ) -> Result<Vec<ObjRow>, Error> {
+    let mut sink = AnySink::Edge(sink);
     let pack_len = entries.last().map_or(32, |r| {
         r.offset
             .saturating_add(u64::from(r.header_len))
@@ -458,16 +773,17 @@ pub async fn resolve_and_normalize(
             .saturating_add(20)
     });
     let mut cx = Cx {
-        win: Window { bucket, key: pending_key, pack_len, start: 0, buf: Vec::new() },
+        win: Window { bucket, src: Source::Key(pending_key), pack_len, start: 0, buf: Vec::new() },
         cache: Cache::default(),
         z: Inflate::default(),
-        by_id: HashMap::new(),
-        external: external_bases,
+        by_id: IdMap::Map(HashMap::new()),
+        externals,
         res_depth: 0,
         chain_live: 0,
     };
     let (mut pre, mut sum) = (Vec::new(), 0u64);
-    for (id, loc) in external_bases {
+    if let Externals::Map(bases) = &cx.externals {
+    for (id, loc) in *bases {
         // oversized streamed bases must not be decoded here — external() reports the
         // actionable "delta base too large" error; decode_entry would throw its bare
         // object-too-large limit first
@@ -479,6 +795,7 @@ pub async fn resolve_and_normalize(
             pre.push((*id, loc.clone()));
         }
     }
+    }
     // prefetch is opportunistic: `read_entries` bounds *merged span* bytes (gaps
     // included), which `pre`'s plain size sum can't predict — on Limit just skip the
     // batch; every base still resolves lazily through `external()`
@@ -489,6 +806,7 @@ pub async fn resolve_and_normalize(
         }
     }
     let need_ids = entries.iter().any(|r| matches!(r.kind_or_delta, Header::RefDelta { .. }));
+    let toc = Toc::Mem(entries);
     let mut rows = Vec::new();
     // A REF_DELTA may name a base that appears LATER in the same pack — including
     // mid-chain inside another delta. `one_entry` returns `Await(base)` for those;
@@ -499,7 +817,7 @@ pub async fn resolve_and_normalize(
     while i < order.len() {
         let at = order[i];
         i += 1;
-        match one_entry(&mut cx, entries, at, need_ids, out, sink, &mut rows, budget).await? {
+        match one_entry(&mut cx, &toc, at, need_ids, out, &mut sink, &mut rows, budget, 0).await? {
             Step::Done(id) => {
                 if let Some(ws) = pending.remove(&id) {
                     order.extend(ws);
@@ -518,29 +836,35 @@ pub async fn resolve_and_normalize(
 
 /// The per-entry outcome: resolved+emitted (`Done`), or blocked on a base id that a later
 /// in-pack entry will produce (`Await`).
-enum Step {
+pub enum Step {
     Done(ObjectId),
     Await(ObjectId),
 }
 
 /// Resolve + normalize one pack entry: base resolution, decode, hash, links, append, index row.
+/// `skip` = wire bytes of this entry already durable in the output pack (a mid-entry
+/// resume after a checkpoint boundary): the entry is fully resolved and hashed but
+/// only its tail is appended, at the durable offset.
 #[allow(clippy::too_many_arguments)]
-async fn one_entry(
+pub async fn one_entry(
     cx: &mut Cx<'_>,
-    entries: &[EntryRec],
+    entries: &Toc<'_>,
     i: usize,
     need_ids: bool,
     out: &mut PackWriter,
-    sink: &mut IndexSink<'_>,
+    sink: &mut AnySink<'_, '_>,
     rows: &mut Vec<ObjRow>,
     budget: &mut ReqBudget,
+    skip: u64,
 ) -> Result<Step, Error> {
-    let rec = entries.get(i).ok_or_else(|| internal("idx"))?;
+    let rec = entries
+        .by_idx(i)?
+        .ok_or_else(|| internal("idx"))?;
     // A blob past MAX_OBJ rides the verbatim path: its compressed bytes are already
     // the normalized form, so we copy them through and re-inflate only to hash —
     // the object never materializes in isolate memory.
     if rec.kind_or_delta == Header::Blob && rec.size > MAX_OBJ {
-        return stream_blob(cx, rec, i, need_ids, out, sink, rows, budget).await;
+        return stream_blob(cx, &rec, i, need_ids, out, sink, rows, budget, skip).await;
     }
     let base = match rec.kind_or_delta {
         Header::OfsDelta { base_distance } => Some(
@@ -561,23 +885,33 @@ async fn one_entry(
         Some(Base::Await(id)) => return Ok(Step::Await(id)),
         None => None,
     };
-    let raw = cx.win.entry(rec, budget).await?;
+    let raw = cx.win.entry(&rec, budget).await?;
     let (kind, data) =
         decode_mini(&mut cx.z, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw)?;
     let id = gix_object::compute_hash(H::Sha1, kind, &data).map_err(|_| unpack("sha1 collision"))?;
     let links = extract_links(kind, &data)?;
     if kind == Kind::Tag {
         if let Some(&t) = links.first() {
-            sink.tags.insert(id, t);
+            sink.tags_mut().insert(id, t);
         }
     }
-    sink.links.extend(links);
     // bound inside the loop too — a single giant tree can spike `links` far past
     // the limit between post() batches otherwise
-    if sink.links.len() > super::run::MAX_LINKS {
-        return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
-    }
-    let (offset, len) = out.append_entry(kind, &data)?;
+    sink.push_links(links)?;
+    sink.mark(i, out.offset().saturating_sub(skip), Some(id), kind, data.len() as u64)?;
+    let (offset, len) = if skip == 0 {
+        out.append_entry(kind, &data)?
+    } else {
+        // mid-entry resume: bytes [0, skip) of the wire entry are already durable
+        // upload parts — re-encode deterministically and append only the tail,
+        // so the row's (offset, len) still describes the whole entry.
+        let mut enc = Vec::new();
+        codec::encode_entry(kind, &data, &mut enc)?;
+        let tail = usize::try_from(skip.min(enc.len() as u64)).map_err(internal)?;
+        let start = out.offset().saturating_sub(tail as u64);
+        out.raw_extend(&enc[tail..]);
+        out.raw_entry_done(kind, start)?
+    };
     out.flush_if_full(budget).await?;
     rows.push(ObjRow {
         sha: id,
@@ -587,6 +921,7 @@ async fn one_entry(
         kind,
         size: data.len() as u64,
     });
+    sink.seal(i, offset.saturating_add(u64::from(len)), id)?;
     if need_ids {
         cx.by_id.insert(id, i);
     }
@@ -610,25 +945,30 @@ async fn stream_blob(
     i: usize,
     need_ids: bool,
     out: &mut PackWriter,
-    sink: &mut IndexSink<'_>,
+    sink: &mut AnySink<'_, '_>,
     rows: &mut Vec<ObjRow>,
     budget: &mut ReqBudget,
+    skip: u64,
 ) -> Result<Step, Error> {
-    let start = out.offset();
+    // skip = wire bytes already durable (mid-entry resume): still read + inflate
+    // everything (the sha covers the whole body) but drop that prefix before append.
+    let mut skip = skip;
+    let start = out.offset().saturating_sub(skip);
+    sink.mark(i, start, None, Kind::Blob, rec.size)?;
     let body_start = rec.offset.saturating_add(u64::from(rec.header_len));
     let end = body_start.saturating_add(u64::from(rec.compressed_len));
-    let hdr = cx
-        .win
-        .bucket
-        .read_range(cx.win.key, rec.offset, u64::from(rec.header_len), budget)
-        .await?;
-    out.raw_extend(&hdr);
+    let hdr = cx.win.read(rec.offset, u64::from(rec.header_len), budget).await?;
+    {
+        let s = usize::try_from(skip.min(hdr.len() as u64)).map_err(internal)?;
+        out.raw_extend(&hdr[s..]);
+        skip -= s as u64;
+    }
     let (mut z, mut h, mut sinkbuf) = (Decompress::new(), gix_hash::hasher(H::Sha1), vec![0u8; 1 << 20]);
     h.update(format!("blob {}\0", rec.size).as_bytes());
     let (mut pos, mut produced, mut st) = (body_start, 0u64, Status::Ok);
     while pos < end && st != Status::StreamEnd {
         let n = end.saturating_sub(pos).min(WINDOW);
-        let chunk = cx.win.bucket.read_range(cx.win.key, pos, n, budget).await?;
+        let chunk = cx.win.read(pos, n, budget).await?;
         let mut inp: &[u8] = &chunk;
         loop {
             let (bi, bo) = (z.total_in(), z.total_out());
@@ -652,7 +992,9 @@ async fn stream_blob(
                 return Err(unpack(format!("zlib stalled at {pos}")));
             }
         }
-        out.raw_extend(&chunk);
+        let s = usize::try_from(skip.min(chunk.len() as u64)).map_err(internal)?;
+        out.raw_extend(&chunk[s..]);
+        skip -= s as u64;
         out.flush_if_full(budget).await?;
         pos = pos.saturating_add(n);
     }
@@ -672,6 +1014,7 @@ async fn stream_blob(
         kind: Kind::Blob,
         size: rec.size,
     });
+    sink.seal(i, offset.saturating_add(u64::from(len)), id)?;
     if need_ids {
         cx.by_id.insert(id, i);
     }

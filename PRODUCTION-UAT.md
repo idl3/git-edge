@@ -43,7 +43,8 @@ fully green: empty-repo push, incremental thin-delta push, branch create/delete,
 tag push, delete-only push, clone + strict fsck, incremental fetch, CAS
 rejection, malformed-pack `ERR`, GC mark/consolidate/sweep cycle.
 
-- [ ] Full suite PASS on production URL
+- [ ] Full suite PASS on production URL (incl. `GE_CONFORMANCE_IMPORT=1`:
+      shared-push staged parts → `import_pack` job → atomic commit → clone+fsck)
 - [ ] Protocol v2 required: v0 `POST git-upload-pack` → HTTP 400 + `ERR` pkt-line
 - [ ] Shallow battery: `--depth=1`, `--depth=5` deepen, `--deepen`,
       `--shallow-since`, `--shallow-exclude`, `--unshallow` — each fsck-clean
@@ -101,17 +102,39 @@ rejection, malformed-pack `ERR`, GC mark/consolidate/sweep cycle.
 
 | Limit | Value | Workaround | Accepted? |
 |---|---|---|---|
-| Request body | ~100 MB (platform) | stage pushes by sha range; LFS later | ☐ |
+| Request body | ~100 MB (platform) | stage pushes by sha range; or `/_admin/import` (no per-part cap) | ☐ |
 | Delta results | 16 MiB | push objects un-deltified (`core.bigFileThreshold`) | ☐ |
-| Clone walk bound | 200k commits | — (needs no-walk clone path) | ☐ |
+| Clone walk bound | none for plain clone (#22 streams all live objects); 200k commits for negotiated fetches | — | ☐ |
 | Fetch objects | 1M reachable | partial clone filters | ☐ |
 | Client floor | git ≥ 2.26 | — | ☐ |
 | Object format | sha1 only | — | ☐ |
-| LFS | not implemented | pass-through covers most uses | ☐ |
-| Auth model | global + per-repo tokens, no per-user identity | name tokens per principal | ☐ |
+| LFS | basic transfer implemented (A33): batch + signed GET/PUT | no verify/locking/custom transfers | ☐ |
+| Auth model | global + per-repo tokens, no per-user identity | name tokens per principal; per-ref `scope` on mint (ROADMAP #19) | ☐ |
 | Paid plan only | 10k subrequests vs 9k budget | — | ☐ |
 
-## 11. Rollback & DR
+## 11. Custom domain + Cloudflare Access (optional, ROADMAP #20)
+
+Zero-code auth upgrade when the worker sits in a Cloudflare zone.
+
+- [ ] Custom domain: `wrangler.jsonc` →
+      `"routes": [{ "pattern": "git.example.com", "custom_domain": true }]`, or
+      dashboard → Workers → git-edge → Domains. `*.workers.dev` can be disabled
+      (Workers → Settings) once the custom domain answers.
+- [ ] Access in front: dashboard → Access → Applications → self-hosted,
+      `git.example.com` — but note the split:
+  - `_admin/*` + `_state` browser/API use → Access IdP works end to end.
+  - git clients (clone/push/fetch) cannot complete an Access browser flow —
+      they need `cf-access-client-id` / `cf-access-client-secret` service-token
+      headers via `git config http.https://git.example.com/.extraHeader`, or
+      leave the git endpoints on token auth and gate only `_admin/*` with
+      Access (recommended: one Access policy whose `include` list matches
+      `/_admin/` and `/_state` paths; service tokens for CI).
+- [ ] Access does not replace `GE_*_TOKEN`: keep bearer auth on — Access is an
+      outer gate, the token model still authorizes per-repo inside the worker.
+- [ ] Verify: `curl https://git.example.com/healthz` → 200; anonymous
+      `/_admin/tokens` → Access login page or 403 with service-token only.
+
+## 12. Rollback & DR
 
 - [ ] Rollback: `wrangler rollback` or redeploy previous version id; DO schema
       migrations are additive-only — verify old code tolerates `tokens` table
