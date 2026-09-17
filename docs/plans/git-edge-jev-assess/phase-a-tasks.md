@@ -16,14 +16,14 @@ adopted-patterns:
 
 # Phase A — snapshot + assess endpoint
 
-> **In plain English:** build the read-only `/_admin/assess` endpoint — gather a
+> **In plain English**: build the read-only `/_admin/assess` endpoint — gather a
 > repo's stats and recent commit subjects into one versioned document, ask the
 > Jev decision model a fixed set of questions about it, and return the answers
 > plus a triage label.
-> **Scope:** `server/src/` only — new `/_do/log` DO route, new `jev` client
+> **Scope**: `server/src/` only — new `/_do/log` DO route, new `jev` client
 > module, snapshot composer, assess route, and an e2e smoke script.
-> **Design:** docs/design/git-edge-jev-assess.md
-> **Branch:** feat/git-edge-jev-assess-phase-a (targets `feat/git-edge-jev-assess-integration`)
+> **Design**: docs/design/git-edge-jev-assess.md
+> **Branch**: feat/git-edge-jev-assess-phase-a (targets `feat/git-edge-jev-assess-integration`)
 
 <!-- CP0 log: emitted by /100x:commit-plan from ~/.claude/plans/git-edge-jev-assess.md pass 2. B6 elided: none (5 tasks + populated rubric). Codex: n/a-override (plan pass 1–2). -->
 

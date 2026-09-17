@@ -15,12 +15,12 @@ adopted-patterns:
 
 # Phase B — sweep + docs
 
-> **In plain English:** make the assessment usable at fleet scale — list an
+> **In plain English**: make the assessment usable at fleet scale — list an
 > owner's repos, loop `/_admin/assess` over them from a shell script, and write
 > down the endpoint contract and the data-egress note.
-> **Scope:** `server/src/` owner-list route, `tools/ge-sweep.sh`, docs.
-> **Design:** docs/design/git-edge-jev-assess.md
-> **Branch:** feat/git-edge-jev-assess-phase-b (targets `feat/git-edge-jev-assess-integration`)
+> **Scope**: `server/src/` owner-list route, `tools/ge-sweep.sh`, docs.
+> **Design**: docs/design/git-edge-jev-assess.md
+> **Branch**: feat/git-edge-jev-assess-phase-b (targets `feat/git-edge-jev-assess-integration`)
 
 <!-- CP0 log: emitted by /100x:commit-plan from ~/.claude/plans/git-edge-jev-assess.md pass 2. B6 elided: Out of scope (README carries it). Codex: n/a-override carried. -->
 
