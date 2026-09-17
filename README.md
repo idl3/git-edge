@@ -4,7 +4,19 @@ git-edge is a git server that has no server. git is a tool that keeps every vers
 
 Think of it like this. A normal git server is a shop with a shopkeeper who must be there all day, even when nobody comes. git-edge is a vending machine. It wakes up when someone presses a button, does one thing, and goes back to sleep. Many vending machines can stand in many cities, and each one knows exactly what is inside it.
 
-The study below came first: 56 ideas, each proven in code, each reviewed by a second agent trying to break it. The working server in `server/` is the study compiled to a Rust/WASM Cloudflare Worker — one SQLite Durable Object per repository, packfiles in R2 — verified end-to-end against a stock `git` client.
+The study below came first: 56 ideas, each proven in code, each reviewed by a second agent trying to break it. The working server in `server/` is the study compiled to a Rust/WASM Cloudflare Worker — one SQLite Durable Object per repository, packfiles in R2 — verified end-to-end against a stock `git` client on repositories up to microsoft/TypeScript's 984,826 objects.
+
+## Why this matters
+
+Git hosting is the last always-on piece of an otherwise serverless stack. A company running CI, agents, and ephemeral environments still pays for a git machine that sits idle between pushes, or leans on a hosted provider's rate limits and per-seat pricing for something that is, at heart, a content-addressed object store with a compare-and-swap ref log.
+
+Two shifts make this the right time for it.
+
+**Agentic development multiplies repositories.** Agents do not share one repo per team. They want a repo per task, per experiment, per preview environment — created in milliseconds, cloned a few times, then thrown away. An always-on server makes that expensive and slow to provision. A vending machine makes it free: a repo exists the moment the first push lands, costs nothing at rest beyond the bytes it stores, and disappears on a `DELETE`. The per-repository Durable Object is also the isolation boundary an agent fleet needs — one repo's job queue, quota, and credentials never share fate with another's.
+
+**The cost shape inverts.** A VM bills for capacity you provisioned. git-edge bills for requests and stored bytes. A clone of a consolidated repo costs about one R2 read no matter how long the history is. Idle repos cost object storage and nothing else. For a company running thousands of agent-created repos, that is the difference between a fleet of servers and a line item measured in cents.
+
+Cloudflare showed the shape was possible: their **artifacts** work serves large blobs straight from R2 at edge scale, and **artifact-fs** mounts a lazy checkout over plain smart-HTTP — a protocol git-edge already speaks end to end (`v2`, `blob:none`, promisor backfill, `allowAnySHA1InWant`). git-edge extends that insight from serving artifacts to *being* the versioned store underneath them.
 
 ## What the server does today
 
@@ -33,6 +45,22 @@ All of this is exercised by the conformance suite (`tests/conformance/run.sh`) a
 | 4× parallel 20k clones | 6.9 s total |
 
 The shape that matters: once a repo consolidates to one live pack, a plain clone costs ~1 R2 read regardless of history size — the subrequest wall that used to stop clones near ~263k objects is gone, and for opted-in clients the pack bytes never touch the Worker at all. The remaining inline-clone bound is wall-clock: verbatim streaming does ~32 MiB/s inside the 240 s request budget, so past ~7 GiB on the wire a clone needs `fetch.uriprotocols` — the URI path downloaded TypeScript's 18.63 GiB pack without touching the fetch budget at all.
+
+## What it took — the walls, and the way around each
+
+Every limit below was hit by a real run against a real repository. None of them required giving up on the model; each had a seam.
+
+| Wall | What happened | The way around it |
+|---|---|---|
+| **9,000 subrequests per request** | One index lookup per object meant clones died near ~110k–263k objects with `budget exhausted` | GC consolidates a repo toward one live pack; that pack streams verbatim at ~1 subrequest. Multiple live packs take a no-walk path that streams every live object straight from the index |
+| **~100 MB request body** | A real repo's history cannot land in one `git push` | Two paths: `tools/git-edge-import.sh` slices history into fast-forward pushes, or the server-side import stages the pack in parts and ingests it as a job |
+| **The unsplittable commit** | TypeScript carries a single commit introducing ~222k objects — no client-side slice boundary exists under the ingest budget | `POST /_admin/import`: the pack is staged into R2, then a Durable Object job parses, resolves deltas, checks connectivity, and commits all refs atomically across alarm slices |
+| **A Worker isolate can die mid-job** | Multi-hour imports were losing their undrained output buffer on every isolate yield and livelocking on the same bytes | Resumable cursors over durable state, yield-persisted output tails, and *strand accounting* — isolate deaths are counted separately from real errors so a rebuild-heavy dev loop can't exhaust a job's retry budget |
+| **A stale multipart upload outlives its slice** | A failed finish aborted the output MPU; the retry then died deterministically on a dead upload | Dead-upload detection probes the result key, commits if the bytes already landed, otherwise wipes output state and rebuilds on a fresh upload |
+| **Duplicate objects during GC transition** | Between `gc_commit` and `gc_sweep` every object exists in two live packs; the no-walk clone emitted both copies and `index-pack` rejected the pack | `no_walk_set` scans objects ordered by sha — copies are adjacent — and marks only the first. O(1) extra memory, verified by a conformance regression that clones inside the overlap window |
+| **240 s per request** | TypeScript's 18.63 GiB normalized pack needs ~620 s of sideband streaming — no inline clone can finish | `packfile-uris`: the fetch returns a signed `/_packs/…` URL and git downloads the bytes directly — 18.63 GiB without touching the fetch budget |
+| **Undeltified storage** | Normalized packs store objects whole: TypeScript's 2.72 GiB delta'd pack became 18.63 GiB on disk (6.85×) | The honest trade for O(1) streaming — R2 bills bytes at rest, not the CPU to reconstruct them. Documented, bounded by `GE_QUOTA_MAX_BYTES`, reclaimed by GC |
+| **A stalled host can outlive a push lease** | A disk-full dev host froze all SQLite writes — including the import heartbeat — for over an hour; the janitor legitimately expired the push and swept the run | Operational guard, not a code fix: in-flight imports heartbeat per slice, so the host must stay healthy for the duration. Dead dev-state MPU parts needed manual reclaim (recipe in `HANDOFF.md`) |
 
 ## What is in this repository
 
@@ -183,3 +211,13 @@ These are the causes that kept coming back. The full document explains each with
 ## How this study was made
 
 Each idea went to one agent with a fixed brief. Show the mechanism in 40 to 120 lines of code on real Cloudflare building blocks. Name what you used. Name what you left out. Each proof then went to a second agent with a different brief. Doubt everything. Walk through one crash. Walk through two users at once. Name the exact byte that would break a real git program. The summary documents were made from those 112 outputs. The plain explainers were then written from the proofs and reviews, using the rules in `STYLE.md`.
+
+The server itself was built the same way the study was — by agents. **Devin**, running on Cognition's **SWE-2 Max** model, carried the implementation from contract to conformance-tested server: the protocol paths, the job machinery, the import pipeline, the GC lifecycle, and every wall-and-workaround in the table above were found, fixed, and verified in the loop described there — reproduce, trace, fix at the root, prove with a real `git` client.
+
+## Acknowledgements
+
+**Cloudflare** — this project exists because of their platform work. **Workers + Durable Objects + R2** are the entire substrate, and their **artifacts** and **artifact-fs** projects showed the world that large object payloads belong in R2 behind a thin edge layer — git-edge applies that same shape to the thing developers version instead of the thing they deploy.
+
+**Devin + SWE-2 Max** (Cognition) — the engineering credit above. The debugging that mattered most was the kind agents are built for: hours of telemetry across a stateful system, a fix that had to be correct on the third resume, and a conformance suite that kept the honest score.
+
+**gitoxide** — the Rust building blocks that read and write git's formats inside a Worker, without which this stays a TypeScript prototype.
