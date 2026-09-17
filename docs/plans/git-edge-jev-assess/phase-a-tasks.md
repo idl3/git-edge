@@ -35,7 +35,7 @@ adopted-patterns:
 | A2 | done |
 | A3 | done |
 | A4 | done |
-| A5 | todo |
+| A5 | done |
 | — done | — |
 
 ## Audit item coverage
