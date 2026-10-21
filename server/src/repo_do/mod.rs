@@ -793,6 +793,8 @@ impl RepoDo {
                 .map(|p| serde_json::json!({ "ref": p.name, "sha": p.sha }))
                 .collect::<Vec<_>>(),
             "protected": protected.iter().map(|p| p.pattern.as_str()).collect::<Vec<_>>(),
+            "push_events_pending": count("SELECT COUNT(*) AS n FROM push_events")?,
+            "push_events_dropped": self.meta_opt("push_events_dropped")?.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0),
             "public": self.meta_opt("public")?.is_some(),
             "deleted": self.meta_opt("deleted")?.is_some(),
             "rate_rows": count("SELECT COUNT(*) AS n FROM rate")?,
@@ -1733,8 +1735,53 @@ impl RepoDo {
                 vec![],
             )?;
             jobs::enqueue(&sql, JobKind::GcMark, now + self.gc_quiet_ms(), "{}")?; // step 7 (dedups)
+            // push events: the outbox row lands in this span with the ref writes,
+            // so an event exists iff refs moved; delivery is the push_event job's
+            self.record_push_event(req, &cmds, &results, now)?;
         }
         self.finish_push(req, "committed", now, results) // step 6
+    }
+
+    /// Push events (jobs/events.rs): one outbox row for the refs that actually
+    /// moved, then enqueue delivery. No-op while the webhook isn't configured.
+    fn record_push_event(
+        &self,
+        req: &CommitRequest,
+        cmds: &[Cmd],
+        results: &[(String, Option<&'static str>)],
+        now: i64,
+    ) -> Result<(), Error> {
+        if jobs::events::config(&self.env).is_none() {
+            return Ok(());
+        }
+        let pending = self.q("SELECT COUNT(*) AS n FROM push_events", vec![])?.one::<N>()?.n;
+        if pending >= jobs::events::MAX_PENDING {
+            self.q(
+                "INSERT INTO meta(key,value) VALUES('push_events_dropped','1') \
+                 ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
+                vec![],
+            )?;
+            return Ok(());
+        }
+        let refs = cmds
+            .iter()
+            .zip(results)
+            .filter(|(_, (_, r))| r.is_none())
+            .map(|(c, _)| serde_json::json!({ "ref": c.name, "old": c.old.to_string(), "new": c.new.to_string() }))
+            .collect::<Vec<_>>();
+        let body = serde_json::json!({
+            "event": "push",
+            "owner": self.meta("owner")?, "repo": self.meta("repo")?, "repo_id": self.repo_id()?.0,
+            "push_id": req.push_id, "principal": req.principal, "at": now,
+            "refs": refs,
+        });
+        let body = serde_json::to_string(&body).map_err(|e| Error::Internal(e.to_string()))?;
+        self.q(
+            "INSERT INTO push_events(push_id,at,body) VALUES(?,?,?)",
+            vec![V::from(req.push_id.as_str()), V::from(now), V::from(body.as_str())],
+        )?;
+        jobs::enqueue(&self.sql(), JobKind::PushEvent, now, "{}")?;
+        Ok(())
     }
 
     /// One RefCommand, independent of its siblings unless `atomic` was requested.

@@ -77,6 +77,40 @@ pub fn lfs_sig_ok(key: &str, repo: &str, oid: &str, exp: i64, op: &str, sig: &st
         .unwrap_or(false)
 }
 
+/// Push-event webhooks: `v1\n<ts>\n<delivery>\n<body>` — the timestamp and the
+/// delivery id are inside the MAC, so a receiver can bound replay and dedup on
+/// an authenticated id. Hex HMAC-SHA256; the header value is `v1=<hex>`.
+fn emsg(ts: i64, delivery: &str, body: &[u8]) -> Vec<u8> {
+    let mut m = format!("v1\n{ts}\n{delivery}\n").into_bytes();
+    m.extend_from_slice(body);
+    m
+}
+pub fn event_sig(key: &str, ts: i64, delivery: &str, body: &[u8]) -> Result<String, Error> {
+    // the delivery id is newline-free by construction (`<repo_id>:<seq>`);
+    // refusing one that isn't keeps the framing unambiguous
+    if delivery.contains('\n') {
+        return Err(Error::Internal("delivery id contains a newline".into()));
+    }
+    Ok(hex(&mac(key, &emsg(ts, delivery, body))?.finalize().into_bytes()))
+}
+/// Receiver-side check (also what the tests pin): constant-time.
+pub fn event_sig_ok(key: &str, ts: i64, delivery: &str, body: &[u8], sig: &str) -> bool {
+    if sig.len() != 64 || delivery.contains('\n') {
+        return false;
+    }
+    let Some(sig) = sig
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|c| std::str::from_utf8(c).ok().and_then(|h| u8::from_str_radix(h, 16).ok()))
+        .collect::<Option<Vec<u8>>>()
+    else {
+        return false;
+    };
+    mac(key, &emsg(ts, delivery, body))
+        .map(|m| m.verify_slice(&sig).is_ok())
+        .unwrap_or(false)
+}
+
 /// The feature switch: GE_URL_SIGNING_KEY unset or weak (<32 bytes) disables C1 —
 /// never minted, never served. Configure via `wrangler secret put`, not [vars].
 pub fn signing_key(env: &Env) -> Option<String> {
@@ -128,5 +162,22 @@ mod tests {
         for (r, o, e) in [("other", oid.as_str(), 123), ("rid", "other", 123), ("rid", oid.as_str(), 124)] {
             assert!(!lfs_sig_ok(K, r, o, e, "get", &s), "{r} {o} {e}");
         }
+    }
+
+    #[test]
+    fn event_sig_binds_ts_delivery_body() {
+        let body = br#"{"event":"push"}"#;
+        let s = event_sig(K, 1700, "r:1", body).unwrap();
+        assert_eq!(s.len(), 64);
+        assert!(event_sig_ok(K, 1700, "r:1", body, &s));
+        assert!(!event_sig_ok(K, 1701, "r:1", body, &s)); // replayed with a new ts
+        assert!(!event_sig_ok(K, 1700, "r:2", body, &s)); // other delivery
+        assert!(!event_sig_ok(K, 1700, "r:1", br#"{"event":"pull"}"#, &s)); // tampered
+        assert!(!event_sig_ok("another-key-0123456789abcdef01234", 1700, "r:1", body, &s));
+        assert!(!event_sig_ok(K, 1700, "r:1", body, "zz"));
+        // no ambiguity between delivery and body across the \n separator
+        assert!(event_sig(K, 1, "a\n", b"b").is_err());
+        let ok = event_sig(K, 1, "a", b"\nb").unwrap();
+        assert!(!event_sig_ok(K, 1, "a\n", b"b", &ok));
     }
 }

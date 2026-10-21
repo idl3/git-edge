@@ -362,6 +362,35 @@ git push -q -f "$URL/$ADMINREPO" HEAD:main 2>"$WORK/perr" || fail "force push af
 git push -q -f "$URL/$ADMINREPO" "$ATIP:refs/heads/main" || fail "restore main"
 git checkout -q main && git reset -q --hard "$ATIP"
 
+# push events: only with GE_CONFORMANCE_EVENTS=1 and the dev server's
+# GE_PUSH_WEBHOOK_URL pointing at tests/conformance/push_event_receiver.py
+# (started with --fail-first, logging to GE_EVENTS_LOG)
+if [ "${GE_CONFORMANCE_EVENTS:-0}" = "1" ]; then
+  note "push events: signed webhook, retried after a failure, in order"
+  EVREPO="$REPO-events"
+  git push -q "$URL/$EVREPO" HEAD:refs/heads/main || fail "events push 1"
+  git push -q "$URL/$EVREPO" HEAD:refs/heads/ev-side || fail "events push 2"
+  git push -q "$URL/$EVREPO" --delete ev-side || fail "events push 3"
+  if git push -q "$URL/$EVREPO" HEAD:refs/heads/main~bad 2>/dev/null; then fail "funny ref push succeeded"; fi
+  deadline=$((SECONDS + 180))
+  while :; do
+    n=$(curl -sf "$URL/$EVREPO/_state" | python3 -c 'import sys,json;print(json.load(sys.stdin)["push_events_pending"])')
+    [ "$n" = "0" ] && break
+    [ $SECONDS -lt $deadline ] || fail "push events never drained (pending=$n)"
+    sleep 3
+  done
+  python3 - "$GE_EVENTS_LOG" "$EVREPO" <<'PY2' || fail "push events log mismatch"
+import json, sys
+log, repo = sys.argv[1], sys.argv[2]
+ev = [json.loads(l) for l in open(log)]
+ev = [e for e in ev if e["body"]["owner"] + "/" + e["body"]["repo"] == repo]
+refs = [[(r["ref"], r["new"] == "0" * 40) for r in e["body"]["refs"]] for e in ev]
+assert refs == [[("refs/heads/main", False)], [("refs/heads/ev-side", False)], [("refs/heads/ev-side", True)]], refs
+seqs = [int(e["delivery"].rsplit(":", 1)[1]) for e in ev]
+assert seqs == sorted(seqs) and len(set(seqs)) == 3, seqs
+PY2
+fi
+
 note "lfs (#21): batch -> signed PUT -> batch -> signed GET round-trip"
 printf 'lfs test payload %s\n' "$(date +%s%N)" > "$WORK/lfs.bin"
 OID=$(shasum -a 256 "$WORK/lfs.bin" | cut -d' ' -f1)

@@ -141,6 +141,32 @@ pushed before this release has no graph rows, so an update whose walk meets
 one is refused with `cannot prove fast-forward` (fail closed). Unprotect,
 push, re-protect to move such a ref once.
 
+### Push events (signed webhook)
+
+Set `GE_PUSH_WEBHOOK_URL` (var) and `GE_PUSH_WEBHOOK_SECRET` (secret, at least 32
+bytes) and every committed push POSTs one JSON event:
+
+```json
+{"event":"push","owner":"acme","repo":"app","repo_id":"…","push_id":"…",
+ "principal":"ci-bot","at":1790000000000,
+ "refs":[{"ref":"refs/heads/main","old":"<sha>","new":"<sha>"}]}
+```
+
+Only refs that actually moved are listed; a rejected push sends nothing.
+Headers: `x-ge-event: push`, `x-ge-delivery: <repo_id>:<seq>` (stable across
+retries — dedup on it), `x-ge-timestamp: <epoch ms>`, and `x-ge-signature:
+v1=<hex HMAC-SHA256(secret, "v1\n<timestamp>\n<delivery>\n" + body)>`.
+Verify the signature, bound the timestamp, dedup on the delivery id —
+`tests/conformance/push_event_receiver.py` is a reference receiver.
+
+The event row is written in the same storage transaction as the ref update, so
+an event exists exactly when refs moved. Delivery is at-least-once and in order
+per repo: a non-2xx answer stops the drain and retries with backoff. Either
+setting missing turns the feature off (nothing recorded, nothing sent unsigned).
+The per-repo outbox holds 10,000 events; past that pushes still land and
+`_state.push_events_dropped` counts the gap (`push_events_pending` shows the
+backlog).
+
 Repo layout is `/:owner/:repo`; `owner` is the quota/claims namespace, not an
 ACL — real access control is per-repo tokens + public flags.
 

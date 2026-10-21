@@ -1,6 +1,7 @@
 //! Job dispatcher (CONTRACTS.md 4, 5; A3, A4) + running-row repair (A12).
 //! `rearm` is the sole `set_alarm` caller; `enqueue` is sync and only writes a row.
 
+pub mod events;
 pub mod gc;
 pub mod import;
 pub mod janitor;
@@ -21,6 +22,7 @@ pub enum JobKind {
     GcSweep,
     PurgeRepo,
     ImportPack,
+    PushEvent,
 }
 impl JobKind {
     pub fn as_str(&self) -> &'static str {
@@ -31,6 +33,7 @@ impl JobKind {
             JobKind::GcSweep => "gc_sweep",
             JobKind::PurgeRepo => "purge_repo",
             JobKind::ImportPack => "import_pack",
+            JobKind::PushEvent => "push_event",
         }
     }
     fn of(s: &str) -> Result<Self, Error> {
@@ -41,6 +44,7 @@ impl JobKind {
             "gc_sweep" => Ok(JobKind::GcSweep),
             "purge_repo" => Ok(JobKind::PurgeRepo),
             "import_pack" => Ok(JobKind::ImportPack),
+            "push_event" => Ok(JobKind::PushEvent),
             k => Err(Error::Internal(format!("unknown job kind {k}"))),
         }
     }
@@ -441,5 +445,6 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         JobKind::GcSweep => gc::gc_sweep(d).await,
         JobKind::PurgeRepo => purge::run_slice(d, job, budget).await,
         JobKind::ImportPack => import::run_slice(d, job, budget).await,
+        JobKind::PushEvent => events::run_slice(d, job, budget).await,
     }
 }

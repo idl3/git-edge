@@ -1040,6 +1040,9 @@ pub mod schema {
         // protected refs: patterns (same grammar as token scopes) whose refs are
         // fast-forward-only and undeletable; commit_parents is the graph the FF
         // check walks (n=-1 = commit recorded, n>=0 = nth parent)
+        // push events outbox (jobs/events.rs): one row per committed push while
+        // GE_PUSH_WEBHOOK_URL is set; deleted on 2xx delivery
+        "CREATE TABLE IF NOT EXISTS push_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, push_id TEXT NOT NULL, at INTEGER NOT NULL, body TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT)",
         "CREATE TABLE IF NOT EXISTS protected (pattern TEXT PRIMARY KEY, created_at INTEGER NOT NULL) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS commit_parents (sha TEXT NOT NULL, n INTEGER NOT NULL, parent TEXT, PRIMARY KEY (sha, n)) WITHOUT ROWID",
         // A27: sliding-window rate counters — one row per (bucket, minute window).
