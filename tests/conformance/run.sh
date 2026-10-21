@@ -324,6 +324,44 @@ for bad in 0 -1 99999999999; do
   [ "$code" = "400" ] || fail "ttl_s=$bad -> $code, want 400"
 done
 
+note "protected refs: fast-forward-only + undeletable, for the admin token too"
+curl -sf -X POST "$URL/$ADMINREPO/_admin/protect" -d '{"ref":"refs/heads/main"}' | grep -q protected \
+  || fail "protect main"
+curl -sf -X POST "$URL/$ADMINREPO/_admin/protect" -d '{"ref":"refs/heads/rel-*"}' | grep -q protected \
+  || fail "protect rel-*"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$ADMINREPO/_admin/protect" -d '{"ref":"main"}')
+[ "$code" = "400" ] || fail "bad protect pattern -> $code, want 400"
+curl -sf "$URL/$ADMINREPO/_state" | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d["protected"]==["refs/heads/main","refs/heads/rel-*"],d["protected"]' \
+  || fail "protected missing from _state"
+git commit -qm ff1 --allow-empty
+git push -q "$URL/$ADMINREPO" HEAD:main 2>"$WORK/perr" || fail "ff push to protected main: $(cat "$WORK/perr")"
+FFTIP=$(git rev-parse HEAD)
+git commit -qm ff2 --allow-empty && git commit -qm ff3 --allow-empty
+git push -q "$URL/$ADMINREPO" HEAD:main 2>"$WORK/perr" || fail "multi-commit ff push: $(cat "$WORK/perr")"
+FFTIP=$(git rev-parse HEAD)
+git checkout -q -b rewrite HEAD~2 && git commit -qm rewritten --allow-empty
+if git push -f "$URL/$ADMINREPO" HEAD:main 2>"$WORK/perr2"; then
+  fail "non-ff force push to protected main succeeded"
+fi
+grep -q "protected ref: non-fast-forward" "$WORK/perr2" || fail "no non-ff reason: $(cat "$WORK/perr2")"
+[ "$(git ls-remote "$URL/$ADMINREPO" refs/heads/main | cut -f1)" = "$FFTIP" ] || fail "protected main moved"
+git push -q "$URL/$ADMINREPO" HEAD:refs/heads/rel-1 2>"$WORK/perr" || fail "create protected rel-1: $(cat "$WORK/perr")"
+if git push "$URL/$ADMINREPO" --delete rel-1 2>"$WORK/perr3"; then
+  fail "delete of protected rel-1 succeeded"
+fi
+grep -q "protected ref: deletion refused" "$WORK/perr3" || fail "no deletion reason: $(cat "$WORK/perr3")"
+# --atomic: a protected refusal rejects the sibling too
+if git push --atomic "$URL/$ADMINREPO" HEAD:main HEAD:refs/heads/prot-sibling 2>/dev/null; then
+  fail "atomic push with a protected refusal succeeded"
+fi
+git ls-remote "$URL/$ADMINREPO" | grep -q prot-sibling && fail "atomic sibling landed"
+curl -sf -X POST "$URL/$ADMINREPO/_admin/unprotect" -d '{"ref":"refs/heads/main"}' | grep -q true \
+  || fail "unprotect main"
+git push -q -f "$URL/$ADMINREPO" HEAD:main 2>"$WORK/perr" || fail "force push after unprotect: $(cat "$WORK/perr")"
+# put main back where the later sections expect it (ATIP)
+git push -q -f "$URL/$ADMINREPO" "$ATIP:refs/heads/main" || fail "restore main"
+git checkout -q main && git reset -q --hard "$ATIP"
+
 note "lfs (#21): batch -> signed PUT -> batch -> signed GET round-trip"
 printf 'lfs test payload %s\n' "$(date +%s%N)" > "$WORK/lfs.bin"
 OID=$(shasum -a 256 "$WORK/lfs.bin" | cut -d' ' -f1)
@@ -628,6 +666,44 @@ if [ "${GE_CONFORMANCE_IMPORT:-0}" = "1" ]; then
     sleep 0.5
   done
   echo "$st" | grep -q "token no longer valid" || fail "no expiry reason: $st"
+
+  # protected refs hold on the import path too — the job commits through the
+  # same apply_one, and its resolve records the commit graph the FF walk uses
+  note "protected refs: import FF lands, import non-FF rejected"
+  PREPO="$REPO-protimp"
+  mkdir "$WORK/protimp" && cd "$WORK/protimp"
+  git init -q && git config user.email t@t && git config user.name t
+  echo a > a && git add a && git commit -qm A && git branch -M main
+  git push -q "$URL/$PREPO" main || fail "protimp seed"
+  PA=$(git rev-parse HEAD)
+  curl -sf -X POST "$URL/$PREPO/_admin/protect" -d '{"ref":"refs/heads/main"}' | grep -q protected || fail "protimp protect"
+  pimport() { # pack old new -> prints push_state:reason
+    local st p k b
+    st=$(curl -sf -X POST "$URL/$PREPO/_admin/import/stage" --data-binary @"$1") || fail "protimp stage"
+    p=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["push"])')
+    k=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+    b=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["bytes"])')
+    curl -sf -X POST "$URL/$PREPO/_admin/import" -H 'Content-Type: application/json' \
+      -d "{\"push\":\"$p\",\"parts\":[{\"key\":\"$k\",\"bytes\":$b}],\"commands\":[{\"old\":\"$2\",\"new\":\"$3\",\"name\":\"refs/heads/main\"}]}" \
+      | grep -q queued || fail "protimp start"
+    local deadline=$((SECONDS + 60))
+    while :; do
+      st=$(curl -sf "$URL/$PREPO/_admin/import/$p")
+      echo "$st" | grep -qE '"push_state":"(committed|rejected)"' && break
+      [ $SECONDS -lt $deadline ] || fail "protimp import never settled: $st"
+      sleep 0.5
+    done
+    echo "$st" | python3 -c 'import sys,json;d=json.load(sys.stdin);r=d.get("result") or "[[0,null]]";r=json.loads(r) if isinstance(r,str) else r;print(d["push_state"]+":"+str(r[0][1]))'
+  }
+  echo b > b && git add b && git commit -qm B && PB=$(git rev-parse HEAD)
+  printf '%s\n^%s\n' "$PB" "$PA" | git pack-objects --revs --stdout > "$WORK/pb.pack"
+  PRES=$(pimport "$WORK/pb.pack" "$PA" "$PB"); [ "$PRES" = "committed:None" ] || fail "protected FF import did not commit: $PRES"
+  git reset -q --hard "$PA" && echo c > c && git add c && git commit -qm C && PC=$(git rev-parse HEAD)
+  printf '%s\n^%s\n' "$PC" "$PA" | git pack-objects --revs --stdout > "$WORK/pc.pack"
+  [ "$(pimport "$WORK/pc.pack" "$PB" "$PC")" = "rejected:protected ref: non-fast-forward" ] \
+    || fail "protected non-FF import not rejected"
+  [ "$(git ls-remote "$URL/$PREPO" refs/heads/main | cut -f1)" = "$PB" ] || fail "protimp main moved"
+  cd "$WORK/seed"
 
   # WILD url import: the worker is the git client — v2 ls-refs + fetch streams
   # the remote's pack into pending/, then the same parse→resolve→commit job

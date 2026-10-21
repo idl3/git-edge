@@ -55,6 +55,11 @@ pub struct ObjRow {
     #[serde(with = "kind_serde")]
     pub kind: Kind,
     pub size: u64,
+    /// Protected refs: a commit's parent ids, known only where the object was
+    /// decoded (receive-pack / import resolve). None = not recorded (GC restage,
+    /// legacy rows) — a fast-forward walk that meets one cannot prove ancestry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parents: Option<Vec<ObjectId>>,
 }
 
 mod kind_serde {
@@ -973,6 +978,23 @@ impl<'s> Index<'s> {
                     i(r.size)?,
                 ],
             )?;
+            // protected refs: the commit graph the FF check walks. n=-1 marks the
+            // commit as recorded (so a root reads as "known, no parents", not
+            // "unknown"); n>=0 are its parents in order. Content-addressed facts —
+            // never stale, so no lifecycle beyond repo purge.
+            if let (Kind::Commit, Some(ps)) = (r.kind, &r.parents) {
+                let sha = r.sha.to_string();
+                self.exec(
+                    "INSERT OR IGNORE INTO commit_parents(sha,n,parent) VALUES(?,-1,NULL)",
+                    vec![V::from(sha.as_str())],
+                )?;
+                for (n, p) in ps.iter().enumerate() {
+                    self.exec(
+                        "INSERT OR IGNORE INTO commit_parents(sha,n,parent) VALUES(?,?,?)",
+                        vec![V::from(sha.as_str()), V::from(n as i64), V::from(p.to_string().as_str())],
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -1015,6 +1037,11 @@ pub mod schema {
         "CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL, level TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL, scope TEXT, expires_at INTEGER) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS tokens_hash ON tokens(hash)",
         "CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, sha TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID",
+        // protected refs: patterns (same grammar as token scopes) whose refs are
+        // fast-forward-only and undeletable; commit_parents is the graph the FF
+        // check walks (n=-1 = commit recorded, n>=0 = nth parent)
+        "CREATE TABLE IF NOT EXISTS protected (pattern TEXT PRIMARY KEY, created_at INTEGER NOT NULL) WITHOUT ROWID",
+        "CREATE TABLE IF NOT EXISTS commit_parents (sha TEXT NOT NULL, n INTEGER NOT NULL, parent TEXT, PRIMARY KEY (sha, n)) WITHOUT ROWID",
         // A27: sliding-window rate counters — one row per (bucket, minute window).
         "CREATE TABLE IF NOT EXISTS rate (bucket TEXT NOT NULL, window INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (bucket, window)) WITHOUT ROWID",
         // I1 import staging: object references for the 2.5 connectivity check live
