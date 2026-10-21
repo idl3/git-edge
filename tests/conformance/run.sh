@@ -303,6 +303,27 @@ if git push -q "$UNURL/$ADMINREPO" HEAD:refs/heads/unscoped-after-revoke 2>/dev/
   fail "revoked token still pushed"
 fi
 
+note "PR-3: token ttl_s — pushes while live, 401 once expired, bad ttl refused"
+EXJSON=$(curl -sf -X POST "$URL/$ADMINREPO/_admin/tokens" \
+  -d '{"name":"shortlived","level":"write","ttl_s":3}') || fail "ttl token mint"
+echo "$EXJSON" | python3 -c 'import sys,json;d=json.load(sys.stdin);assert isinstance(d["expires_at"],int),d' \
+  || fail "ttl token has no expires_at"
+EXTOK=$(echo "$EXJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+EXURL="$(echo "$URL" | sed -E "s|^(https?://)[^/@]*@|\1x:$EXTOK@|")"
+git push -q "$EXURL/$ADMINREPO" HEAD:refs/heads/ttl-live 2>"$WORK/exerr" \
+  || fail "live ttl token push rejected: $(cat "$WORK/exerr")"
+sleep 4
+if git push -q "$EXURL/$ADMINREPO" HEAD:refs/heads/ttl-expired 2>/dev/null; then
+  fail "expired token still pushed"
+fi
+code=$(curl -s -o /dev/null -w '%{http_code}' -u "x:$EXTOK" "$(echo "$URL" | sed -E 's|^(https?://)[^/@]*@|\1|')/$ADMINREPO/info/refs?service=git-upload-pack")
+[ "$code" = "401" ] || fail "expired token read -> $code, want 401"
+for bad in 0 -1 99999999999; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/$ADMINREPO/_admin/tokens" \
+    -d "{\"name\":\"bad\",\"level\":\"write\",\"ttl_s\":$bad}")
+  [ "$code" = "400" ] || fail "ttl_s=$bad -> $code, want 400"
+done
+
 note "lfs (#21): batch -> signed PUT -> batch -> signed GET round-trip"
 printf 'lfs test payload %s\n' "$(date +%s%N)" > "$WORK/lfs.bin"
 OID=$(shasum -a 256 "$WORK/lfs.bin" | cut -d' ' -f1)
@@ -583,6 +604,30 @@ if [ "${GE_CONFORMANCE_IMPORT:-0}" = "1" ]; then
   done
   echo "$st" | grep -q "token no longer valid" || fail "no revoke reason: $st"
   if git ls-remote "$URL/$IREPO" | grep -q refs/heads/revoked; then fail "revoked ref landed"; fi
+
+  # PR-3: a token that expires between stage and commit is refused at commit
+  note "PR-3: token expired mid-push -> import commit rejected"
+  XPJSON=$(curl -sf -X POST "$URL/$IREPO/_admin/tokens" -d '{"name":"expiring","level":"write","ttl_s":2}') || fail "expiring mint"
+  XPTOK=$(echo "$XPJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+  XPURL="$(echo "$URL" | sed -E "s|^(https?://)[^/@]*@|\1x:$XPTOK@|")"
+  st=$(curl -sf -X POST "$XPURL/$IREPO/_admin/import/stage" --data-binary @"$WORK/dup.pack") || fail "expiring stage"
+  PUSH5=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["push"])')
+  KEY5=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+  BYTES5=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["bytes"])')
+  sleep 3
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import" -H 'Content-Type: application/json' \
+    -d "{\"push\":\"$PUSH5\",\"parts\":[{\"key\":\"$KEY5\",\"bytes\":$BYTES5}],\"commands\":[{\"old\":\"$ZERO\",\"new\":\"$NEW\",\"name\":\"refs/heads/expired\"}]}")
+  echo "$st" | grep -q queued || fail "expired import start: $st"
+  deadline=$((SECONDS + 60))
+  while :; do
+    st=$(curl -sf "$URL/$IREPO/_admin/import/$PUSH5")
+    ps=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("push_state"))')
+    [ "$ps" = "rejected" ] && break
+    [ "$ps" = "committed" ] && fail "expired token's import committed: $st"
+    [ $SECONDS -lt $deadline ] || fail "expired import never settled: $st"
+    sleep 0.5
+  done
+  echo "$st" | grep -q "token no longer valid" || fail "no expiry reason: $st"
 
   # WILD url import: the worker is the git client — v2 ls-refs + fetch streams
   # the remote's pack into pending/, then the same parse→resolve→commit job

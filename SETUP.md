@@ -119,6 +119,12 @@ pattern `refs/*` (all refs), and a push whose token row is missing or whose
 stored scope is empty is refused. Only `GE_WRITE_TOKEN` pushes without a token
 row. Rows minted before this rule are rewritten to `refs/*` on DO boot.
 
+Tokens can expire: add `"ttl_s": <seconds>` (1 to 31,622,400, i.e. 366 days) when
+minting. The response and `GET /_admin/tokens` carry `expires_at` (epoch ms).
+An expired token gets a 401 on every route, can't open a push, and a push it
+opened is rejected at commit (`token no longer valid`) — the same check that
+catches a token revoked mid-push. Omit `ttl_s` for a non-expiring token.
+
 Repo layout is `/:owner/:repo`; `owner` is the quota/claims namespace, not an
 ACL — real access control is per-repo tokens + public flags.
 

@@ -115,6 +115,10 @@ struct NewToken {
     /// Omitted/empty at mint = all refs, stored explicitly as `ALL_REFS` — a
     /// stored scope is never empty, so an empty one at check time denies.
     scope: Option<String>,
+    /// PR-3: optional lifetime in seconds (1..=MAX_TOKEN_TTL_S). Omitted = no
+    /// expiry (existing behaviour). Expiry is checked at auth, begin and commit.
+    #[serde(default)]
+    ttl_s: Option<i64>,
 }
 #[derive(serde::Deserialize)]
 struct RevokeDto {
@@ -382,6 +386,26 @@ fn push_scope(admin: bool, key: &str, row: Option<(&str, Option<&str>)>) -> Resu
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .ok_or(Error::Forbidden),
+    }
+}
+
+/// PR-3: longest lifetime a minted token may ask for — one year.
+const MAX_TOKEN_TTL_S: i64 = 366 * 24 * 3600;
+
+/// PR-3: a token row is live until `expires_at` (ms, exclusive). NULL = no expiry.
+/// Every lookup filters through this, so an expired token reads as a missing one
+/// and inherits the same fail-closed paths (auth 401, begin Auth, commit ng).
+fn token_live(expires_at: Option<i64>, now: i64) -> bool {
+    expires_at.map_or(true, |e| now < e)
+}
+
+/// PR-3: mint-time `ttl_s` → stored `expires_at` (ms). Out-of-range is refused,
+/// never clamped, so a caller can't silently get a longer-lived credential.
+fn mint_expiry(ttl_s: Option<i64>, now: i64) -> Result<Option<i64>, Error> {
+    match ttl_s {
+        None => Ok(None),
+        Some(t) if (1..=MAX_TOKEN_TTL_S).contains(&t) => Ok(Some(now + t * 1000)),
+        Some(_) => Err(Error::Protocol(format!("ttl_s must be 1..={MAX_TOKEN_TTL_S}"))),
     }
 }
 
@@ -750,14 +774,19 @@ impl RepoDo {
             level: String,
             name: String,
             scope: Option<String>,
+            expires_at: Option<i64>,
         }
+        let now = platform::now_ms();
         let row = self
-            .q("SELECT level, name, scope FROM tokens WHERE hash=?", vec![V::from(b.hash.as_str())])?
+            .q("SELECT level, name, scope, expires_at FROM tokens WHERE hash=?", vec![V::from(b.hash.as_str())])?
             .to_array::<R>()?
             .into_iter()
             .next()
+            .filter(|r| token_live(r.expires_at, now)) // PR-3: expired = unknown → 401
             .ok_or(Error::Auth)?;
-        json(serde_json::json!({ "level": row.level, "name": row.name, "scope": row.scope }))
+        json(serde_json::json!({
+            "level": row.level, "name": row.name, "scope": row.scope, "expires_at": row.expires_at
+        }))
     }
 
     /// POST /_do/tokens {name, level, scope?} — the edge has already gated this on the global
@@ -770,6 +799,8 @@ impl RepoDo {
             return Err(Error::Protocol("name must be 1-128 bytes".into()));
         }
         let scope = mint_scope(b.scope.as_deref())?;
+        let now = platform::now_ms();
+        let expires_at = mint_expiry(b.ttl_s, now)?;
         let n = self.q("SELECT COUNT(*) AS n FROM tokens", vec![])?.one::<N>()?.n;
         if n >= 256 {
             return Err(Error::Limit("too many tokens (256 max)".into()));
@@ -777,17 +808,21 @@ impl RepoDo {
         let token = format!("ge_{}{}", platform::hex16()?, platform::hex16()?);
         let id = platform::hex16()?;
         self.q(
-            "INSERT INTO tokens(id,hash,level,name,created_at,scope) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO tokens(id,hash,level,name,created_at,scope,expires_at) VALUES(?,?,?,?,?,?,?)",
             vec![
                 V::from(id.as_str()),
                 V::from(crate::auth::token_hash(&token)?),
                 V::from(b.level.as_str()),
                 V::from(b.name.as_str()),
-                V::from(platform::now_ms()),
+                V::from(now),
                 V::from(scope.as_str()),
+                expires_at.map(V::from).unwrap_or(V::Null),
             ],
         )?;
-        json(serde_json::json!({ "id": id, "token": token, "level": b.level, "name": b.name, "scope": scope }))
+        json(serde_json::json!({
+            "id": id, "token": token, "level": b.level, "name": b.name, "scope": scope,
+            "expires_at": expires_at
+        }))
     }
 
     /// GET /_do/tokens — id/name/level only; hashes and token values never leave.
@@ -799,16 +834,17 @@ impl RepoDo {
             level: String,
             created_at: i64,
             scope: Option<String>,
+            expires_at: Option<i64>,
         }
         let rows = self
-            .q("SELECT id, name, level, created_at, scope FROM tokens ORDER BY created_at", vec![])?
+            .q("SELECT id, name, level, created_at, scope, expires_at FROM tokens ORDER BY created_at", vec![])?
             .to_array::<T>()?;
         json(serde_json::json!({
             "tokens": rows
                 .iter()
                 .map(|t| serde_json::json!({
                     "id": t.id, "name": t.name, "level": t.level, "created_at": t.created_at,
-                    "scope": t.scope,
+                    "scope": t.scope, "expires_at": t.expires_at,
                 }))
                 .collect::<Vec<_>>()
         }))
@@ -1073,14 +1109,17 @@ impl RepoDo {
                 struct Sc {
                     level: String,
                     scope: Option<String>,
+                    expires_at: Option<i64>,
                 }
+                let now = platform::now_ms();
                 let row = if b.admin || b.key.is_empty() {
                     None
                 } else {
-                    self.q("SELECT level, scope FROM tokens WHERE hash=?", vec![V::from(b.key.as_str())])?
+                    self.q("SELECT level, scope, expires_at FROM tokens WHERE hash=?", vec![V::from(b.key.as_str())])?
                         .to_array::<Sc>()?
                         .into_iter()
                         .next()
+                        .filter(|r| token_live(r.expires_at, now)) // PR-3: expired = missing
                 };
                 let scope =
                     push_scope(b.admin, &b.key, row.as_ref().map(|r| (r.level.as_str(), r.scope.as_deref())))?;
@@ -1475,13 +1514,15 @@ impl RepoDo {
             struct T {
                 level: String,
                 scope: Option<String>,
+                expires_at: Option<i64>,
             }
             let row = match push.auth.as_deref() {
                 Some(a) if a != ADMIN_AUTH && !a.is_empty() => self
-                    .q("SELECT level, scope FROM tokens WHERE hash=?", vec![V::from(a)])?
+                    .q("SELECT level, scope, expires_at FROM tokens WHERE hash=?", vec![V::from(a)])?
                     .to_array::<T>()?
                     .into_iter()
-                    .next(),
+                    .next()
+                    .filter(|r| token_live(r.expires_at, now)), // PR-3: expired mid-push = revoked
                 _ => None,
             };
             match commit_auth(push.auth.as_deref(), row.as_ref().map(|r| (r.level.as_str(), r.scope.as_deref()))) {
@@ -2599,7 +2640,7 @@ struct PackMetaDto {
 
 #[cfg(test)]
 mod tests {
-    use super::{commit_auth, mark_dedup, mint_scope, push_scope, ADMIN_AUTH, TOKEN_INVALID, scope_allows, scope_pattern_ok, DedupRow, ALL_REFS};
+    use super::{commit_auth, mark_dedup, mint_expiry, mint_scope, token_live, MAX_TOKEN_TTL_S, push_scope, ADMIN_AUTH, TOKEN_INVALID, scope_allows, scope_pattern_ok, DedupRow, ALL_REFS};
     use crate::error::Error;
     use crate::pack::generate;
     use crate::store::PackId;
@@ -2768,5 +2809,26 @@ mod tests {
         let scopes = [Some(ALL_REFS), cur.as_deref()];
         assert!(scopes.iter().all(|s| scope_allows(*s, "refs/heads/a")));
         assert!(!scopes.iter().all(|s| scope_allows(*s, "refs/heads/b")));
+    }
+
+    #[test]
+    fn token_expiry() {
+        // no expiry: live forever
+        assert!(token_live(None, i64::MAX));
+        // exclusive bound: live strictly before expires_at
+        assert!(token_live(Some(1000), 999));
+        assert!(!token_live(Some(1000), 1000));
+        assert!(!token_live(Some(1000), 5000));
+        // mint
+        assert_eq!(mint_expiry(None, 10).unwrap(), None);
+        assert_eq!(mint_expiry(Some(1), 10).unwrap(), Some(1010));
+        assert_eq!(mint_expiry(Some(MAX_TOKEN_TTL_S), 0).unwrap(), Some(MAX_TOKEN_TTL_S * 1000));
+        assert!(mint_expiry(Some(0), 10).is_err());
+        assert!(mint_expiry(Some(-5), 10).is_err());
+        assert!(mint_expiry(Some(MAX_TOKEN_TTL_S + 1), 10).is_err());
+        // an expired row is filtered to None and so fails every path closed
+        let row = Some(("write", Some(ALL_REFS))).filter(|_| token_live(Some(1000), 2000));
+        assert!(matches!(push_scope(false, "h", row), Err(Error::Auth)));
+        assert_eq!(commit_auth(Some("h"), row), Err(TOKEN_INVALID));
     }
 }

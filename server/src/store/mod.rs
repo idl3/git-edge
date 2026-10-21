@@ -1012,7 +1012,7 @@ pub mod schema {
         // buffer, chunked. Without it a slice that can't fill one part inside the
         // request budget (sparse marks => ~1 read per entry) replays forever.
         "CREATE TABLE IF NOT EXISTS gc_tail (seq INTEGER PRIMARY KEY, blob BLOB NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL, level TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL, scope TEXT) WITHOUT ROWID",
+        "CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL, level TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL, scope TEXT, expires_at INTEGER) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS tokens_hash ON tokens(hash)",
         "CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, sha TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID",
         // A27: sliding-window rate counters — one row per (bucket, minute window).
@@ -1056,6 +1056,7 @@ pub mod schema {
         ("tokens", "scope", "scope TEXT"),
         ("pushes", "scope", "scope TEXT"),
         ("pushes", "auth", "auth TEXT"),
+        ("tokens", "expires_at", "expires_at INTEGER"),
     ];
     pub fn migrate(sql: &SqlStorage) -> Result<(), Error> {
         for q in DDL {
