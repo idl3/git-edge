@@ -125,6 +125,22 @@ An expired token gets a 401 on every route, can't open a push, and a push it
 opened is rejected at commit (`token no longer valid`) — the same check that
 catches a token revoked mid-push. Omit `ttl_s` for a non-expiring token.
 
+Protected refs are fast-forward-only and can't be deleted, for every credential
+including `GE_WRITE_TOKEN`:
+
+```bash
+curl -u "ops:$TOKEN" -X POST "$REMOTE/acme/app/_admin/protect" -d '{"ref":"refs/heads/main"}'
+curl -u "ops:$TOKEN" -X POST "$REMOTE/acme/app/_admin/unprotect" -d '{"ref":"refs/heads/main"}'
+```
+
+`ref` takes the token-scope grammar (`refs/heads/release-*`); `_state` lists the
+patterns under `protected`. A push or import that would rewrite or delete a
+protected ref gets `ng <ref> protected ref: non-fast-forward` or `… deletion
+refused`. Ancestry is proven from a commit graph recorded at ingest; history
+pushed before this release has no graph rows, so an update whose walk meets
+one is refused with `cannot prove fast-forward` (fail closed). Unprotect,
+push, re-protect to move such a ref once.
+
 Repo layout is `/:owner/:repo`; `owner` is the quota/claims namespace, not an
 ACL — real access control is per-repo tokens + public flags.
 

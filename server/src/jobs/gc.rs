@@ -750,6 +750,7 @@ async fn build(
                     len,
                     kind: l.kind,
                     size: l.size,
+                    parents: None, // restage: the graph rows already exist from ingest
                 });
                 ordinal = ordinal.saturating_add(1);
                 pos.frag = 0;

@@ -904,6 +904,8 @@ pub async fn one_entry(
         decode_mini(&mut cx.z, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw, cx.obj_kind)?;
     let id = gix_object::compute_hash(cx.obj_kind, kind, &data).map_err(|_| unpack("hash collision"))?;
     let links = extract_links(kind, &data, cx.obj_kind)?;
+    // protected refs: extract_links puts a commit's tree first, then parents
+    let parents = (kind == Kind::Commit).then(|| links.iter().skip(1).copied().collect::<Vec<_>>());
     if kind == Kind::Tag {
         if let Some(&t) = links.first() {
             sink.tags_mut().insert(id, t);
@@ -934,6 +936,7 @@ pub async fn one_entry(
         len,
         kind,
         size: data.len() as u64,
+        parents,
     });
     sink.seal(i, offset.saturating_add(u64::from(len)), id)?;
     if need_ids {
@@ -1027,6 +1030,7 @@ async fn stream_blob(
         len,
         kind: Kind::Blob,
         size: rec.size,
+        parents: None,
     });
     sink.seal(i, offset.saturating_add(u64::from(len)), id)?;
     if need_ids {

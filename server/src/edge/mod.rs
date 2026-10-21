@@ -168,6 +168,8 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         (Method::Post, "_admin/format") => repo_format(req, &env, &route, &spend).await,
         (Method::Post, "_admin/pin") => pin_ref(req, &env, &route, "/_do/pin", &spend).await,
         (Method::Post, "_admin/unpin") => pin_ref(req, &env, &route, "/_do/unpin", &spend).await,
+        (Method::Post, "_admin/protect") => protect_ref(req, &env, &route, "/_do/protect", &spend).await,
+        (Method::Post, "_admin/unprotect") => protect_ref(req, &env, &route, "/_do/unprotect", &spend).await,
         (Method::Post, "_admin/import/stage") => import_stage(req, &env, &route, &spend).await,
         (Method::Post, "_admin/import") => import_begin(req, &env, &route, &spend).await,
         (Method::Get, p) if p.starts_with("_admin/import/") => {
@@ -702,6 +704,19 @@ async fn pin_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str, spe
     git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
 }
 
+/// POST /:owner/:repo/_admin/protect {ref} / _admin/unprotect {ref} — protected
+/// ref patterns (fast-forward-only, undeletable). Global admin only.
+async fn protect_ref(mut req: Request, env: &Env, route: &RepoRoute, path: &str, spend: &Spend) -> Result<Response, Error> {
+    auth::authenticate_admin(&req, env)?;
+    let v = json_body(&mut req).await?;
+    if v.get("ref").and_then(|r| r.as_str()).is_none() {
+        return Err(Error::Protocol("body must be {\"ref\": ...}".into()));
+    }
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    let out: serde_json::Value = stub_json(&stub, route, path, &v, &mut budget).await?;
+    git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
 /// POST /:owner/:repo/_admin/import/stage — stream a client-assembled pack into
 /// pending/<push> untouched (I1). No parse at the edge: the import job's pass A
 /// re-reads it from R2 across slices, which is the point — a pack this large
@@ -1191,6 +1206,9 @@ fn leak_reason(m: &str) -> &'static str {
         "ref is pinned" => "ref is pinned",
         "ref outside token scope" => "ref outside token scope",
         "token no longer valid" => "token no longer valid",
+        "protected ref: deletion refused" => "protected ref: deletion refused",
+        "protected ref: non-fast-forward" => "protected ref: non-fast-forward",
+        "protected ref: cannot prove fast-forward" => "protected ref: cannot prove fast-forward",
         _ => "failed to update ref",
     }
 }

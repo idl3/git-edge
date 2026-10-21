@@ -135,6 +135,12 @@ struct PinDto {
     sha: String,
 }
 #[derive(serde::Deserialize)]
+struct ProtectDto {
+    /// a ref pattern in the token-scope grammar: `refs/heads/main`, `refs/tags/*`
+    #[serde(rename = "ref")]
+    pattern: String,
+}
+#[derive(serde::Deserialize)]
 struct UnpinDto {
     #[serde(rename = "ref")]
     name: String,
@@ -228,6 +234,8 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/format") => self.set_format(&body),
                 (Method::Post, "/_do/pin") => self.pin(&parse::<PinDto>(&body)?),
                 (Method::Post, "/_do/unpin") => self.unpin(&parse::<UnpinDto>(&body)?),
+                (Method::Post, "/_do/protect") => self.protect(&parse::<ProtectDto>(&body)?),
+                (Method::Post, "/_do/unprotect") => self.unprotect(&parse::<ProtectDto>(&body)?),
                 _ => return Ok(None),
             }
             .map(Some)
@@ -386,6 +394,28 @@ fn push_scope(admin: bool, key: &str, row: Option<(&str, Option<&str>)>) -> Resu
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .ok_or(Error::Forbidden),
+    }
+}
+
+/// Protected refs: the FF walk's row budget — past it, ancestry is unproven
+/// and the update is refused (fail closed), never assumed.
+const FF_WALK_MAX: i64 = 200_000;
+
+/// Protected refs: why a command on a protected ref is refused, or None. Pure
+/// so the rule table is unit-tested. `ff` is the ancestry verdict for an update
+/// (Some(true) = old is an ancestor of new, Some(false) = provably not,
+/// None = unproven: missing graph rows or walk budget hit).
+fn protected_verdict(old_null: bool, new_null: bool, ff: Option<bool>) -> Option<&'static str> {
+    if new_null {
+        return Some("protected ref: deletion refused");
+    }
+    if old_null {
+        return None; // create: an absent protected ref may be born once; deletion can't reset it
+    }
+    match ff {
+        Some(true) => None,
+        Some(false) => Some("protected ref: non-fast-forward"),
+        None => Some("protected ref: cannot prove fast-forward"),
     }
 }
 
@@ -735,6 +765,13 @@ impl RepoDo {
         let pins = self
             .q("SELECT name, sha FROM pins ORDER BY name", vec![])?
             .to_array::<Pin>()?;
+        #[derive(serde::Deserialize)]
+        struct Prot {
+            pattern: String,
+        }
+        let protected = self
+            .q("SELECT pattern FROM protected ORDER BY pattern", vec![])?
+            .to_array::<Prot>()?;
         json(serde_json::json!({
             "refs": count("SELECT COUNT(*) AS n FROM refs")?,
             "objects": count("SELECT COUNT(*) AS n FROM objects")?,
@@ -755,6 +792,7 @@ impl RepoDo {
                 .iter()
                 .map(|p| serde_json::json!({ "ref": p.name, "sha": p.sha }))
                 .collect::<Vec<_>>(),
+            "protected": protected.iter().map(|p| p.pattern.as_str()).collect::<Vec<_>>(),
             "public": self.meta_opt("public")?.is_some(),
             "deleted": self.meta_opt("deleted")?.is_some(),
             "rate_rows": count("SELECT COUNT(*) AS n FROM rate")?,
@@ -949,6 +987,71 @@ impl RepoDo {
         let name = valid_ref(&b.name)?;
         self.q("DELETE FROM pins WHERE name=?", vec![V::from(name)])?;
         json(serde_json::json!({ "unpinned": self.changes()? > 0 }))
+    }
+
+    /// POST /_do/protect {ref} — mark a ref pattern fast-forward-only and
+    /// undeletable. Applies to every credential, GE_WRITE_TOKEN included:
+    /// changing history on a protected ref means unprotecting it first, which
+    /// is an explicit, separate admin call.
+    fn protect(&self, b: &ProtectDto) -> Result<Response, Error> {
+        let p = b.pattern.trim();
+        if p.len() > 256 || !scope_pattern_ok(p) {
+            return Err(Error::Protocol("ref must be a refs/… pattern (trailing * only)".into()));
+        }
+        let n = self
+            .q("SELECT COUNT(*) AS n FROM protected WHERE pattern<>?", vec![V::from(p)])?
+            .one::<N>()?
+            .n;
+        if n >= 64 {
+            return Err(Error::Limit("too many protected patterns (64 max)".into()));
+        }
+        self.q(
+            "INSERT OR IGNORE INTO protected(pattern,created_at) VALUES(?,?)",
+            vec![V::from(p), V::from(platform::now_ms())],
+        )?;
+        json(serde_json::json!({ "protected": p }))
+    }
+
+    /// POST /_do/unprotect {ref} — exact pattern match.
+    fn unprotect(&self, b: &ProtectDto) -> Result<Response, Error> {
+        self.q("DELETE FROM protected WHERE pattern=?", vec![V::from(b.pattern.trim())])?;
+        json(serde_json::json!({ "unprotected": self.changes()? > 0 }))
+    }
+
+    /// Whether any protected pattern covers this ref name.
+    fn is_protected(&self, name: &str) -> Result<bool, Error> {
+        #[derive(serde::Deserialize)]
+        struct P {
+            pattern: String,
+        }
+        let pats = self.q("SELECT pattern FROM protected", vec![])?.to_array::<P>()?;
+        Ok(pats.iter().any(|p| scope_allows(Some(&p.pattern), name)))
+    }
+
+    /// Protected refs: is `old` an ancestor of (or equal to) `new`? Walks the
+    /// commit_parents graph from `new` inside the commit span — the push's own
+    /// commits were recorded at index time, so no R2 read. Some(false) only
+    /// when the whole reachable set was recorded and `old` isn't in it.
+    fn ff_ancestor(&self, old: &str, new: &str) -> Result<Option<bool>, Error> {
+        #[derive(serde::Deserialize)]
+        struct W {
+            hit: i64,
+            unknown: i64,
+            seen: i64,
+        }
+        let w = self
+            .q(
+                "WITH RECURSIVE anc(sha) AS (SELECT ?1 UNION SELECT p.parent FROM commit_parents p                  JOIN anc ON p.sha=anc.sha WHERE p.n>=0 LIMIT ?3)                  SELECT (SELECT COUNT(*) FROM anc WHERE sha=?2) AS hit,                  (SELECT COUNT(*) FROM anc a WHERE NOT EXISTS                    (SELECT 1 FROM commit_parents k WHERE k.sha=a.sha AND k.n=-1)) AS unknown,                  (SELECT COUNT(*) FROM anc) AS seen",
+                vec![V::from(new), V::from(old), V::from(FF_WALK_MAX)],
+            )?
+            .one::<W>()?;
+        Ok(if w.hit > 0 {
+            Some(true)
+        } else if w.unknown > 0 || w.seen >= FF_WALK_MAX {
+            None
+        } else {
+            Some(false)
+        })
     }
 
     /// The pinned sha for a ref name — one row in `pins` freezes the ref.
@@ -1671,6 +1774,18 @@ impl RepoDo {
         }
         if c.new.is_null() && c.name == head {
             return Ok(Some("deletion of the current branch prohibited"));
+        }
+        // protected refs: FF-only + undeletable, for every credential and on
+        // every path (receive-pack and import both commit through here)
+        if self.is_protected(&c.name)? {
+            let ff = if c.old.is_null() || c.new.is_null() {
+                None
+            } else {
+                self.ff_ancestor(&c.old.to_string(), &c.new.to_string())?
+            };
+            if let Some(why) = protected_verdict(c.old.is_null(), c.new.is_null(), ff) {
+                return Ok(Some(why));
+            }
         }
         if !c.new.is_null() {
             // 2.5 re-guard: the tip must be live *now*, in this span. The push's pack is live since step 3.
@@ -2640,7 +2755,7 @@ struct PackMetaDto {
 
 #[cfg(test)]
 mod tests {
-    use super::{commit_auth, mark_dedup, mint_expiry, mint_scope, token_live, MAX_TOKEN_TTL_S, push_scope, ADMIN_AUTH, TOKEN_INVALID, scope_allows, scope_pattern_ok, DedupRow, ALL_REFS};
+    use super::{commit_auth, mark_dedup, protected_verdict, mint_expiry, mint_scope, token_live, MAX_TOKEN_TTL_S, push_scope, ADMIN_AUTH, TOKEN_INVALID, scope_allows, scope_pattern_ok, DedupRow, ALL_REFS};
     use crate::error::Error;
     use crate::pack::generate;
     use crate::store::PackId;
@@ -2830,5 +2945,18 @@ mod tests {
         let row = Some(("write", Some(ALL_REFS))).filter(|_| token_live(Some(1000), 2000));
         assert!(matches!(push_scope(false, "h", row), Err(Error::Auth)));
         assert_eq!(commit_auth(Some("h"), row), Err(TOKEN_INVALID));
+    }
+
+    #[test]
+    fn protected_rules() {
+        // deletion always refused, whatever ancestry says
+        assert_eq!(protected_verdict(false, true, Some(true)), Some("protected ref: deletion refused"));
+        assert_eq!(protected_verdict(true, true, None), Some("protected ref: deletion refused"));
+        // create allowed (deletion can't have reset it)
+        assert_eq!(protected_verdict(true, false, None), None);
+        // update: FF only, unproven = refused
+        assert_eq!(protected_verdict(false, false, Some(true)), None);
+        assert_eq!(protected_verdict(false, false, Some(false)), Some("protected ref: non-fast-forward"));
+        assert_eq!(protected_verdict(false, false, None), Some("protected ref: cannot prove fast-forward"));
     }
 }
