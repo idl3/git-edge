@@ -557,6 +557,33 @@ if [ "${GE_CONFORMANCE_IMPORT:-0}" = "1" ]; then
   git -C "$WORK/dclone" fsck --strict || fail "overlap-window fsck"
   [ "$OVRLAP" -ge 2 ] && note "overlap clone exercised dedup (packs_live=$OVRLAP)" || note "sweep beat the clone — dedup path not exercised this run"
 
+  # PR-3b: a token revoked after staging can't land refs — commit re-validates
+  # the credential that opened the push, in the same span as the ref writes
+  note "PR-3b: token revoked mid-push -> import commit rejected"
+  RVJSON=$(curl -sf -X POST "$URL/$IREPO/_admin/tokens" -d '{"name":"revokee","level":"write"}') || fail "revokee mint"
+  RVTOK=$(echo "$RVJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+  RVID=$(echo "$RVJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+  RVURL="$(echo "$URL" | sed -E "s|^(https?://)[^/@]*@|\1x:$RVTOK@|")"
+  st=$(curl -sf -X POST "$RVURL/$IREPO/_admin/import/stage" --data-binary @"$WORK/dup.pack") || fail "revokee stage"
+  PUSH4=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["push"])')
+  KEY4=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+  BYTES4=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin)["bytes"])')
+  curl -sf -X DELETE "$URL/$IREPO/_admin/tokens/$RVID" | grep -q true || fail "revoke revokee"
+  st=$(curl -sf -X POST "$URL/$IREPO/_admin/import" -H 'Content-Type: application/json' \
+    -d "{\"push\":\"$PUSH4\",\"parts\":[{\"key\":\"$KEY4\",\"bytes\":$BYTES4}],\"commands\":[{\"old\":\"$ZERO\",\"new\":\"$NEW\",\"name\":\"refs/heads/revoked\"}]}")
+  echo "$st" | grep -q queued || fail "revoked import start: $st"
+  deadline=$((SECONDS + 60))
+  while :; do
+    st=$(curl -sf "$URL/$IREPO/_admin/import/$PUSH4")
+    ps=$(echo "$st" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("push_state"))')
+    [ "$ps" = "rejected" ] && break
+    [ "$ps" = "committed" ] && fail "revoked token's import committed: $st"
+    [ $SECONDS -lt $deadline ] || fail "revoked import never settled: $st"
+    sleep 0.5
+  done
+  echo "$st" | grep -q "token no longer valid" || fail "no revoke reason: $st"
+  if git ls-remote "$URL/$IREPO" | grep -q refs/heads/revoked; then fail "revoked ref landed"; fi
+
   # WILD url import: the worker is the git client — v2 ls-refs + fetch streams
   # the remote's pack into pending/, then the same parse→resolve→commit job
   # owns it. Source is this same instance over loopback http — normalize()
