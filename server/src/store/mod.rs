@@ -1075,6 +1075,14 @@ pub mod schema {
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
         }
+        // PR-3a: a NULL/blank token scope used to mean "all refs" and now denies.
+        // Rewrite legacy rows to the explicit pattern so existing tokens keep the
+        // access they were minted with. Idempotent; a no-op once every row is set.
+        sql.exec(
+            "UPDATE tokens SET scope='refs/*' WHERE scope IS NULL OR trim(scope)=''",
+            Some(Vec::<V>::new()),
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 }

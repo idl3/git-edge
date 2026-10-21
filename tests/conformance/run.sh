@@ -183,7 +183,7 @@ PY
 fi
 
 note "incremental push (thin pack with deltas)"
-dd if=/dev/urandom of=big.bin bs=1m count=6 2>/dev/null
+dd if=/dev/urandom of=big.bin bs=1048576 count=6 2>/dev/null
 git add big.bin && git commit -qm big
 git push -q "$URL/$REPO" main || fail "incremental push"
 TIP2=$(git rev-parse HEAD)
@@ -285,6 +285,22 @@ grep -q "outside token scope" "$WORK/scerr2" || fail "no scope reason: $(cat "$W
 # a scoped token can't mint further credentials (still global-write gated)
 if curl -sf -X POST "$SCURL/$ADMINREPO/_admin/tokens" -d '{"name":"x","level":"write"}' 2>/dev/null; then
   fail "scoped token minted a credential"
+fi
+
+note "PR-3a: unscoped token stores explicit refs/*, still pushes; revoked token fails closed"
+UNJSON=$(curl -sf -X POST "$URL/$ADMINREPO/_admin/tokens" \
+  -d '{"name":"unscoped","level":"write"}') || fail "unscoped token mint"
+echo "$UNJSON" | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d["scope"]=="refs/*",d["scope"]' \
+  || fail "unscoped token did not store explicit refs/*"
+UNTOK=$(echo "$UNJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+UNID=$(echo "$UNJSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+UNURL="$(echo "$URL" | sed -E "s|^(https?://)[^/@]*@|\1x:$UNTOK@|")"
+git push -q "$UNURL/$ADMINREPO" HEAD:refs/heads/unscoped-ok 2>"$WORK/unerr" \
+  || fail "unscoped token push rejected: $(cat "$WORK/unerr")"
+curl -sf -X DELETE "$URL/$ADMINREPO/_admin/tokens/$UNID" | grep -q true \
+  || fail "revoke unscoped token"
+if git push -q "$UNURL/$ADMINREPO" HEAD:refs/heads/unscoped-after-revoke 2>/dev/null; then
+  fail "revoked token still pushed"
 fi
 
 note "lfs (#21): batch -> signed PUT -> batch -> signed GET round-trip"

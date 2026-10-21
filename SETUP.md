@@ -114,6 +114,11 @@ curl -u "ops:$TOKEN" -X POST "$REMOTE/acme/app/_admin/format" \
   -d '{"object_format":"sha256"}'
 ```
 
+Scopes fail closed: a token minted without `scope` is stored with the explicit
+pattern `refs/*` (all refs), and a push whose token row is missing or whose
+stored scope is empty is refused. Only `GE_WRITE_TOKEN` pushes without a token
+row. Rows minted before this rule are rewritten to `refs/*` on DO boot.
+
 Repo layout is `/:owner/:repo`; `owner` is the quota/claims namespace, not an
 ACL — real access control is per-repo tokens + public flags.
 

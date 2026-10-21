@@ -744,7 +744,10 @@ async fn import_stage(mut req: Request, env: &Env, route: &RepoRoute, spend: &Sp
         &stub,
         route,
         "/_do/push/begin",
-        &serde_json::json!({ "push_id": push.0, "principal": principal, "key": rate_key }),
+        &serde_json::json!({
+            "push_id": push.0, "principal": principal, "key": rate_key,
+            "admin": auth::is_admin(&req, env),
+        }),
         &mut budget,
     )
     .await?;
@@ -878,7 +881,10 @@ async fn import_begin(mut req: Request, env: &Env, route: &RepoRoute, spend: &Sp
             &stub,
             route,
             "/_do/push/begin",
-            &serde_json::json!({ "push_id": push.0, "principal": principal, "key": rate_key }),
+            &serde_json::json!({
+            "push_id": push.0, "principal": principal, "key": rate_key,
+            "admin": auth::is_admin(&req, env),
+        }),
             &mut budget,
         )
         .await?;
@@ -990,6 +996,9 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spen
     // A27: sha1 of the presented token is the rate-limit bucket key — the raw
     // credential never crosses the stub boundary (8.1)
     let rate_key = auth::presented_hash(&req)?;
+    // PR-3a: the DO needs to know a tokens-row miss is the global admin, not a
+    // revoked repo token — computed before the body borrows the request
+    let admin = auth::is_admin(&req, &env);
     let mut body = BodyReader::new(&mut req)?;
 
     // ---- pre-header: parse errors are still normal HTTP errors (A2 arm not yet active) ----
@@ -1012,7 +1021,7 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spen
     }
 
     // ---- post-header (A2): everything from here reports HTTP 200 + report-status ----
-    match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key, spend).await {
+    match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key, admin, spend).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             // A27: a throttled push answers a real HTTP 429 + Retry-After, not an
@@ -1059,6 +1068,7 @@ async fn receive_inner(
     hdr: &wire::ReceiveHeader,
     principal: &str,
     rate_key: &str,
+    admin: bool,
     spend: &Spend,
 ) -> Result<Response, Error> {
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
@@ -1074,7 +1084,7 @@ async fn receive_inner(
         route,
         "/_do/push/begin",
         &serde_json::json!({
-            "push_id": push.0, "principal": principal, "key": rate_key,
+            "push_id": push.0, "principal": principal, "key": rate_key, "admin": admin,
             "object_format": if hdr.caps.object_format == gix_hash::Kind::Sha256 { "sha256" } else { "sha1" },
         }),
         &mut budget,
