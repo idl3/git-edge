@@ -1,1 +1,1 @@
-{"name":"git-edge-server","private":true,"devDependencies":{"wrangler":"^4.132.0"}}
+{"name":"git-edge-server","private":true,"license":"Apache-2.0","devDependencies":{"wrangler":"^4.132.0"}}

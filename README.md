@@ -224,3 +224,9 @@ The server itself was built the same way the study was — by agents. **Devin**,
 **Devin + SWE-2 Max** (Cognition) — the engineering credit above. The debugging that mattered most was the kind agents are built for: hours of telemetry across a stateful system, a fix that had to be correct on the third resume, and a conformance suite that kept the honest score.
 
 **gitoxide** — the Rust building blocks that read and write git's formats inside a Worker, without which this stays a TypeScript prototype.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). Copyright 2026 Ernest Sim. See [NOTICE](NOTICE).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in git-edge shall be licensed as above, without any additional terms or conditions.
