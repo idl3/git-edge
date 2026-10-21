@@ -78,6 +78,17 @@ pub fn authenticate_admin(req: &Request, env: &Env) -> Result<String, Error> {
     }
 }
 
+/// True only when the presented credential is the global GE_WRITE_TOKEN. Push
+/// begin forwards this so the DO can tell "deployment admin, all refs" apart
+/// from "repo token whose row is gone" — both have no tokens row, and only the
+/// first may push. Any parse/secret failure is `false` (fail closed).
+pub fn is_admin(req: &Request, env: &Env) -> bool {
+    let Ok((token, _)) = credentials(req) else {
+        return false;
+    };
+    secret_opt(env, "GE_WRITE_TOKEN").map(|w| ct_eq(token.as_bytes(), w.as_bytes())) == Some(true)
+}
+
 /// Returns the principal string recorded in the reflog — for a repo token, its
 /// admin-assigned name, so pushes attribute to a meaningful identity. `spend`
 /// tallies the stub call so a 401/403 still reports x-ge-subrequests.

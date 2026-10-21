@@ -80,6 +80,10 @@ struct BeginDto {
     /// import_start / url-fetch time instead)
     #[serde(default)]
     object_format: Option<String>,
+    /// PR-3a: the edge matched the global GE_WRITE_TOKEN — the only credential
+    /// that pushes without a tokens row. Absent (older edge) = false: fail closed.
+    #[serde(default)]
+    admin: bool,
 }
 #[derive(serde::Deserialize)]
 struct ImportStartDto {
@@ -108,7 +112,8 @@ struct NewToken {
     level: String,
     /// #19: optional ref scope — a comma list of ref patterns, `*` allowed only
     /// as a trailing wildcard (e.g. `refs/heads/release-*`, `refs/heads/dev/*`).
-    /// NULL/empty = all refs.
+    /// Omitted/empty at mint = all refs, stored explicitly as `ALL_REFS` — a
+    /// stored scope is never empty, so an empty one at check time denies.
     scope: Option<String>,
 }
 #[derive(serde::Deserialize)]
@@ -303,12 +308,19 @@ fn scope_pattern_ok(p: &str) -> bool {
         && gix_validate::reference::name_partial(name.as_bytes().as_bstr()).is_ok()
 }
 
+/// The explicit "every ref" scope (PR-3a). Minted for an unscoped token and
+/// captured for a GE_WRITE_TOKEN push; apply_one already confines refs to
+/// `refs/`, so this is exactly the old unrestricted behaviour, written down.
+pub(crate) const ALL_REFS: &str = "refs/*";
+
 /// A command ref matches a scope when any comma pattern covers it — exact match,
-/// or prefix when the pattern ends in `*`. Empty scope = unrestricted.
+/// or prefix when the pattern ends in `*`. PR-3a: missing or empty scope DENIES.
+/// "All refs" is the explicit `ALL_REFS` pattern, never the absence of one —
+/// so a lost token row or a NULL column can't widen a push to every ref.
 pub(crate) fn scope_allows(scope: Option<&str>, name: &str) -> bool {
     match scope.map(str::trim).filter(|s| !s.is_empty()) {
-        None => true,
-        Some(s) => s.split(',').map(str::trim).any(|p| {
+        None => false,
+        Some(s) => s.split(',').map(str::trim).filter(|p| !p.is_empty()).any(|p| {
             if let Some(prefix) = p.strip_suffix('*') {
                 name.starts_with(prefix)
             } else {
@@ -316,6 +328,40 @@ pub(crate) fn scope_allows(scope: Option<&str>, name: &str) -> bool {
             }
         }),
     }
+}
+
+/// PR-3a: the scope a new push row captures. The global admin gets `ALL_REFS`;
+/// a repo token must still exist, be write-level, and carry a non-empty scope.
+/// Anything else is refused at begin — fail closed, nothing staged.
+fn push_scope(admin: bool, key: &str, row: Option<(&str, Option<&str>)>) -> Result<String, Error> {
+    if admin {
+        return Ok(ALL_REFS.to_string());
+    }
+    if key.is_empty() {
+        return Err(Error::Auth);
+    }
+    match row {
+        // revoked between edge auth and begin
+        None => Err(Error::Auth),
+        Some((level, _)) if level != "write" => Err(Error::Forbidden),
+        Some((_, scope)) => scope
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or(Error::Forbidden),
+    }
+}
+
+/// PR-3a: normalize a mint-time scope — omitted/empty becomes the explicit
+/// `ALL_REFS`, anything else must be valid patterns. Never returns empty.
+fn mint_scope(scope: Option<&str>) -> Result<String, Error> {
+    let Some(s) = scope.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(ALL_REFS.to_string());
+    };
+    if s.len() > 256 || s.split(',').map(str::trim).any(|p| !scope_pattern_ok(p)) {
+        return Err(Error::Protocol("scope must be <=256 bytes of refs/… patterns (trailing * only)".into()));
+    }
+    Ok(s.to_string())
 }
 /// The /_do/refs DTO body — built once per refs_version and memoized (A28).
 /// `obj_format` lets the edge advertise the right `object-format=` capability.
@@ -690,18 +736,7 @@ impl RepoDo {
         if b.name.is_empty() || b.name.len() > 128 {
             return Err(Error::Protocol("name must be 1-128 bytes".into()));
         }
-        let scope = b.scope.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        if let Some(s) = scope {
-            if s.len() > 256
-                || s.split(',')
-                    .map(str::trim)
-                    .any(|p| !scope_pattern_ok(p))
-            {
-                return Err(Error::Protocol(
-                    "scope must be <=256 bytes of refs/… patterns (trailing * only)".into(),
-                ));
-            }
-        }
+        let scope = mint_scope(b.scope.as_deref())?;
         let n = self.q("SELECT COUNT(*) AS n FROM tokens", vec![])?.one::<N>()?.n;
         if n >= 256 {
             return Err(Error::Limit("too many tokens (256 max)".into()));
@@ -716,7 +751,7 @@ impl RepoDo {
                 V::from(b.level.as_str()),
                 V::from(b.name.as_str()),
                 V::from(platform::now_ms()),
-                scope.map(V::from).unwrap_or(V::Null),
+                V::from(scope.as_str()),
             ],
         )?;
         json(serde_json::json!({ "id": id, "token": token, "level": b.level, "name": b.name, "scope": scope }))
@@ -993,19 +1028,23 @@ impl RepoDo {
                 // #19: capture the presenting token's ref scope on the push row —
                 // commit_push/import enforce it per command, and a mid-push token
                 // edit can't retroactively widen an open push
+                // PR-3a: fail closed — a missing row, a read token or an empty scope
+                // refuses here; only the edge-attested global admin gets ALL_REFS
                 #[derive(serde::Deserialize)]
                 struct Sc {
+                    level: String,
                     scope: Option<String>,
                 }
-                let scope = if b.key.is_empty() {
+                let row = if b.admin || b.key.is_empty() {
                     None
                 } else {
-                    self.q("SELECT scope FROM tokens WHERE hash=?", vec![V::from(b.key.as_str())])?
+                    self.q("SELECT level, scope FROM tokens WHERE hash=?", vec![V::from(b.key.as_str())])?
                         .to_array::<Sc>()?
                         .into_iter()
                         .next()
-                        .and_then(|s| s.scope)
                 };
+                let scope =
+                    push_scope(b.admin, &b.key, row.as_ref().map(|r| (r.level.as_str(), r.scope.as_deref())))?;
                 self.q(
                     "INSERT INTO pushes(id,state,principal,began_at,gc_epoch,scope) VALUES(?,'open',?,?,?,?)",
                     vec![
@@ -1013,7 +1052,7 @@ impl RepoDo {
                         V::from(b.principal.as_str()),
                         V::from(platform::now_ms()),
                         V::from(meta.gc_epoch),
-                        scope.map(V::from).unwrap_or(V::Null),
+                        V::from(scope.as_str()),
                     ],
                 )?;
             }
@@ -1194,13 +1233,12 @@ impl RepoDo {
         };
         if url.is_none() {
             // #19: an import obeys the push's captured token scope — every command's
-            // ref must be covered, or the whole import 400s before a job exists
-            if let Some(scope) = st.scope.as_deref() {
-                for c in &b.commands {
-                    let name = c.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-                    if !scope_allows(Some(scope), name) {
-                        return Err(Error::Protocol(format!("ref {name} outside token scope")));
-                    }
+            // ref must be covered, or the whole import 400s before a job exists.
+            // PR-3a: a NULL scope (legacy row) covers nothing.
+            for c in &b.commands {
+                let name = c.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                if !scope_allows(st.scope.as_deref(), name) {
+                    return Err(Error::Protocol(format!("ref {name} outside token scope")));
                 }
             }
             // part keys must stay inside this repo's pending namespace — the R2 bucket
@@ -2493,7 +2531,8 @@ struct PackMetaDto {
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_dedup, scope_allows, scope_pattern_ok, DedupRow};
+    use super::{mark_dedup, mint_scope, push_scope, scope_allows, scope_pattern_ok, DedupRow, ALL_REFS};
+    use crate::error::Error;
     use crate::pack::generate;
     use crate::store::PackId;
     use std::collections::HashMap;
@@ -2577,9 +2616,15 @@ mod tests {
     #[test]
     fn scope_matching() {
         // unrestricted
-        assert!(scope_allows(None, "refs/heads/anything"));
-        assert!(scope_allows(Some(""), "refs/heads/anything"));
-        assert!(scope_allows(Some("  "), "refs/heads/anything"));
+        // PR-3a: no scope / blank scope denies — fail closed, never unrestricted
+        assert!(!scope_allows(None, "refs/heads/anything"));
+        assert!(!scope_allows(Some(""), "refs/heads/anything"));
+        assert!(!scope_allows(Some("  "), "refs/heads/anything"));
+        assert!(!scope_allows(Some(" , ,"), "refs/heads/anything"));
+        // the explicit all-refs sentinel covers every refs/ name
+        assert!(scope_allows(Some(ALL_REFS), "refs/heads/main"));
+        assert!(scope_allows(Some(ALL_REFS), "refs/tags/v1"));
+        assert!(!scope_allows(Some(ALL_REFS), "HEAD"));
         // exact
         assert!(scope_allows(Some("refs/heads/main"), "refs/heads/main"));
         assert!(!scope_allows(Some("refs/heads/main"), "refs/heads/main2"));
@@ -2597,5 +2642,41 @@ mod tests {
         // full-repo wildcard
         assert!(scope_allows(Some("refs/*"), "refs/heads/x"));
         assert!(!scope_allows(Some("refs/*"), "not-refs"));
+    }
+
+    #[test]
+    fn push_scope_fails_closed() {
+        // global admin: explicit all-refs, regardless of key/row
+        assert_eq!(push_scope(true, "", None).unwrap(), ALL_REFS);
+        assert_eq!(push_scope(true, "abc", None).unwrap(), ALL_REFS);
+        // repo token present with a scope: captured verbatim (trimmed)
+        assert_eq!(push_scope(false, "h", Some(("write", Some(" refs/heads/a ")))).unwrap(), "refs/heads/a");
+        assert_eq!(push_scope(false, "h", Some(("write", Some(ALL_REFS)))).unwrap(), ALL_REFS);
+        // R2-B1: row missing at begin (revoked / never existed) -> deny
+        assert!(matches!(push_scope(false, "h", None), Err(Error::Auth)));
+        // no presented key and not admin -> deny
+        assert!(matches!(push_scope(false, "", None), Err(Error::Auth)));
+        // empty / NULL scope on a presenting credential -> deny
+        assert!(matches!(push_scope(false, "h", Some(("write", None))), Err(Error::Forbidden)));
+        assert!(matches!(push_scope(false, "h", Some(("write", Some("")))), Err(Error::Forbidden)));
+        assert!(matches!(push_scope(false, "h", Some(("write", Some("  ")))), Err(Error::Forbidden)));
+        // a read token can never open a push
+        assert!(matches!(push_scope(false, "h", Some(("read", Some(ALL_REFS)))), Err(Error::Forbidden)));
+    }
+
+    #[test]
+    fn mint_scope_is_never_empty() {
+        assert_eq!(mint_scope(None).unwrap(), ALL_REFS);
+        assert_eq!(mint_scope(Some("")).unwrap(), ALL_REFS);
+        assert_eq!(mint_scope(Some("   ")).unwrap(), ALL_REFS);
+        assert_eq!(mint_scope(Some(" refs/heads/a,refs/tags/* ")).unwrap(), "refs/heads/a,refs/tags/*");
+        assert!(mint_scope(Some("*")).is_err());
+        assert!(mint_scope(Some("refs/heads/a,")).is_err());
+        assert!(mint_scope(Some(&format!("refs/heads/{}", "a".repeat(260)))).is_err());
+        // whatever mint stores, the check side honours
+        for s in [None, Some("refs/heads/x")] {
+            let stored = mint_scope(s).unwrap();
+            assert!(scope_allows(Some(&stored), "refs/heads/x"));
+        }
     }
 }
