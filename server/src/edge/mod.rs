@@ -1190,6 +1190,7 @@ fn leak_reason(m: &str) -> &'static str {
         "gc ran during push, retry" => "gc ran during push, retry",
         "ref is pinned" => "ref is pinned",
         "ref outside token scope" => "ref outside token scope",
+        "token no longer valid" => "token no longer valid",
         _ => "failed to update ref",
     }
 }

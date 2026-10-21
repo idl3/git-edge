@@ -996,7 +996,7 @@ pub mod schema {
         "CREATE TABLE IF NOT EXISTS refs (name TEXT PRIMARY KEY, target TEXT NOT NULL, peeled TEXT, updated_at INTEGER NOT NULL) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS reflog (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, old TEXT NOT NULL, new TEXT NOT NULL, push_id TEXT NOT NULL, principal TEXT NOT NULL, at INTEGER NOT NULL)",
         "CREATE INDEX IF NOT EXISTS reflog_at ON reflog(at)",
-        "CREATE TABLE IF NOT EXISTS pushes (id TEXT PRIMARY KEY, state TEXT NOT NULL, pack_id TEXT, principal TEXT NOT NULL, began_at INTEGER NOT NULL, ended_at INTEGER, gc_epoch INTEGER NOT NULL, result TEXT, swept_at INTEGER, scope TEXT) WITHOUT ROWID",
+        "CREATE TABLE IF NOT EXISTS pushes (id TEXT PRIMARY KEY, state TEXT NOT NULL, pack_id TEXT, principal TEXT NOT NULL, began_at INTEGER NOT NULL, ended_at INTEGER, gc_epoch INTEGER NOT NULL, result TEXT, swept_at INTEGER, scope TEXT, auth TEXT) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS pushes_state ON pushes(state)",
         "CREATE TABLE IF NOT EXISTS packs (id TEXT PRIMARY KEY, state TEXT NOT NULL, count INTEGER NOT NULL, bytes INTEGER NOT NULL, commit_lo INTEGER NOT NULL, commit_hi INTEGER NOT NULL, push_id TEXT, created_at INTEGER NOT NULL, dead_at INTEGER) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS packs_state ON packs(state)",
@@ -1055,6 +1055,7 @@ pub mod schema {
         ("import_open", "size", "size INTEGER"),
         ("tokens", "scope", "scope TEXT"),
         ("pushes", "scope", "scope TEXT"),
+        ("pushes", "auth", "auth TEXT"),
     ];
     pub fn migrate(sql: &SqlStorage) -> Result<(), Error> {
         for q in DDL {

@@ -144,6 +144,9 @@ struct PushRow {
     state: String,
     gc_epoch: i64,
     scope: Option<String>,
+    /// PR-3b: who opened the push — `ADMIN_AUTH`, or the presenting token's
+    /// hash — so commit can re-validate the credential, not just trust begin.
+    auth: Option<String>,
 }
 struct Cmd {
     old: ObjectId,
@@ -312,6 +315,36 @@ fn scope_pattern_ok(p: &str) -> bool {
 /// captured for a GE_WRITE_TOKEN push; apply_one already confines refs to
 /// `refs/`, so this is exactly the old unrestricted behaviour, written down.
 pub(crate) const ALL_REFS: &str = "refs/*";
+
+/// PR-3b: `pushes.auth` marker for a GE_WRITE_TOKEN push. Token hashes are
+/// 40/64 hex, so this can never collide with one.
+const ADMIN_AUTH: &str = "admin";
+
+/// The `ng` reason when the push's credential no longer checks out at commit.
+const TOKEN_INVALID: &str = "token no longer valid";
+
+/// PR-3b: re-validate a push's credential at commit, in the same sync span as
+/// the ref writes (no TOCTOU against a revoke). `auth` is the push row's
+/// marker, `row` the presenting token's current (level, scope) if it still
+/// exists. Ok(None) = admin (only the captured scope applies); Ok(Some(s)) =
+/// the token's *current* scope, which every command must ALSO satisfy, so a
+/// scope narrowed mid-push takes effect and a widened one doesn't. A legacy
+/// row with no marker, a vanished token or a non-write token: Err — deny.
+fn commit_auth(auth: Option<&str>, row: Option<(&str, Option<&str>)>) -> Result<Option<String>, &'static str> {
+    match auth.map(str::trim).filter(|a| !a.is_empty()) {
+        None => Err(TOKEN_INVALID),
+        Some(ADMIN_AUTH) => Ok(None),
+        Some(_) => match row {
+            None => Err(TOKEN_INVALID),
+            Some((level, _)) if level != "write" => Err(TOKEN_INVALID),
+            Some((_, scope)) => scope
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| Some(s.to_string()))
+                .ok_or(TOKEN_INVALID),
+        },
+    }
+}
 
 /// A command ref matches a scope when any comma pattern covers it — exact match,
 /// or prefix when the pattern ends in `*`. PR-3a: missing or empty scope DENIES.
@@ -1002,17 +1035,23 @@ impl RepoDo {
         struct Existing {
             state: String,
             principal: String,
+            auth: Option<String>,
         }
         let existing = self
             .q(
-                "SELECT state, principal FROM pushes WHERE id=?",
+                "SELECT state, principal, auth FROM pushes WHERE id=?",
                 vec![V::from(b.push_id.as_str())],
             )?
             .to_array::<Existing>()?
             .into_iter()
             .next();
         match existing {
-            Some(e) if e.state == "open" && e.principal == b.principal => {}
+            // PR-3b: same principal AND same credential — commit re-validates the
+            // begin credential, so a second part can't ride under another token
+            Some(e)
+                if e.state == "open"
+                    && e.principal == b.principal
+                    && e.auth.as_deref() == Some(if b.admin { ADMIN_AUTH } else { b.key.as_str() }) => {}
             Some(e) if e.state == "open" => return Err(Error::Forbidden),
             Some(e) => return Err(Error::Conflict(format!("push is {}", e.state))),
             None => {
@@ -1046,13 +1085,14 @@ impl RepoDo {
                 let scope =
                     push_scope(b.admin, &b.key, row.as_ref().map(|r| (r.level.as_str(), r.scope.as_deref())))?;
                 self.q(
-                    "INSERT INTO pushes(id,state,principal,began_at,gc_epoch,scope) VALUES(?,'open',?,?,?,?)",
+                    "INSERT INTO pushes(id,state,principal,began_at,gc_epoch,scope,auth) VALUES(?,'open',?,?,?,?,?)",
                     vec![
                         V::from(b.push_id.as_str()),
                         V::from(b.principal.as_str()),
                         V::from(platform::now_ms()),
                         V::from(meta.gc_epoch),
                         V::from(scope.as_str()),
+                        V::from(if b.admin { ADMIN_AUTH } else { b.key.as_str() }),
                     ],
                 )?;
             }
@@ -1419,7 +1459,7 @@ impl RepoDo {
             .collect::<Result<Vec<_>, Error>>()?;
         let now = platform::now_ms();
         let push = self
-            .q("SELECT state, gc_epoch, scope FROM pushes WHERE id=?", vec![V::from(req.push_id.as_str())])?
+            .q("SELECT state, gc_epoch, scope, auth FROM pushes WHERE id=?", vec![V::from(req.push_id.as_str())])?
             .to_array::<PushRow>()?
             .into_iter()
             .next()
@@ -1427,6 +1467,32 @@ impl RepoDo {
         if push.state != "open" {
             return Err(Error::Conflict(format!("push is {}", push.state))); // step 1
         }
+        // PR-3b: re-validate the credential now, not just at begin — a token
+        // revoked (or narrowed) while the pack streamed must not land refs.
+        // Before step 3, so a rejected push leaves its pack 'ingesting' for the janitor.
+        let current_scope = {
+            #[derive(serde::Deserialize)]
+            struct T {
+                level: String,
+                scope: Option<String>,
+            }
+            let row = match push.auth.as_deref() {
+                Some(a) if a != ADMIN_AUTH && !a.is_empty() => self
+                    .q("SELECT level, scope FROM tokens WHERE hash=?", vec![V::from(a)])?
+                    .to_array::<T>()?
+                    .into_iter()
+                    .next(),
+                _ => None,
+            };
+            match commit_auth(push.auth.as_deref(), row.as_ref().map(|r| (r.level.as_str(), r.scope.as_deref()))) {
+                Ok(s) => s,
+                Err(why) => {
+                    let results = cmds.iter().map(|c| (c.name.clone(), Some(why))).collect();
+                    return self.finish_push(req, "rejected", now, results);
+                }
+            }
+        };
+        let scopes = [push.scope.as_deref(), current_scope.as_deref().or(push.scope.as_deref())];
         if self.meta_i64("gc_epoch")? != push.gc_epoch {
             // step 2
             let results = cmds
@@ -1484,7 +1550,7 @@ impl RepoDo {
             let mut results = Vec::with_capacity(cmds.len());
             let mut any_fail = false;
             for c in &cmds {
-                let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now, false, push.scope.as_deref())?;
+                let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now, false, &scopes)?;
                 any_fail |= r.is_some();
                 results.push((c.name.clone(), r));
             }
@@ -1507,7 +1573,7 @@ impl RepoDo {
         let mut any_ok = false;
         for c in &cmds {
             // step 4
-            let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now, true, push.scope.as_deref())?;
+            let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now, true, &scopes)?;
             any_ok |= r.is_none();
             results.push((c.name.clone(), r));
         }
@@ -1540,7 +1606,7 @@ impl RepoDo {
         who: &str,
         now: i64,
         write: bool,
-        scope: Option<&str>,
+        scopes: &[Option<&str>],
     ) -> Result<Option<&'static str>, Error> {
         // refs live under refs/ only — a full valid refname, never HEAD or a bare word
         if !c.name.as_bytes().starts_with(b"refs/")
@@ -1550,7 +1616,9 @@ impl RepoDo {
         }
         // #19 deploy-key scope: the push row carries the token's ref patterns —
         // a scoped token can only touch its refs (per-command `ng`, like a pin)
-        if !scope_allows(scope, &c.name) {
+        // PR-3b: every scope must allow it — the one captured at begin AND the
+        // token's current one (commit_push re-reads it in this span)
+        if !scopes.iter().all(|s| scope_allows(*s, &c.name)) {
             return Ok(Some("ref outside token scope"));
         }
         if c.old.is_null() && c.new.is_null() {
@@ -2531,7 +2599,7 @@ struct PackMetaDto {
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_dedup, mint_scope, push_scope, scope_allows, scope_pattern_ok, DedupRow, ALL_REFS};
+    use super::{commit_auth, mark_dedup, mint_scope, push_scope, ADMIN_AUTH, TOKEN_INVALID, scope_allows, scope_pattern_ok, DedupRow, ALL_REFS};
     use crate::error::Error;
     use crate::pack::generate;
     use crate::store::PackId;
@@ -2678,5 +2746,27 @@ mod tests {
             let stored = mint_scope(s).unwrap();
             assert!(scope_allows(Some(&stored), "refs/heads/x"));
         }
+    }
+
+    #[test]
+    fn commit_auth_revalidates() {
+        // admin: no extra scope beyond the captured one
+        assert_eq!(commit_auth(Some(ADMIN_AUTH), None), Ok(None));
+        // live write token: its current scope is returned for the AND-check
+        assert_eq!(commit_auth(Some("h"), Some(("write", Some("refs/heads/a")))), Ok(Some("refs/heads/a".into())));
+        // revoked mid-push
+        assert_eq!(commit_auth(Some("h"), None), Err(TOKEN_INVALID));
+        // demoted to read / scope blanked
+        assert_eq!(commit_auth(Some("h"), Some(("read", Some(ALL_REFS)))), Err(TOKEN_INVALID));
+        assert_eq!(commit_auth(Some("h"), Some(("write", None))), Err(TOKEN_INVALID));
+        assert_eq!(commit_auth(Some("h"), Some(("write", Some(" ")))), Err(TOKEN_INVALID));
+        // legacy push row without a marker: fail closed
+        assert_eq!(commit_auth(None, None), Err(TOKEN_INVALID));
+        assert_eq!(commit_auth(Some(""), Some(("write", Some(ALL_REFS)))), Err(TOKEN_INVALID));
+        // narrowing wins: captured refs/* AND current refs/heads/a
+        let cur = commit_auth(Some("h"), Some(("write", Some("refs/heads/a")))).unwrap();
+        let scopes = [Some(ALL_REFS), cur.as_deref()];
+        assert!(scopes.iter().all(|s| scope_allows(*s, "refs/heads/a")));
+        assert!(!scopes.iter().all(|s| scope_allows(*s, "refs/heads/b")));
     }
 }
